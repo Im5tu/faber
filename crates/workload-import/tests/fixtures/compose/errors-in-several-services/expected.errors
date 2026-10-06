@@ -1,0 +1,13 @@
+/srv/app/compose.yaml: include: not supported: run `docker compose config` and deploy its output
+/srv/app/compose.yaml: services.db_main: service name `db_main` is not allowed: a name is 1 to 63 lowercase letters, digits and hyphens, and does not start or end with a hyphen; rename it, for example to `db-main`
+/srv/app/compose.yaml: services.db_main.shm_size: not supported: the size of /dev/shm cannot be set
+/srv/app/compose.yaml: services.db_main.volumes[0]: volume `pgdata` is not declared: add `pgdata:` under the top-level `volumes`, or write a path that starts with `/` or `./`
+/srv/app/compose.yaml: services.db_main.volumes[1]: `~` is not expanded: write the path as it is on the node
+/srv/app/compose.yaml: services.web.build: not supported: faber does not build images; build and push the image, then name it under `image`
+/srv/app/compose.yaml: services.web.privileged: not supported: containers run unprivileged; list the capabilities the service needs under `cap_add`
+/srv/app/compose.yaml: services.web.network_mode: not supported: a workload always has its own network namespace
+/srv/app/compose.yaml: services.web: `image` is missing: faber runs images and does not build them
+/srv/app/compose.yaml: services.web.ports[0]: sctp is not supported: a port is `tcp` or `udp`
+/srv/app/compose.yaml: services.worker.extends: not supported: run `docker compose config` and deploy its output
+/srv/app/compose.yaml: services.worker.secrets: not supported: faber cannot hand a secret to a container yet
+/srv/app/compose.yaml: services.worker.deploy.mode: not supported: faber runs services, not jobs that end

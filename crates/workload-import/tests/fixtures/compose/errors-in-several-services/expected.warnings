@@ -1,0 +1,2 @@
+/srv/app/compose.yaml: services.worker.depends_on: skipped: faber starts the workloads of a deploy in no particular order
+/srv/app/compose.yaml: services.worker.logging: skipped: logging drivers cannot be configured

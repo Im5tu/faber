@@ -1,0 +1,6 @@
+input.yaml#2: spec.strategy: rollout settings are not used
+input.yaml#2: spec.template.spec.securityContext.runAsNonRoot: not enforced
+input.yaml#2: spec.template.spec.serviceAccountName: not used: faber has no service accounts
+input.yaml#2: spec.template.spec.containers[0].envFrom[0].configMapRef: key `not a variable` of ConfigMap `web-settings` is skipped: `APP_not a variable` is not a valid environment variable name
+input.yaml#2: spec.template.spec.containers[0].env[3].valueFrom.configMapKeyRef: ConfigMap `web-settings` has no key `TRACING_ENDPOINT`; skipped because it is optional
+input.yaml#3: Service `web` is skipped: faber has nothing like it

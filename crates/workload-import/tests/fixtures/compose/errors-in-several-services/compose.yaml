@@ -1,0 +1,31 @@
+include:
+  - base.yaml
+
+services:
+  web:
+    build: .
+    ports: ["443:8443/sctp"]
+    privileged: true
+    network_mode: host
+
+  db_main:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ~/backups:/backups
+    shm_size: 1g
+
+  worker:
+    image: ghcr.io/acme/worker:2.0
+    extends:
+      service: web
+    deploy:
+      mode: replicated-job
+    depends_on: [db_main]
+    secrets: [api_key]
+    logging:
+      driver: journald
+
+secrets:
+  api_key:
+    file: ./api_key

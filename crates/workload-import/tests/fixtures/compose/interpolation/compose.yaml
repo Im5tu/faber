@@ -1,0 +1,18 @@
+services:
+  api:
+    image: ${REGISTRY:-docker.io}/acme/api:${TAG:?set TAG to the version to deploy}
+    scale: ${API_REPLICAS:-1}
+    read_only: ${READ_ONLY}
+    environment:
+      REGION: ${REGION}
+      API_KEY:
+      GREETING: "hello $$USER"
+      DEBUG: ${DEBUG-}
+      TRACE: ${TRACE}
+    env_file:
+      - api.env
+      - path: local.env
+        required: false
+    ports:
+      - "${API_PORT:-8080}"
+    mem_limit: ${API_MEMORY}

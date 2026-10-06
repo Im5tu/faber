@@ -1,0 +1,15 @@
+input.yaml#1: metadata.name: workload name `Web_Frontend` is not a DNS label: it may only contain a-z, 0-9 and hyphens. Rename it in the manifest
+input.yaml#1: spec.template.spec.hostNetwork: the host network is not supported
+input.yaml#1: spec.template.spec.initContainers: init containers are not supported: faber starts every container of a workload together
+input.yaml#1: spec.template.spec.containers[0].env[0].value: expected a string, found a number: quote the value
+input.yaml#1: spec.template.spec.containers[0].env[1].valueFrom.secretKeyRef: secrets are not supported: faber has no secret store yet
+input.yaml#1: spec.template.spec.containers[0].resources.limits.memory: `256m` means 256 thousandths of a byte; did you mean `256Mi`?
+input.yaml#1: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]: resource `nvidia.com/gpu` is not supported: only `cpu` and `memory` are
+input.yaml#1: spec.template.spec.containers[0].securityContext.privileged: privileged containers are not supported: list the capabilities the container needs under `capabilities.add`
+input.yaml#2: Job `migrate` is not supported: faber runs workloads that stay up, not ones that run to completion
+input.yaml#3: spec.template.spec.restartPolicy: must be `Always` under a controller
+input.yaml#3: spec.template.spec.containers[0].livenessProbe.grpc: gRPC probes are not supported: use `httpGet`, `tcpSocket` or `exec`
+input.yaml#3: spec.template.spec.containers[0].lifecycle: lifecycle hooks are not supported
+input.yaml#3: spec.template.spec.volumes[0].configMap: `configMap` volumes are not supported; pass the values as environment variables with `configMapKeyRef` or `envFrom`
+input.yaml#3: spec.template.spec.containers[0].futureField: unsupported key
+input.yaml#5: Rollout `canary` is of an unknown kind; if it runs containers, write it as a Deployment

@@ -1,0 +1,2 @@
+/srv/app/compose.yaml: services.web.depends_on: skipped: faber starts the workloads of a deploy in no particular order
+/srv/app/compose.yaml: services.web.ports[0]: the port is not published on the host: faber has no ingress yet; use `--expose web` to make the service reachable cluster-wide

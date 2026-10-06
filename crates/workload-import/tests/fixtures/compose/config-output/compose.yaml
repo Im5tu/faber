@@ -1,0 +1,59 @@
+name: shop
+services:
+  db:
+    environment:
+      POSTGRES_PASSWORD: shop
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U postgres
+      timeout: 5s
+      interval: 10s
+      retries: 5
+    image: postgres:16
+    networks:
+      default: null
+    restart: always
+    volumes:
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql/data
+        volume: {}
+  web:
+    command:
+      - serve
+    depends_on:
+      db:
+        condition: service_healthy
+        required: true
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "268435456"
+    entrypoint:
+      - /usr/local/bin/shop
+    environment:
+      DATABASE_URL: postgres://postgres:shop@db:5432/postgres
+    image: ghcr.io/acme/shop-web:1.4.2
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        target: 8080
+        published: "8080"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: /srv/app/config
+        target: /etc/shop
+        read_only: true
+        bind:
+          create_host_path: true
+networks:
+  default:
+    name: shop_default
+volumes:
+  pgdata:
+    name: shop_pgdata

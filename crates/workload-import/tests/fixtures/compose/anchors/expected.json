@@ -1,0 +1,112 @@
+{
+  "mailer": {
+    "scale": {
+      "replicas": 1
+    },
+    "restart": "on_failure",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {},
+    "containers": [
+      {
+        "name": "mailer",
+        "image": "ghcr.io/acme/worker:2.0",
+        "command": [],
+        "args": [
+          "worker",
+          "--queue",
+          "mail"
+        ],
+        "env": {
+          "LOG_LEVEL": "info",
+          "QUEUE_URL": "redis://queue:6379"
+        },
+        "ports": [],
+        "mounts": [],
+        "resources": {
+          "limits": {
+            "memory_bytes": 134217728
+          },
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false
+      }
+    ]
+  },
+  "queue": {
+    "scale": {
+      "replicas": 1
+    },
+    "restart": "never",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {},
+    "containers": [
+      {
+        "name": "queue",
+        "image": "redis:7",
+        "command": [],
+        "args": [],
+        "env": {},
+        "ports": [],
+        "mounts": [],
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false,
+        "readiness": {
+          "action": {
+            "type": "exec",
+            "command": [
+              "redis-cli",
+              "ping"
+            ]
+          },
+          "initial_delay_secs": 0,
+          "period_secs": 15,
+          "timeout_secs": 3,
+          "success_threshold": 1,
+          "failure_threshold": 3
+        }
+      }
+    ]
+  },
+  "reports": {
+    "scale": {
+      "replicas": 1
+    },
+    "restart": "never",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {},
+    "containers": [
+      {
+        "name": "reports",
+        "image": "ghcr.io/acme/worker:2.0",
+        "command": [],
+        "args": [
+          "worker",
+          "--queue",
+          "reports"
+        ],
+        "env": {
+          "LOG_LEVEL": "debug",
+          "QUEUE_URL": "redis://queue:6379"
+        },
+        "ports": [],
+        "mounts": [],
+        "resources": {
+          "limits": {
+            "memory_bytes": 134217728
+          },
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false
+      }
+    ]
+  }
+}

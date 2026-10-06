@@ -1,0 +1,2 @@
+input.json: spec.template.spec.volumes[0].persistentVolumeClaim: volume `cache-data` is node-local, not a PersistentVolume: the data stays on the node the pod runs on
+input.json: spec.template.spec.containers[0].ports[0].hostPort: not published: faber opens no port on the node

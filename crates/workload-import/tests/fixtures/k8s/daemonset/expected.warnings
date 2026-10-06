@@ -1,0 +1,5 @@
+input.yaml: spec.updateStrategy: rollout settings are not used
+input.yaml: spec.template.spec.tolerations: not used: faber places workloads itself
+input.yaml: spec.template.spec.priorityClassName: not used: faber places workloads itself
+input.yaml: spec.template.spec.containers[0].resources.limits.ephemeral-storage: not enforced: faber does not limit disk use
+input.yaml: spec.template.spec.volumes[2].projected: `projected` volumes are not supported; skipped because no container mounts it

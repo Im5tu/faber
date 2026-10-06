@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: greeter
+spec:
+  containers:
+    - name: greeter
+      image: busybox:1.36
+      command: [sh, -c, "echo $(GREETING); sleep infinity"]
+      envFrom:
+        - configMapRef:
+            name: settings
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: unused
+spec:
+  accessModes: [ReadWriteOnce]

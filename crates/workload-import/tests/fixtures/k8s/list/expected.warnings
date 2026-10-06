@@ -1,0 +1,2 @@
+input.yaml: items[0].spec.template.spec.containers[0].imagePullPolicy: not used: faber pulls an image when the node does not have it
+input.yaml: items[1]: Service `api` is skipped: faber has nothing like it

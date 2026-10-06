@@ -1,0 +1,1 @@
+/srv/app/compose.yaml: services.api.environment.TRACE: variable TRACE is not set and is replaced by an empty string; set it in the environment or in the .env file

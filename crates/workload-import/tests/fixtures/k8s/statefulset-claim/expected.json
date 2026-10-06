@@ -1,0 +1,75 @@
+{
+  "db": {
+    "scale": {
+      "replicas": 2
+    },
+    "restart": "always",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {
+      "data": {
+        "type": "named",
+        "name": "data",
+        "per_replica": true
+      },
+      "run": {
+        "type": "ephemeral",
+        "memory": true,
+        "size_bytes": 16777216
+      }
+    },
+    "containers": [
+      {
+        "name": "postgres",
+        "image": "postgres:16",
+        "command": [],
+        "args": [],
+        "env": {
+          "PGDATA": "/var/lib/postgresql/data/pgdata"
+        },
+        "ports": [
+          {
+            "name": "postgres",
+            "port": 5432,
+            "protocol": "tcp"
+          }
+        ],
+        "mounts": [
+          {
+            "volume": "data",
+            "path": "/var/lib/postgresql/data",
+            "read_only": false
+          },
+          {
+            "volume": "run",
+            "path": "/var/run/postgresql",
+            "read_only": false
+          }
+        ],
+        "resources": {
+          "limits": {
+            "memory_bytes": 1073741824
+          },
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false,
+        "startup": {
+          "action": {
+            "type": "exec",
+            "command": [
+              "pg_isready",
+              "-U",
+              "postgres"
+            ]
+          },
+          "initial_delay_secs": 0,
+          "period_secs": 2,
+          "timeout_secs": 1,
+          "success_threshold": 1,
+          "failure_threshold": 30
+        }
+      }
+    ]
+  }
+}

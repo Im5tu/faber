@@ -1,0 +1,109 @@
+{
+  "db": {
+    "scale": {
+      "replicas": 1
+    },
+    "restart": "always",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {
+      "pgdata": {
+        "type": "named",
+        "name": "pgdata",
+        "per_replica": false
+      }
+    },
+    "containers": [
+      {
+        "name": "db",
+        "image": "postgres:16",
+        "command": [],
+        "args": [],
+        "env": {
+          "POSTGRES_PASSWORD": "shop"
+        },
+        "ports": [],
+        "mounts": [
+          {
+            "volume": "pgdata",
+            "path": "/var/lib/postgresql/data",
+            "read_only": false
+          }
+        ],
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false,
+        "readiness": {
+          "action": {
+            "type": "exec",
+            "command": [
+              "/bin/sh",
+              "-c",
+              "pg_isready -U postgres"
+            ]
+          },
+          "initial_delay_secs": 0,
+          "period_secs": 10,
+          "timeout_secs": 5,
+          "success_threshold": 1,
+          "failure_threshold": 5
+        }
+      }
+    ]
+  },
+  "web": {
+    "scale": {
+      "replicas": 2
+    },
+    "restart": "never",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {
+      "v0": {
+        "type": "host_path",
+        "path": "/srv/app/config",
+        "create": true
+      }
+    },
+    "containers": [
+      {
+        "name": "web",
+        "image": "ghcr.io/acme/shop-web:1.4.2",
+        "command": [
+          "/usr/local/bin/shop"
+        ],
+        "args": [
+          "serve"
+        ],
+        "env": {
+          "DATABASE_URL": "postgres://postgres:shop@db:5432/postgres"
+        },
+        "ports": [
+          {
+            "port": 8080,
+            "protocol": "tcp"
+          }
+        ],
+        "mounts": [
+          {
+            "volume": "v0",
+            "path": "/etc/shop",
+            "read_only": true
+          }
+        ],
+        "resources": {
+          "limits": {
+            "cpu_millis": 500,
+            "memory_bytes": 268435456
+          },
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false
+      }
+    ]
+  }
+}

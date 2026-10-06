@@ -1,0 +1,43 @@
+{
+  "api": {
+    "scale": {
+      "replicas": 3
+    },
+    "restart": "never",
+    "expose": "environment",
+    "placement": {},
+    "volumes": {},
+    "containers": [
+      {
+        "name": "api",
+        "image": "docker.io/acme/api:2.3.1",
+        "command": [],
+        "args": [],
+        "env": {
+          "API_KEY": "from-dotenv",
+          "DEBUG": "",
+          "FEATURE_FLAGS": "a,b",
+          "GREETING": "hello $USER",
+          "REGION": "eu-west-1",
+          "RELEASE": "2.3.1",
+          "TRACE": ""
+        },
+        "ports": [
+          {
+            "port": 8080,
+            "protocol": "tcp"
+          }
+        ],
+        "mounts": [],
+        "resources": {
+          "limits": {
+            "memory_bytes": 268435456
+          },
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": true
+      }
+    ]
+  }
+}

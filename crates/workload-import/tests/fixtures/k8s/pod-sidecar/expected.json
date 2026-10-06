@@ -1,0 +1,79 @@
+{
+  "report": {
+    "scale": {
+      "replicas": 1
+    },
+    "restart": "on_failure",
+    "expose": "environment",
+    "placement": {
+      "node": "node-2"
+    },
+    "volumes": {
+      "shared": {
+        "type": "ephemeral",
+        "memory": false
+      }
+    },
+    "containers": [
+      {
+        "name": "builder",
+        "image": "example.com/report-builder:2",
+        "command": [
+          "/bin/sh",
+          "-c"
+        ],
+        "args": [
+          "build --out /out"
+        ],
+        "env": {
+          "OUT_DIR": "/out"
+        },
+        "working_dir": "/work",
+        "ports": [],
+        "mounts": [
+          {
+            "volume": "shared",
+            "path": "/out",
+            "read_only": false
+          }
+        ],
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "capabilities": [],
+        "read_only_root_fs": false
+      },
+      {
+        "name": "server",
+        "image": "nginx:1.27",
+        "command": [],
+        "args": [],
+        "env": {},
+        "ports": [
+          {
+            "port": 80,
+            "protocol": "tcp"
+          }
+        ],
+        "mounts": [
+          {
+            "volume": "shared",
+            "path": "/usr/share/nginx/html",
+            "read_only": true,
+            "sub_path": "public"
+          }
+        ],
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "capabilities": [
+          "NET_BIND_SERVICE",
+          "CHOWN"
+        ],
+        "read_only_root_fs": false
+      }
+    ]
+  }
+}
