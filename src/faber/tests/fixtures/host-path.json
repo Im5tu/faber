@@ -1,0 +1,16 @@
+{
+  "web": {
+    "volumes": {
+      "data": { "type": "host_path", "path": "/srv/data" }
+    },
+    "containers": [
+      {
+        "name": "web",
+        "image": "nginx:1.27",
+        "env": { "DB_PASSWORD": "hunter2" },
+        "mounts": [{ "volume": "data", "path": "/data" }],
+        "capabilities": ["NET_BIND_SERVICE"]
+      }
+    ]
+  }
+}
