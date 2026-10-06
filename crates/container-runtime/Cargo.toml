@@ -1,0 +1,21 @@
+[package]
+name = "faber-container-runtime"
+description = "Container runtime reconciliation for faber: a runtime-agnostic spec and the containerd drop-in writer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "faber_container_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+ipnet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
