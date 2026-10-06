@@ -1,0 +1,29 @@
+[package]
+name = "faber-api-types"
+description = "Shared public API contract (DTOs and HTTP client) for faber"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "faber_api_types"
+path = "src/lib.rs"
+
+[features]
+default = []
+client = ["dep:reqwest", "dep:thiserror"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+[[test]]
+name = "client"
+required-features = ["client"]
