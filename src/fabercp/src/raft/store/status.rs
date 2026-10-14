@@ -3,7 +3,8 @@
 //!
 //! A report replaces the whole record of its node under `status/<node_id>`.
 //! Apply stamps it with the lease clock (`MeshState::clock`), never with a
-//! time the node sent. A report writes no other key: the mesh record and the
+//! time the node sent. A report writes no other key, except that a node's first
+//! report records its instance id in the mesh as a lease renewal does. The
 //! environment records stay as they are, so no generation moves and the
 //! reconcile steps that compare their own desired values see no change.
 //!
@@ -99,34 +100,22 @@ pub struct NodeStatus {
 /// the record to store under [`node_key`]. Checked in this order:
 ///
 /// - No mesh: `mesh_not_configured`.
-/// - Unknown node: `mesh_node_removed`.
-/// - The record has an `instance_id` and it is not the one given:
-///   `forbidden`. A record without one (the founder's) accepts any: unlike
-///   `RenewLease`, a report does not adopt it.
+/// - The instance id, by the rule `RenewLease` uses
+///   ([`MeshState::claim_instance`]): unknown node `mesh_node_removed`,
+///   another machine `forbidden`. A node whose record has no instance id
+///   yet takes the one given, so `mesh` changes then and the caller must
+///   store it. It does not otherwise.
 /// - Too many replicas, or a name or `detail` over its limit: `bad_request`.
+///
+/// On a rejection the caller discards `mesh`.
 pub fn apply_report_node(
-    mesh: Option<&MeshState>,
+    mesh: Option<&mut MeshState>,
     cmd: ReportNode,
 ) -> Result<NodeStatus, Rejection> {
     let mesh = mesh.ok_or_else(|| {
         Rejection::new(error_code::MESH_NOT_CONFIGURED, "the cluster has no mesh")
     })?;
-    let node = mesh.nodes.get(&cmd.node_id).ok_or_else(|| {
-        Rejection::new(
-            error_code::MESH_NODE_REMOVED,
-            format!("node {} is not in the mesh", cmd.node_id),
-        )
-    })?;
-    if node
-        .instance_id
-        .as_deref()
-        .is_some_and(|held| held != cmd.instance_id)
-    {
-        return Err(Rejection::new(
-            error_code::FORBIDDEN,
-            format!("node {} is registered to another machine", cmd.node_id),
-        ));
-    }
+    mesh.claim_instance(cmd.node_id, &cmd.instance_id)?;
     check_sizes(&cmd.replicas)?;
     Ok(NodeStatus {
         reported_at: mesh.clock,

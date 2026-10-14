@@ -11,7 +11,8 @@
 //!
 //! The lease clock moves in steps of the leader's tick (5 to 60 seconds in
 //! real time), so a report is up to one tick older on the clock than it is
-//! in real time.
+//! in real time. The limit is three intervals plus one tick, so a node that
+//! reports on time never reads `unavailable`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -249,8 +250,17 @@ pub struct NodeView {
 impl StatusView {
     /// Builds the view of `statuses` at `now` on the lease clock, for reports
     /// every `interval_secs`. Every replica of a stale node is `unavailable`.
-    pub fn new(statuses: BTreeMap<u64, NodeStatus>, interval_secs: u64, now: u64) -> Self {
-        let limit = interval_secs.saturating_mul(STALE_AFTER_INTERVALS);
+    pub fn new(
+        statuses: BTreeMap<u64, NodeStatus>,
+        interval_secs: u64,
+        now: u64,
+        tick_secs: u64,
+    ) -> Self {
+        // The clock runs in steps of `tick_secs`, so a node that reported on
+        // time can be a whole tick behind it.
+        let limit = interval_secs
+            .saturating_mul(STALE_AFTER_INTERVALS)
+            .saturating_add(tick_secs);
         let mut view = StatusView::default();
         for (id, status) in statuses {
             let stale = now.saturating_sub(status.reported_at) > limit;
@@ -295,12 +305,17 @@ impl StatusView {
 
 /// The reports in `state` at `now` on the lease clock. A cluster with no
 /// reports gives an empty view.
-pub fn view(state: &StateReader, now: u64) -> Result<StatusView, ReadError> {
+pub fn view(state: &StateReader, now: u64, tick_secs: u64) -> Result<StatusView, ReadError> {
     let statuses = state.statuses()?;
     if statuses.is_empty() {
         return Ok(StatusView::default());
     }
-    Ok(StatusView::new(statuses, state.status_interval()?, now))
+    Ok(StatusView::new(
+        statuses,
+        state.status_interval()?,
+        now,
+        tick_secs,
+    ))
 }
 
 #[cfg(test)]
@@ -345,7 +360,7 @@ mod tests {
         ]);
         // Interval 5: fresh up to and including 15 seconds of age.
         for (now, stale) in [(100, false), (115, false), (116, true), (10_000, true)] {
-            let view = StatusView::new(statuses.clone(), 5, now);
+            let view = StatusView::new(statuses.clone(), 5, now, 0);
             let got = view.workload("shop", "staging", "web");
             assert_eq!(got.len(), 2);
             let want = if stale {
@@ -357,7 +372,7 @@ mod tests {
             assert_eq!(view.nodes[&1].stale, stale);
         }
         // The interval scales the limit.
-        let view = StatusView::new(statuses, 30, 190);
+        let view = StatusView::new(statuses, 30, 190, 0);
         assert!(!view.nodes[&1].stale);
         // A node that is quiet does not hide a node that reports.
         let mixed = BTreeMap::from([
@@ -370,11 +385,35 @@ mod tests {
                 record(100, vec![replica("web", 1, ReplicaState::Available)]),
             ),
         ]);
-        let got = StatusView::new(mixed, 5, 100).workload("shop", "staging", "web");
+        let got = StatusView::new(mixed, 5, 100, 0).workload("shop", "staging", "web");
         assert_eq!(
             got.iter().map(|r| (r.node, r.state)).collect::<Vec<_>>(),
             vec![(1, ReplicaState::Unavailable), (2, ReplicaState::Available)]
         );
+    }
+
+    /// The clock moves 60 seconds at a time; reports come every 5.
+    #[test]
+    fn a_coarse_clock_tick_does_not_make_a_node_that_reports_look_stale() {
+        let tick = 60;
+        let reported = |at| {
+            BTreeMap::from([(
+                1,
+                record(at, vec![replica("web", 0, ReplicaState::Available)]),
+            )])
+        };
+        let state = |at, now| {
+            StatusView::new(reported(at), 5, now, tick).workload("shop", "staging", "web")[0].state
+        };
+        // Reported just before the clock ticked, and not again yet: a whole
+        // tick old on the clock.
+        assert_eq!(state(0, 60), ReplicaState::Available);
+        // It stops: unavailable once older than three intervals and a tick.
+        assert_eq!(state(0, 75), ReplicaState::Available);
+        assert_eq!(state(0, 76), ReplicaState::Unavailable);
+        // Without the tick the same age would already be stale.
+        let bare = StatusView::new(reported(0), 5, 60, 0);
+        assert!(bare.nodes[&1].stale);
     }
 
     #[test]
@@ -395,7 +434,7 @@ mod tests {
                 record(0, vec![replica("web", 0, ReplicaState::Available)]),
             ),
         ]);
-        let view = StatusView::new(statuses, 5, 0);
+        let view = StatusView::new(statuses, 5, 0, 0);
         let web = view.workload("shop", "staging", "web");
         assert_eq!(
             web.iter()

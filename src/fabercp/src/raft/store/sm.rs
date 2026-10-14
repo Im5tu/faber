@@ -215,11 +215,17 @@ impl StateMachineStore {
             // A report reads the mesh and writes only its own node's record:
             // it never goes through `apply_mesh`, which writes `mesh` back.
             EntryPayload::Normal(Request::ReportNode(cmd)) => {
-                let mesh = self.mesh(pending)?;
+                let stored = self.mesh(pending)?;
+                let mut mesh = stored.clone();
                 let key = status::node_key(cmd.node_id);
-                match status::apply_report_node(mesh.as_ref(), cmd) {
+                match status::apply_report_node(mesh.as_mut(), cmd) {
                     Ok(record) => {
                         pending.put(&key, &record)?;
+                        // Only a node's first report, which sets its
+                        // instance id as a renewal does, changes the mesh.
+                        if let Some(mesh) = mesh.filter(|m| Some(m) != stored.as_ref()) {
+                            pending.put(KEY_MESH, &mesh)?;
+                        }
                         Response::None
                     }
                     Err(r) => r.into(),
@@ -2481,20 +2487,47 @@ mod tests {
         assert!(rejected(ec::BAD_REQUEST)(&replies[2]), "{replies:?}");
         assert_eq!(dump(&s), before);
 
-        // The founder has no instance id yet: it reports as any machine and
-        // keeps the record unclaimed.
+        // The founder has no instance id yet. As with a renewal, an empty
+        // one claims nothing and the first real one is recorded.
         oversize.node_id = 1;
         oversize.replicas.clear();
+        oversize.instance_id = String::new();
+        let founder_id = |s: &Storage| {
+            s.reader.mesh().unwrap().unwrap().nodes[&1]
+                .instance_id
+                .clone()
+        };
         let replies = s
             .state_machine
-            .apply([normal(7, Request::ReportNode(oversize))])
+            .apply([normal(7, Request::ReportNode(oversize.clone()))])
             .await
             .unwrap();
         assert!(matches!(replies[0], Response::None), "{replies:?}");
-        assert_eq!(
-            s.reader.mesh().unwrap().unwrap().nodes[&1].instance_id,
-            None
-        );
+        assert_eq!(founder_id(&s), None);
+        oversize.instance_id = "ef".repeat(16);
+        let replies = s
+            .state_machine
+            .apply([normal(8, Request::ReportNode(oversize.clone()))])
+            .await
+            .unwrap();
+        assert!(matches!(replies[0], Response::None), "{replies:?}");
+        assert_eq!(founder_id(&s), Some("ef".repeat(16)));
+
+        // Now another machine can neither report nor renew as the founder,
+        // and a refused report changes nothing.
+        let before = dump(&s);
+        oversize.instance_id = "cd".repeat(16);
+        let replies = s
+            .state_machine
+            .apply([
+                normal(9, Request::ReportNode(oversize)),
+                normal(10, renew(1)),
+            ])
+            .await
+            .unwrap();
+        assert!(rejected(ec::FORBIDDEN)(&replies[0]), "{replies:?}");
+        assert!(rejected(ec::FORBIDDEN)(&replies[1]), "{replies:?}");
+        assert_eq!(dump(&s), before);
 
         // No mesh at all.
         let dir = tempfile::tempdir().unwrap();

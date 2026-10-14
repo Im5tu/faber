@@ -680,24 +680,40 @@ impl MeshState {
                 format!("the lease of node {node_id} has expired"),
             ));
         }
-        if node
-            .instance_id
-            .as_deref()
-            .is_some_and(|held| held != instance_id)
-        {
-            return Err(Rejection::new(
-                error_code::FORBIDDEN,
-                format!("node {node_id} is registered to another machine"),
-            ));
-        }
+        self.claim_instance(node_id, instance_id)?;
         let clock = self.clock;
         if let Some(node) = self.nodes.get_mut(&node_id) {
-            if node.instance_id.is_none() && !instance_id.is_empty() {
-                node.instance_id = Some(instance_id.to_string());
-            }
             node.lease_renewed_at = clock;
         }
         Ok(())
+    }
+
+    /// The instance id rule of every command a node sends for itself
+    /// (`RenewLease`, `ReportNode`): a record that holds an `instance_id`
+    /// accepts only that one (`forbidden` otherwise). A record without one
+    /// (the founder's is created without one) adopts the one given, unless
+    /// that is empty. Nothing changes when it fails. A node that is not in
+    /// the mesh is `mesh_node_removed`.
+    pub fn claim_instance(&mut self, node_id: u64, instance_id: &str) -> Result<(), Rejection> {
+        let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            Rejection::new(
+                error_code::MESH_NODE_REMOVED,
+                format!("node {node_id} is not in the mesh"),
+            )
+        })?;
+        match node.instance_id.as_deref() {
+            Some(held) if held != instance_id => Err(Rejection::new(
+                error_code::FORBIDDEN,
+                format!("node {node_id} is registered to another machine"),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                if !instance_id.is_empty() {
+                    node.instance_id = Some(instance_id.to_string());
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Applies `RemoveNode`: deletes the record of `node_id`, which frees

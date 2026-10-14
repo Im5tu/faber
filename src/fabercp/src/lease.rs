@@ -98,6 +98,14 @@ impl LeaseTiming {
             .max(self.tick_min)
             .min(self.tick_max)
     }
+
+    /// [`Self::tick`] in seconds of the lease clock, rounded up: the most
+    /// the clock can run ahead of what a node has reported.
+    pub fn tick_clock_secs(&self, lease_secs: u64) -> u64 {
+        let second = self.second.as_nanos().max(1);
+        let secs = self.tick(lease_secs).as_nanos().div_ceil(second);
+        u64::try_from(secs).unwrap_or(u64::MAX)
+    }
 }
 
 /// Measures the time between the ticks of one spell as leader, in whole
@@ -464,6 +472,22 @@ async fn bounded<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_tick_in_clock_seconds_follows_the_lease() {
+        let t = LeaseTiming::default();
+        assert_eq!(t.tick_clock_secs(300), 5);
+        assert_eq!(t.tick_clock_secs(1_800), 30);
+        assert_eq!(t.tick_clock_secs(28_800), 60);
+        let fast = LeaseTiming {
+            tick_min: Duration::from_millis(20),
+            tick_max: Duration::from_millis(100),
+            second: Duration::from_millis(1),
+            ..t
+        };
+        assert_eq!(fast.tick_clock_secs(300), 20);
+        assert_eq!(fast.tick_clock_secs(28_800), 100);
+    }
+
     use faber_api_types::{CreateInviteRequest, error_code};
     use faber_container_runtime::ContainerRuntimeSpec;
     use openraft::ChangeMembers;

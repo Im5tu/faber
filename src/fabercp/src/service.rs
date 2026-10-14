@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use faber_api_types::{
@@ -158,6 +158,9 @@ struct Inner {
     /// is loopback (single-host tests and dev), where every node has the
     /// same address.
     strict_peer_source: bool,
+    /// The clocks of the lease task, set once at startup. Readers of node
+    /// status need the length of a tick of the lease clock.
+    lease_timing: OnceLock<lease::LeaseTiming>,
 }
 
 impl FaberService {
@@ -185,6 +188,7 @@ impl FaberService {
                 state,
                 mesh,
                 strict_peer_source,
+                lease_timing: OnceLock::new(),
             }),
             cluster_keys: Arc::new(NoClusterKey),
         })
@@ -831,6 +835,24 @@ impl FaberService {
             }
         }
         self.report_node(report, forwarded).await
+    }
+
+    /// Tells the service the clocks of the lease task, which set how far the
+    /// lease clock can run ahead of a report. Once; later calls are ignored.
+    pub fn set_lease_timing(&self, timing: lease::LeaseTiming) {
+        let _ = self.inner.lease_timing.set(timing);
+    }
+
+    /// What the nodes reported, as of the lease clock of this node's copy of
+    /// the mesh ([`crate::status::view`]). Empty without a mesh.
+    pub(crate) fn status_view(&self) -> ServiceResult<crate::status::StatusView> {
+        let Some(mesh) = self.read_mesh()? else {
+            return Ok(Default::default());
+        };
+        let timing = self.inner.lease_timing.get().copied().unwrap_or_default();
+        let tick = timing.tick_clock_secs(mesh.lease_secs);
+        crate::status::view(&self.inner.state, mesh.clock, tick)
+            .map_err(|e| ServiceError::Internal(format!("status: {e}")))
     }
 
     /// The id and instance id this node reports with, or `None` when it has

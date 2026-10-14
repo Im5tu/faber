@@ -496,6 +496,7 @@ pub async fn start_with(
     .with_cluster_keys(Arc::new(secrets::FileClusterKey::new(
         config.cluster_key_path(),
     )));
+    service.set_lease_timing(config.lease_timing);
     let cancel = CancellationToken::new();
 
     let mcp = mcp::service(config.allowed_mcp_hosts(peer_addr), cancel.child_token());

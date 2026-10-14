@@ -246,10 +246,7 @@ impl FaberService {
         };
         // Reports are stamped with the lease clock, so staleness is judged on
         // it. Without a mesh nothing has reported.
-        let now = self.read_mesh()?.map_or(0, |mesh| mesh.clock);
-        let replicas = crate::status::view(self.state(), now)
-            .map_err(|e| read_error("status", e))?
-            .workload(project, environment, workload);
+        let replicas = self.status_view()?.workload(project, environment, workload);
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),
@@ -1788,8 +1785,14 @@ mod tests {
                 .is_empty()
         );
 
-        // Three intervals of five seconds later, with no new report.
-        svc.propose(Request::AdvanceClock { elapsed_secs: 16 })
+        // Three intervals of five seconds and a 60 second tick of the lease
+        // clock later, with no new report. Just inside that is still fine.
+        svc.propose(Request::AdvanceClock { elapsed_secs: 75 })
+            .await
+            .unwrap();
+        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        assert_eq!(got.replicas, want(true));
+        svc.propose(Request::AdvanceClock { elapsed_secs: 1 })
             .await
             .unwrap();
         let got = svc.workload("shop", "staging", "web").await.unwrap();
