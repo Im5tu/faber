@@ -5,14 +5,14 @@ use tonic::transport::Channel;
 use crate::v1::image_service_client::ImageServiceClient;
 use crate::v1::runtime_service_client::RuntimeServiceClient;
 use crate::v1::{
-    AuthConfig, Container, ContainerConfig, ContainerFilter, ContainerStatus,
-    CreateContainerRequest, Image, ImageSpec, ImageStatusRequest, ListContainersRequest,
-    ListPodSandboxRequest, PodSandbox, PodSandboxConfig, PodSandboxFilter, PodSandboxStatus,
-    PodSandboxStatusRequest, PullImageRequest, RemoveContainerRequest, RemovePodSandboxRequest,
-    RunPodSandboxRequest, StartContainerRequest, StopContainerRequest, StopPodSandboxRequest,
-    VersionRequest, VersionResponse,
+    Container, ContainerConfig, ContainerFilter, ContainerStatus, CreateContainerRequest, Image,
+    ImageSpec, ImageStatusRequest, ListContainersRequest, ListPodSandboxRequest, PodSandbox,
+    PodSandboxConfig, PodSandboxFilter, PodSandboxStatus, PodSandboxStatusRequest,
+    PullImageRequest, RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
+    StartContainerRequest, StopContainerRequest, StopPodSandboxRequest, VersionRequest,
+    VersionResponse,
 };
-use crate::{BoxFuture, CriClient, CriError, Result};
+use crate::{BoxFuture, CriClient, CriError, RegistryCredentials, Result};
 
 /// containerd's default CRI socket.
 pub const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
@@ -102,12 +102,12 @@ impl CriClient for GrpcCri {
     fn pull_image<'a>(
         &'a self,
         image: &'a str,
-        auth: Option<AuthConfig>,
+        auth: Option<RegistryCredentials>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let req = PullImageRequest {
                 image: Some(spec(image)),
-                auth,
+                auth: auth.map(Into::into),
                 sandbox_config: None,
             };
             Ok(self

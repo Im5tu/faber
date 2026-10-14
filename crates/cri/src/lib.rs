@@ -4,6 +4,7 @@
 //! The wire types are generated from the vendored `kubernetes/cri-api`
 //! v0.34.0 `api.proto` (see the crate README) and live in [`v1`].
 
+mod credentials;
 mod error;
 pub mod fake;
 mod grpc;
@@ -11,6 +12,7 @@ mod grpc;
 use std::future::Future;
 use std::pin::Pin;
 
+pub use credentials::RegistryCredentials;
 pub use error::CriError;
 pub use grpc::{DEFAULT_SOCKET, GrpcCri};
 
@@ -29,8 +31,8 @@ pub mod v1 {
 }
 
 pub use v1::{
-    AuthConfig, Container, ContainerConfig, ContainerFilter, ContainerState, ContainerStatus,
-    Image, PodSandbox, PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStatus,
+    Container, ContainerConfig, ContainerFilter, ContainerState, ContainerStatus, Image,
+    PodSandbox, PodSandboxConfig, PodSandboxFilter, PodSandboxState, PodSandboxStatus,
     VersionResponse,
 };
 
@@ -49,7 +51,7 @@ pub trait CriClient: Send + Sync {
     fn pull_image<'a>(
         &'a self,
         image: &'a str,
-        auth: Option<AuthConfig>,
+        auth: Option<RegistryCredentials>,
     ) -> BoxFuture<'a, Result<String>>;
 
     /// Returns the new sandbox id.

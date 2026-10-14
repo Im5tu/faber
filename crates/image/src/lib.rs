@@ -2,7 +2,7 @@
 //!
 //! Image references are passed to the runtime as given; no normalisation.
 
-use faber_cri::{AuthConfig, BoxFuture, CriClient, CriError};
+use faber_cri::{BoxFuture, CriClient, CriError, RegistryCredentials};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
@@ -33,7 +33,7 @@ pub trait RegistryAuth: Send + Sync {
     fn auth_for<'a>(
         &'a self,
         image: &'a str,
-    ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>>;
+    ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>>;
 }
 
 /// No credentials, for public registries.
@@ -44,7 +44,7 @@ impl RegistryAuth for Anonymous {
     fn auth_for<'a>(
         &'a self,
         _image: &'a str,
-    ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+    ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -106,9 +106,9 @@ mod tests {
         fn auth_for<'a>(
             &'a self,
             image: &'a str,
-        ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+        ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>> {
             Box::pin(async move {
-                Ok(Some(AuthConfig {
+                Ok(Some(RegistryCredentials {
                     username: "bot".to_owned(),
                     server_address: image.split('/').next().unwrap_or_default().to_owned(),
                     ..Default::default()
@@ -123,7 +123,7 @@ mod tests {
         fn auth_for<'a>(
             &'a self,
             _image: &'a str,
-        ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+        ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>> {
             Box::pin(async { Err(AuthError("vault sealed".to_owned())) })
         }
     }

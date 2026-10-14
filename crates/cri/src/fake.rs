@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
-    AuthConfig, BoxFuture, Container, ContainerConfig, ContainerFilter, ContainerState,
-    ContainerStatus, CriClient, CriError, Image, PodSandbox, PodSandboxConfig, PodSandboxFilter,
-    PodSandboxState, PodSandboxStatus, Result, VersionResponse,
+    BoxFuture, Container, ContainerConfig, ContainerFilter, ContainerState, ContainerStatus,
+    CriClient, CriError, Image, PodSandbox, PodSandboxConfig, PodSandboxFilter, PodSandboxState,
+    PodSandboxStatus, RegistryCredentials, Result, VersionResponse,
 };
 
 /// One call made on a [`FakeCri`], in order.
@@ -17,7 +17,7 @@ pub enum Call {
     ImageStatus(String),
     PullImage {
         image: String,
-        auth: Option<AuthConfig>,
+        auth: Option<RegistryCredentials>,
     },
     RunPodSandbox {
         runtime_handler: String,
@@ -188,7 +188,7 @@ impl CriClient for FakeCri {
     fn pull_image<'a>(
         &'a self,
         image: &'a str,
-        auth: Option<AuthConfig>,
+        auth: Option<RegistryCredentials>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let mut s = self.lock();
@@ -478,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn pull_records_auth() {
         let cri = FakeCri::new();
-        let auth = AuthConfig {
+        let auth = RegistryCredentials {
             username: "u".to_owned(),
             ..Default::default()
         };
@@ -490,6 +490,18 @@ mod tests {
                 auth: Some(auth)
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn call_debug_redacts_credentials() {
+        let cri = FakeCri::new();
+        let auth = RegistryCredentials {
+            username: "user-secret".to_owned(),
+            password: "pw-secret".to_owned(),
+            ..Default::default()
+        };
+        cri.pull_image("a/b", Some(auth)).await.unwrap();
+        assert!(!format!("{:?}", cri.calls()).contains("secret"));
     }
 
     #[tokio::test]
