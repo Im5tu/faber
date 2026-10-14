@@ -128,7 +128,7 @@ impl CriClient for GrpcCri {
             let req = VersionRequest {
                 version: API_VERSION.to_owned(),
             };
-            Ok(call(self.timeouts.call, self.runtime.clone().version(req)).await?)
+            call(self.timeouts.call, self.runtime.clone().version(req)).await
         })
     }
 
