@@ -736,6 +736,7 @@ version = "0.1.0"
 dependencies = [
  "faber-cri",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
