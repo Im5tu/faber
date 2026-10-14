@@ -53,6 +53,7 @@ base64 = "0.22"
 ipnet = { version = "2", features = ["serde"] }
 getrandom = "0.4"
 tonic = "0.14"
+tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 hyper-util = { version = "0.1", features = ["tokio"] }
