@@ -14,6 +14,8 @@ pub enum CriError {
     Unavailable(String),
     #[error("cri call failed ({code:?}): {message}")]
     Other { code: Code, message: String },
+    #[error("cri call timed out after {0:?}")]
+    Timeout(std::time::Duration),
     #[error("connecting to the runtime: {0}")]
     Connect(String),
     #[error("the CRI client needs a Unix socket and is unsupported on this platform")]

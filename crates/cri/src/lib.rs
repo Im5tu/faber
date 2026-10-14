@@ -14,7 +14,7 @@ use std::pin::Pin;
 
 pub use credentials::RegistryCredentials;
 pub use error::CriError;
-pub use grpc::{DEFAULT_SOCKET, GrpcCri};
+pub use grpc::{DEFAULT_SOCKET, GrpcCri, Timeouts};
 
 /// Generated CRI v1 messages and clients.
 #[allow(

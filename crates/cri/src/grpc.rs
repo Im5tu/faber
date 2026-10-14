@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use tonic::transport::Channel;
 
@@ -20,9 +22,42 @@ pub const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
 /// The CRI version this client speaks, sent in `Version`.
 const API_VERSION: &str = "v1";
 
+/// Time limits for [`GrpcCri`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Establishing the socket connection.
+    pub connect: Duration,
+    /// Each call except image pulls.
+    pub call: Duration,
+    /// Image pulls, which can legitimately take minutes.
+    pub pull: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            call: Duration::from_secs(30),
+            pull: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+/// Awaits a gRPC call under `limit`, turning expiry into [`CriError::Timeout`].
+async fn call<T>(
+    limit: Duration,
+    fut: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(response) => Ok(response?.into_inner()),
+        Err(_) => Err(CriError::Timeout(limit)),
+    }
+}
+
 /// CRI client over a Unix socket (containerd). Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct GrpcCri {
+    timeouts: Timeouts,
     runtime: RuntimeServiceClient<Channel>,
     image: ImageServiceClient<Channel>,
 }
@@ -31,6 +66,12 @@ impl GrpcCri {
     /// Connects to the runtime socket at `path`.
     #[cfg(unix)]
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with(path, Timeouts::default()).await
+    }
+
+    /// Connects to the runtime socket at `path` with explicit time limits.
+    #[cfg(unix)]
+    pub async fn connect_with(path: impl AsRef<Path>, timeouts: Timeouts) -> Result<Self> {
         use hyper_util::rt::TokioIo;
         use tonic::transport::{Endpoint, Uri};
         use tower::service_fn;
@@ -38,6 +79,7 @@ impl GrpcCri {
         let path = path.as_ref().to_path_buf();
         // The URI is required by tonic but ignored by the connector.
         let channel = Endpoint::from_static("http://localhost")
+            .connect_timeout(timeouts.connect)
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = path.clone();
                 async move {
@@ -49,6 +91,7 @@ impl GrpcCri {
             .await
             .map_err(|e| CriError::Connect(e.to_string()))?;
         Ok(Self {
+            timeouts,
             runtime: RuntimeServiceClient::new(channel.clone()),
             image: ImageServiceClient::new(channel),
         })
@@ -56,7 +99,13 @@ impl GrpcCri {
 
     /// Connects to the runtime socket at `path`.
     #[cfg(not(unix))]
-    pub async fn connect(_path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with(path, Timeouts::default()).await
+    }
+
+    /// Connects to the runtime socket at `path` with explicit time limits.
+    #[cfg(not(unix))]
+    pub async fn connect_with(_path: impl AsRef<Path>, _timeouts: Timeouts) -> Result<Self> {
         Err(CriError::Unsupported)
     }
 
@@ -79,7 +128,7 @@ impl CriClient for GrpcCri {
             let req = VersionRequest {
                 version: API_VERSION.to_owned(),
             };
-            Ok(self.runtime.clone().version(req).await?.into_inner())
+            Ok(call(self.timeouts.call, self.runtime.clone().version(req)).await?)
         })
     }
 
@@ -89,13 +138,11 @@ impl CriClient for GrpcCri {
                 image: Some(spec(image)),
                 verbose: false,
             };
-            Ok(self
-                .image
-                .clone()
-                .image_status(req)
-                .await?
-                .into_inner()
-                .image)
+            Ok(
+                call(self.timeouts.call, self.image.clone().image_status(req))
+                    .await?
+                    .image,
+            )
         })
     }
 
@@ -110,12 +157,8 @@ impl CriClient for GrpcCri {
                 auth: auth.map(Into::into),
                 sandbox_config: None,
             };
-            Ok(self
-                .image
-                .clone()
-                .pull_image(req)
+            Ok(call(self.timeouts.pull, self.image.clone().pull_image(req))
                 .await?
-                .into_inner()
                 .image_ref)
         })
     }
@@ -130,13 +173,12 @@ impl CriClient for GrpcCri {
                 config: Some(config),
                 runtime_handler: runtime_handler.to_owned(),
             };
-            Ok(self
-                .runtime
-                .clone()
-                .run_pod_sandbox(req)
-                .await?
-                .into_inner()
-                .pod_sandbox_id)
+            Ok(call(
+                self.timeouts.call,
+                self.runtime.clone().run_pod_sandbox(req),
+            )
+            .await?
+            .pod_sandbox_id)
         })
     }
 
@@ -145,7 +187,11 @@ impl CriClient for GrpcCri {
             let req = StopPodSandboxRequest {
                 pod_sandbox_id: id.to_owned(),
             };
-            self.runtime.clone().stop_pod_sandbox(req).await?;
+            call(
+                self.timeouts.call,
+                self.runtime.clone().stop_pod_sandbox(req),
+            )
+            .await?;
             Ok(())
         })
     }
@@ -155,7 +201,11 @@ impl CriClient for GrpcCri {
             let req = RemovePodSandboxRequest {
                 pod_sandbox_id: id.to_owned(),
             };
-            self.runtime.clone().remove_pod_sandbox(req).await?;
+            call(
+                self.timeouts.call,
+                self.runtime.clone().remove_pod_sandbox(req),
+            )
+            .await?;
             Ok(())
         })
     }
@@ -166,13 +216,12 @@ impl CriClient for GrpcCri {
     ) -> BoxFuture<'_, Result<Vec<PodSandbox>>> {
         Box::pin(async move {
             let req = ListPodSandboxRequest { filter };
-            Ok(self
-                .runtime
-                .clone()
-                .list_pod_sandbox(req)
-                .await?
-                .into_inner()
-                .items)
+            Ok(call(
+                self.timeouts.call,
+                self.runtime.clone().list_pod_sandbox(req),
+            )
+            .await?
+            .items)
         })
     }
 
@@ -182,13 +231,13 @@ impl CriClient for GrpcCri {
                 pod_sandbox_id: id.to_owned(),
                 verbose: false,
             };
-            self.runtime
-                .clone()
-                .pod_sandbox_status(req)
-                .await?
-                .into_inner()
-                .status
-                .ok_or(CriError::MalformedResponse("pod sandbox status"))
+            call(
+                self.timeouts.call,
+                self.runtime.clone().pod_sandbox_status(req),
+            )
+            .await?
+            .status
+            .ok_or(CriError::MalformedResponse("pod sandbox status"))
         })
     }
 
@@ -204,13 +253,12 @@ impl CriClient for GrpcCri {
                 config: Some(config),
                 sandbox_config: Some(sandbox_config),
             };
-            Ok(self
-                .runtime
-                .clone()
-                .create_container(req)
-                .await?
-                .into_inner()
-                .container_id)
+            Ok(call(
+                self.timeouts.call,
+                self.runtime.clone().create_container(req),
+            )
+            .await?
+            .container_id)
         })
     }
 
@@ -219,7 +267,11 @@ impl CriClient for GrpcCri {
             let req = StartContainerRequest {
                 container_id: id.to_owned(),
             };
-            self.runtime.clone().start_container(req).await?;
+            call(
+                self.timeouts.call,
+                self.runtime.clone().start_container(req),
+            )
+            .await?;
             Ok(())
         })
     }
@@ -230,7 +282,7 @@ impl CriClient for GrpcCri {
                 container_id: id.to_owned(),
                 timeout: timeout_secs,
             };
-            self.runtime.clone().stop_container(req).await?;
+            call(self.timeouts.call, self.runtime.clone().stop_container(req)).await?;
             Ok(())
         })
     }
@@ -240,7 +292,11 @@ impl CriClient for GrpcCri {
             let req = RemoveContainerRequest {
                 container_id: id.to_owned(),
             };
-            self.runtime.clone().remove_container(req).await?;
+            call(
+                self.timeouts.call,
+                self.runtime.clone().remove_container(req),
+            )
+            .await?;
             Ok(())
         })
     }
@@ -251,13 +307,12 @@ impl CriClient for GrpcCri {
     ) -> BoxFuture<'_, Result<Vec<Container>>> {
         Box::pin(async move {
             let req = ListContainersRequest { filter };
-            Ok(self
-                .runtime
-                .clone()
-                .list_containers(req)
-                .await?
-                .into_inner()
-                .containers)
+            Ok(call(
+                self.timeouts.call,
+                self.runtime.clone().list_containers(req),
+            )
+            .await?
+            .containers)
         })
     }
 
@@ -267,14 +322,37 @@ impl CriClient for GrpcCri {
                 container_id: id.to_owned(),
                 verbose: false,
             };
-            self.runtime
-                .clone()
-                .container_status(req)
-                .await?
-                .into_inner()
-                .status
-                .ok_or(CriError::MalformedResponse("container status"))
+            call(
+                self.timeouts.call,
+                self.runtime.clone().container_status(req),
+            )
+            .await?
+            .status
+            .ok_or(CriError::MalformedResponse("container status"))
         })
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn call_times_out() {
+        let err = call::<()>(Duration::from_millis(10), std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CriError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn call_maps_status_errors() {
+        let err = call::<()>(Duration::from_secs(1), async {
+            Err(tonic::Status::not_found("x"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.is_not_found());
     }
 }
 
