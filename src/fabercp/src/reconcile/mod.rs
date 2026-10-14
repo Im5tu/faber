@@ -18,12 +18,14 @@
 //! wakes on a state-machine watch tick (debounced), on the resync interval,
 //! and when the earliest live invite expires (expiry changes the peer set
 //! without any write). When the desired state differs from the last applied
-//! one (or on the resync tick) it runs [`apply_host`]: `network.reconcile`,
-//! then `runtime.reconcile`. A failing step does not skip the other; any
-//! failure is logged and the loop backs off.
+//! one (or on the resync tick) it runs the [`step`]s in order: network, then
+//! runtime configuration. Each step applies only when its own desired value
+//! changed, or on the resync tick. A failing step does not skip the others;
+//! any failure is logged and the loop backs off.
 
 pub mod containers;
 pub mod services;
+pub mod step;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -46,6 +48,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use self::step::{
+    Planned, ReconcileStep, ReplicatedStateView, StepFuture, StepRunner, StepValue, spawn_steps,
+};
 use crate::config::DEFAULT_RECONCILE_INTERVAL_SECS;
 use crate::mesh::state::{MeshConfig, MeshState, WG_KEEPALIVE_SECS};
 use crate::mesh::token::TokenPeer;
@@ -313,44 +318,117 @@ pub struct HostBackends {
     pub runtime: Arc<dyn ContainerRuntime>,
 }
 
-/// Everything the host reconcile loop applies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostDesired {
-    pub network: NetworkSpec,
-    pub runtime: Option<NodeRuntimeSpec>,
+/// The network step: `network.reconcile` for the WireGuard and nftables state
+/// [`desired_network`] derives.
+pub struct NetworkStep {
+    network: NetworkManager,
+    iface: String,
+    identity: Identity,
+    join_pending: JoinPending,
+    peer_port: u16,
 }
 
-/// `network.reconcile`, then `runtime.reconcile`. The runtime step runs even
-/// if the network step failed; each failure is logged, and the result is an
-/// error if either failed so the loop backs off and retries.
-pub async fn apply_host(backends: &HostBackends, desired: &HostDesired) -> anyhow::Result<()> {
-    let network = backends
-        .network
-        .reconcile(&desired.network)
-        .await
-        .map_err(anyhow::Error::from);
-    if let Err(e) = &network {
-        tracing::warn!(step = "network", error = %format!("{e:#}"), "host apply step failed");
-    }
-    let runtime = match &desired.runtime {
-        Some(spec) => backends
-            .runtime
-            .reconcile(spec)
-            .await
-            .map_err(anyhow::Error::from),
-        None => Ok(false),
-    };
-    match &runtime {
-        Ok(true) => tracing::info!("container runtime configuration updated"),
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(step = "runtime", error = %format!("{e:#}"), "host apply step failed");
+impl NetworkStep {
+    pub fn new(
+        network: NetworkManager,
+        iface: String,
+        identity: Identity,
+        join_pending: JoinPending,
+        peer_port: u16,
+    ) -> Self {
+        Self {
+            network,
+            iface,
+            identity,
+            join_pending,
+            peer_port,
         }
     }
-    match (network, runtime) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(e), Ok(_)) | (Ok(()), Err(e)) => Err(e),
-        (Err(n), Err(r)) => Err(anyhow::anyhow!("network: {n:#}; runtime: {r:#}")),
+}
+
+impl ReconcileStep for NetworkStep {
+    type Desired = NetworkSpec;
+
+    fn name(&self) -> &'static str {
+        "network"
+    }
+
+    fn plan(&self, view: &ReplicatedStateView) -> Planned<NetworkSpec> {
+        // The copy from startup still has the pending join after the node
+        // became a voter. The token's peers must go then.
+        let joined;
+        let identity = if self.join_pending.is_pending() {
+            &self.identity
+        } else {
+            joined = Identity {
+                pending_join: None,
+                ..self.identity.clone()
+            };
+            &joined
+        };
+        let (desired, warnings) = desired_network(
+            identity,
+            &self.iface,
+            self.peer_port,
+            view.mesh.as_ref(),
+            view.now,
+        );
+        Planned { desired, warnings }
+    }
+
+    fn apply<'a>(&'a self, desired: &'a NetworkSpec) -> StepFuture<'a> {
+        Box::pin(async move { Ok(self.network.reconcile(desired).await?) })
+    }
+}
+
+/// The runtime configuration step: `runtime.reconcile` for what
+/// [`desired_runtime`] derives. Nothing is applied while `InitCluster` has
+/// not replicated the settings.
+pub struct RuntimeStep {
+    runtime: Arc<dyn ContainerRuntime>,
+    node_id: u64,
+    cni_conf_dir: PathBuf,
+}
+
+impl RuntimeStep {
+    pub fn new(runtime: Arc<dyn ContainerRuntime>, node_id: u64, cni_conf_dir: PathBuf) -> Self {
+        Self {
+            runtime,
+            node_id,
+            cni_conf_dir,
+        }
+    }
+}
+
+impl ReconcileStep for RuntimeStep {
+    type Desired = Option<NodeRuntimeSpec>;
+
+    fn name(&self) -> &'static str {
+        "runtime"
+    }
+
+    fn plan(&self, view: &ReplicatedStateView) -> Planned<Option<NodeRuntimeSpec>> {
+        let warnings = view
+            .containerd
+            .as_ref()
+            .and_then(|settings| cni_dir_warning(settings, &self.cni_conf_dir))
+            .into_iter()
+            .collect();
+        Planned {
+            desired: desired_runtime(view.containerd.clone(), view.mesh.as_ref(), self.node_id),
+            warnings,
+        }
+    }
+
+    fn apply<'a>(&'a self, desired: &'a Option<NodeRuntimeSpec>) -> StepFuture<'a> {
+        Box::pin(async move {
+            if let Some(spec) = desired
+                && self.runtime.reconcile(spec).await?
+            {
+                tracing::info!("container runtime configuration updated");
+            }
+            Ok(())
+        })
     }
 }
 
@@ -377,77 +455,35 @@ pub struct HostReconciler {
     pub reader: StateReader,
 }
 
-/// [`HostReconciler::plan`]: the desired state as of now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostPlan {
-    pub desired: HostDesired,
-    /// One line per peer, endpoint or container subnet skipped because it
-    /// is malformed, and one when [`cni_dir_warning`] has something to say.
-    pub warnings: Vec<String>,
-    /// [`next_invite_expiry`]: when `desired` changes with no state change.
-    pub next_change: Option<Duration>,
-}
-
 impl HostReconciler {
-    /// [`desired_network`] and [`desired_runtime`] from the replicated state
-    /// as it is now. Both read this node's container subnet from the same
-    /// `mesh`, so the route, the firewall and the CNI config agree.
-    pub fn plan(&self) -> Result<HostPlan, ReadError> {
-        let mesh = self.reader.mesh()?;
-        let settings = self.reader.containerd()?;
-        let now = now_secs();
-        // The copy from startup still has the pending join after the node
-        // became a voter. The token's peers must go then.
-        let joined;
-        let identity = if self.join_pending.is_pending() {
-            &self.identity
-        } else {
-            joined = Identity {
-                pending_join: None,
-                ..self.identity.clone()
-            };
-            &joined
-        };
-        let (network, mut warnings) =
-            desired_network(identity, &self.iface, self.peer_port, mesh.as_ref(), now);
-        if let Some(settings) = &settings {
-            warnings.extend(cni_dir_warning(settings, &self.cni_conf_dir));
-        }
-        let runtime = desired_runtime(settings, mesh.as_ref(), self.identity.node_id);
-        Ok(HostPlan {
-            desired: HostDesired { network, runtime },
-            warnings,
-            next_change: next_invite_expiry(mesh.as_ref(), now),
-        })
+    /// The replicated state as it is now. Every step plans from the same
+    /// view, so the route, the firewall and the CNI config agree on this
+    /// node's container subnet.
+    pub fn view(&self) -> Result<ReplicatedStateView, ReadError> {
+        ReplicatedStateView::read(&self.reader, now_secs())
     }
 
-    /// Spawns the one host reconcile loop: [`Self::plan`], applied with
-    /// [`apply_host`]. `applied` is the state startup already applied, if
-    /// any; the loop does not apply it a second time.
+    /// Spawns the one host reconcile loop over `runner`'s steps (see
+    /// [`crate::host_steps`]). `applied`
+    /// is the desired state startup already brought up through `runner`; the
+    /// loop does not apply it a second time.
     pub fn spawn(
         self,
         timing: ReconcileTiming,
-        applied: Option<HostDesired>,
+        runner: StepRunner,
+        applied: Vec<StepValue>,
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let changes = self.reader.subscribe();
-        let backends = self.backends.clone();
-        let compute = move || match self.plan() {
-            Ok(plan) => {
-                for w in plan.warnings {
-                    tracing::debug!("{w}");
-                }
-                (Some(plan.desired), plan.next_change)
-            }
-            Err(_) => (None, None),
-        };
-        let apply = move |desired: HostDesired| {
-            let backends = backends.clone();
-            async move { apply_host(&backends, &desired).await }
-        };
-        tokio::spawn(run_reconciler(
-            "host", changes, timing, applied, compute, apply, shutdown,
-        ))
+        spawn_steps(
+            "host",
+            changes,
+            timing,
+            runner,
+            Some(applied),
+            move || self.view(),
+            shutdown,
+        )
     }
 }
 
@@ -588,6 +624,34 @@ impl ReconcileTiming {
     }
 }
 
+/// [`run_loop`] for loops whose `apply` ignores the resync flag.
+#[cfg(test)]
+async fn run_reconciler<D, C, A, F>(
+    name: &'static str,
+    changes: watch::Receiver<u64>,
+    timing: ReconcileTiming,
+    applied: Option<D>,
+    compute: C,
+    apply: A,
+    shutdown: CancellationToken,
+) where
+    D: Clone + PartialEq + Send + 'static,
+    C: Fn() -> (Option<D>, Option<Duration>) + Send + 'static,
+    A: Fn(D) -> F + Send + 'static,
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    run_loop(
+        name,
+        changes,
+        timing,
+        applied,
+        compute,
+        move |desired, _resync| apply(desired),
+        shutdown,
+    )
+    .await;
+}
+
 /// A reconcile loop named `name` (used in logs). It is generic over the
 /// desired state so that its timing and failure handling are tested without a
 /// host; [`HostReconciler::spawn`] is the one production caller.
@@ -610,7 +674,11 @@ impl ReconcileTiming {
 /// not cut it short. The loop ends when `shutdown` is cancelled or the
 /// `changes` sender is dropped (storage is closed, so there is nothing left
 /// to read); an `apply` already running is allowed to finish first.
-async fn run_reconciler<D, C, A, F>(
+///
+/// `apply` also learns whether the pass was forced by a resync (or is the
+/// first one), so that it can re-apply what has not changed on those passes
+/// only.
+async fn run_loop<D, C, A, F>(
     name: &'static str,
     mut changes: watch::Receiver<u64>,
     timing: ReconcileTiming,
@@ -621,7 +689,7 @@ async fn run_reconciler<D, C, A, F>(
 ) where
     D: Clone + PartialEq + Send + 'static,
     C: Fn() -> (Option<D>, Option<Duration>) + Send + 'static,
-    A: Fn(D) -> F + Send + 'static,
+    A: Fn(D, bool) -> F + Send + 'static,
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let mut force = applied.is_none();
@@ -652,7 +720,7 @@ async fn run_reconciler<D, C, A, F>(
             }
             Ok(Some(desired)) if force || last_applied.as_ref() != Some(&desired) => {
                 // Run on its own task so a panic in `apply` is contained.
-                match tokio::spawn(apply(desired.clone())).await {
+                match tokio::spawn(apply(desired.clone(), force)).await {
                     Ok(Ok(())) => {
                         if failures > 0 {
                             tracing::info!(reconciler = name, "applied after {failures} failures");
@@ -756,6 +824,7 @@ mod tests {
         DEFAULT_LEASE_SECS, InviteRecord, MeshConfig, NodeRecord, WG_KEEPALIVE_SECS,
     };
     use crate::mesh::{PendingJoin, PrivateKey};
+    use crate::reconcile::step::StepList;
 
     // ---- derivation ----
 
@@ -1097,7 +1166,7 @@ mod tests {
             reader: storage.reader.clone(),
         };
         let keys = |host: &HostReconciler| -> Vec<String> {
-            let plan = host.plan().unwrap();
+            let plan = plan_of(host);
             let peers = plan.desired.network.wireguard.peers;
             peers.into_iter().map(|p| p.public_key).collect()
         };
@@ -1746,7 +1815,7 @@ mod tests {
         );
     }
 
-    /// [`HostReconciler::plan`] over real storage: nothing before
+    /// [`crate::host_steps`] over real storage: nothing before
     /// `InitCluster`, and after it the founder's subnet in every part of the
     /// plan.
     #[tokio::test]
@@ -1773,7 +1842,7 @@ mod tests {
 
         // Nothing replicated: no runtime spec, so no directory to compare.
         for host in [&replicated, &elsewhere] {
-            let plan = host.plan().unwrap();
+            let plan = plan_of(host);
             assert_eq!(plan.desired.runtime, None);
             assert!(plan.desired.network.wireguard.routes.is_empty());
             assert_eq!(plan.desired.network.firewall.containers, None);
@@ -1793,7 +1862,7 @@ mod tests {
         };
         storage.state_machine.apply([seed]).await.unwrap();
 
-        let plan = replicated.plan().unwrap();
+        let plan = plan_of(&replicated);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         let own = net("10.200.0.0/24");
         assert_eq!(plan.desired.network.wireguard.routes, vec![net(RANGE)]);
@@ -1812,7 +1881,7 @@ mod tests {
         // The same state with another local directory: one warning, on every
         // plan, and the same desired state.
         for _ in 0..2 {
-            let other = elsewhere.plan().unwrap();
+            let other = plan_of(&elsewhere);
             assert_eq!(other.desired, plan.desired);
             assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
             assert!(other.warnings[0].contains("/var/tmp/cni"));
@@ -2123,6 +2192,58 @@ mod tests {
             settings: ContainerRuntimeSpec::default(),
             pod_network: None,
         }
+    }
+
+    /// What the host steps want, as typed values.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HostDesired {
+        network: NetworkSpec,
+        runtime: Option<NodeRuntimeSpec>,
+    }
+
+    struct HostPlan {
+        desired: HostDesired,
+        warnings: Vec<String>,
+    }
+
+    /// The host steps planned against `host`'s replicated state.
+    fn plan_of(host: &HostReconciler) -> HostPlan {
+        let plan = crate::host_steps(host).plan(&host.view().unwrap());
+        let network = plan.desired[0].downcast_ref::<NetworkSpec>().unwrap();
+        let runtime = plan.desired[1]
+            .downcast_ref::<Option<NodeRuntimeSpec>>()
+            .unwrap();
+        HostPlan {
+            desired: HostDesired {
+                network: network.clone(),
+                runtime: runtime.clone(),
+            },
+            warnings: plan.warnings,
+        }
+    }
+
+    /// The host steps applied once, network then runtime.
+    async fn apply_host(backends: &HostBackends, desired: &HostDesired) -> anyhow::Result<()> {
+        let runner = StepRunner::new(
+            StepList::default()
+                .with(NetworkStep {
+                    network: backends.network.clone(),
+                    iface: "faber0".into(),
+                    identity: local(2),
+                    join_pending: JoinPending::new(false),
+                    peer_port: 7401,
+                })
+                .with(RuntimeStep {
+                    runtime: backends.runtime.clone(),
+                    node_id: 2,
+                    cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
+                }),
+        );
+        let values = [
+            StepValue::new(desired.network.clone()),
+            StepValue::new(desired.runtime.clone()),
+        ];
+        runner.apply(&values, false).await
     }
 
     fn host_desired(runtime: Option<NodeRuntimeSpec>) -> HostDesired {

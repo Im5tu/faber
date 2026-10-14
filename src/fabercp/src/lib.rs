@@ -72,7 +72,8 @@ use crate::raft::rpc::{RaftGate, SourceCheck};
 use crate::raft::store::StateReader;
 use crate::raft::types::{Node, NodeId, Raft};
 use crate::raft::{rpc, store};
-use crate::reconcile::{HostDesired, HostReconciler, ReconcileTiming};
+use crate::reconcile::step::{StepList, StepRunner, StepValue};
+use crate::reconcile::{HostReconciler, NetworkStep, ReconcileTiming, RuntimeStep};
 use crate::service::{MeshLocal, now_secs};
 
 /// How long shutdown waits for in-flight HTTP requests and for storage to close.
@@ -417,7 +418,7 @@ pub async fn start_with(
             cni_conf_dir: config.cni_conf_dir.clone(),
             reader: reader.clone(),
         });
-    let applied = match &host {
+    let started = match &host {
         Some(host) => Some(bring_up_host(host).await?),
         None => None,
     };
@@ -523,7 +524,7 @@ pub async fn start_with(
     let mut tasks = Vec::new();
     // The host loop has a stop of its own: a rejected invite ends it while
     // the rest of the node stays up. `host` implies `identity`.
-    let host = host.map(|host| {
+    let host = host.zip(started).map(|(host, (runner, applied))| {
         let stop = cancel.child_token();
         HostControl {
             network: host.backends.network.clone(),
@@ -533,6 +534,7 @@ pub async fn start_with(
             stop: stop.clone(),
             task: host.spawn(
                 ReconcileTiming::with_resync(Duration::from_secs(config.reconcile_interval_secs)),
+                runner,
                 applied,
                 stop,
             ),
@@ -794,26 +796,40 @@ async fn stored_member(data_dir: &Path, node_id: u64) -> anyhow::Result<bool> {
     Ok(member)
 }
 
+/// The host reconcile steps, in the order they run: network, then runtime
+/// configuration. Later steps are added here.
+pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
+    StepRunner::new(
+        StepList::default()
+            .with(NetworkStep::new(
+                host.backends.network.clone(),
+                host.iface.clone(),
+                host.identity.clone(),
+                host.join_pending.clone(),
+                host.peer_port,
+            ))
+            .with(RuntimeStep::new(
+                host.backends.runtime.clone(),
+                host.identity.node_id,
+                host.cni_conf_dir.clone(),
+            )),
+    )
+}
+
 /// Startup host setup, in the contract order: `network.reconcile` (wg up,
-/// then `nft -f -`), then `runtime.reconcile`. The same desired state and the
-/// same calls as the reconcile loop, except that the first failure stops
-/// startup. Returns what was applied, to seed the loop. The interface has
-/// been claimed ([`claim_interface`]) by now.
-async fn bring_up_host(host: &HostReconciler) -> anyhow::Result<HostDesired> {
-    let plan = host.plan().context("reading replicated state")?;
+/// then `nft -f -`), then `runtime.reconcile`. The same steps and the same
+/// calls as the reconcile loop, except that the first failure stops startup.
+/// Returns the steps and what they applied, to seed the loop. The interface
+/// has been claimed ([`claim_interface`]) by now.
+async fn bring_up_host(host: &HostReconciler) -> anyhow::Result<(StepRunner, Vec<StepValue>)> {
+    let runner = host_steps(host);
+    let view = host.view().context("reading replicated state")?;
+    let plan = runner.plan(&view);
     for w in &plan.warnings {
         tracing::warn!("{w}");
     }
-    host.backends
-        .network
-        .reconcile(&plan.desired.network)
-        .await?;
-    if let Some(spec) = &plan.desired.runtime
-        && host.backends.runtime.reconcile(spec).await?
-    {
-        tracing::info!("container runtime configuration updated");
-    }
-    Ok(plan.desired)
+    runner.bring_up(&plan.desired).await?;
+    Ok((runner, plan.desired))
 }
 
 /// Creates `--state-dir` if it is missing (mode 0700 on unix). Under systemd
