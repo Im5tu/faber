@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use super::{CF_SM_DATA, CF_SM_META, cf, write_synced};
+use super::{CF_SM_DATA, CF_SM_META, cf, keys, place, services, status, write_synced};
 use crate::apps::state::{ENV_PREFIX, KEY_PROJECTS, env_key, is_reserved_key};
 use crate::apps::{EnvironmentRecord, ProjectIndex};
 use crate::mesh::state::{KEY_CONTAINERD, KEY_MESH, RESERVED_KEYS};
@@ -201,6 +201,21 @@ impl StateMachineStore {
                 | Request::ApplyWorkloads { .. }
                 | Request::RemoveWorkloads { .. }),
             ) => self.apply_apps(pending, req, entry.log_id.index)?,
+            EntryPayload::Normal(Request::CreateDataKey(cmd)) => keys::apply_create_data_key(cmd),
+            EntryPayload::Normal(Request::SetClusterKeyId(cmd)) => {
+                keys::apply_set_cluster_key_id(cmd)
+            }
+            EntryPayload::Normal(Request::PlaceReplicas(cmd)) => place::apply_place_replicas(cmd),
+            EntryPayload::Normal(Request::ReportNode(cmd)) => status::apply_report_node(cmd),
+            EntryPayload::Normal(Request::SetStatusInterval(cmd)) => {
+                status::apply_set_status_interval(cmd)
+            }
+            EntryPayload::Normal(Request::AllocateServiceIp(cmd)) => {
+                services::apply_allocate_service_ip(cmd)
+            }
+            EntryPayload::Normal(Request::ReleaseServiceIp(cmd)) => {
+                services::apply_release_service_ip(cmd)
+            }
             EntryPayload::Normal(req) => self.apply_mesh(pending, req)?,
             EntryPayload::Membership(m) => {
                 pending.membership = Some(StoredMembership::new(Some(entry.log_id), m));
@@ -299,7 +314,14 @@ impl StateMachineStore {
             | Request::AdvanceClock { .. }
             | Request::RenewLease { .. }
             | Request::RemoveNode { .. }
-            | Request::SetLease { .. } => Err(Rejection::new(
+            | Request::SetLease { .. }
+            | Request::CreateDataKey(_)
+            | Request::SetClusterKeyId(_)
+            | Request::PlaceReplicas(_)
+            | Request::ReportNode(_)
+            | Request::SetStatusInterval(_)
+            | Request::AllocateServiceIp(_)
+            | Request::ReleaseServiceIp(_) => Err(Rejection::new(
                 faber_api_types::error_code::INTERNAL,
                 "not a project or workload command",
             )),
@@ -434,7 +456,14 @@ impl StateMachineStore {
             | Request::AddEnvironment { .. }
             | Request::RemoveEnvironment { .. }
             | Request::ApplyWorkloads { .. }
-            | Request::RemoveWorkloads { .. } => Err(Rejection::new(
+            | Request::RemoveWorkloads { .. }
+            | Request::CreateDataKey(_)
+            | Request::SetClusterKeyId(_)
+            | Request::PlaceReplicas(_)
+            | Request::ReportNode(_)
+            | Request::SetStatusInterval(_)
+            | Request::AllocateServiceIp(_)
+            | Request::ReleaseServiceIp(_) => Err(Rejection::new(
                 faber_api_types::error_code::INTERNAL,
                 "not a mesh command",
             )),
@@ -2426,6 +2455,61 @@ mod tests {
         assert_eq!(s.reader.get("a").unwrap(), Some(json!(2)));
         assert_eq!(s.reader.get("b").unwrap(), None);
         assert_eq!(s.reader.get("c").unwrap(), None);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn scaffold_commands_are_rejected_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        s.state_machine
+            .apply([normal(1, create_project("shop"))])
+            .await
+            .unwrap();
+        let before = dump(&s);
+
+        let commands = [
+            Request::CreateDataKey(keys::CreateDataKey {
+                key_id: "k1".into(),
+                sealed: vec![1],
+                at: 1,
+            }),
+            Request::SetClusterKeyId(keys::SetClusterKeyId {
+                key_id: "c1".into(),
+            }),
+            Request::PlaceReplicas(place::PlaceReplicas {
+                project: "shop".into(),
+                environment: "staging".into(),
+                workload: "web".into(),
+                nodes: vec![1],
+                at: 1,
+            }),
+            Request::ReportNode(status::ReportNode {
+                node_id: 1,
+                report: json!({}),
+                at: 1,
+            }),
+            Request::SetStatusInterval(status::SetStatusInterval { secs: 10 }),
+            Request::AllocateServiceIp(services::AllocateServiceIp {
+                project: "shop".into(),
+                environment: "staging".into(),
+                workload: "web".into(),
+            }),
+            Request::ReleaseServiceIp(services::ReleaseServiceIp {
+                project: "shop".into(),
+                environment: "staging".into(),
+                workload: "web".into(),
+            }),
+        ];
+        let entries: Vec<Entry> = commands
+            .into_iter()
+            .enumerate()
+            .map(|(n, req)| normal(2 + n as u64, req))
+            .collect();
+        let replies = s.state_machine.apply(entries).await.unwrap();
+        assert_eq!(replies.len(), 7);
+        assert!(replies.iter().all(rejected("internal")), "{replies:?}");
+        assert_eq!(dump(&s), before);
         drop(s);
     }
 

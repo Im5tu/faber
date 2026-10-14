@@ -10,8 +10,12 @@
 //! Every write that Raft depends on for safety goes through a synced
 //! `WriteBatch`, so a crash never loses an acknowledged write.
 
+pub mod keys;
 mod log;
+pub mod place;
+pub mod services;
 mod sm;
+pub mod status;
 
 use std::path::Path;
 use std::sync::{Arc, Weak};

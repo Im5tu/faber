@@ -13,6 +13,10 @@ use serde_json::Value;
 
 use crate::apps::Applied;
 use crate::mesh::{Allocation, MeshConfig, NodeRecord, Rejection};
+use crate::raft::store::keys::{CreateDataKey, SetClusterKeyId};
+use crate::raft::store::place::PlaceReplicas;
+use crate::raft::store::services::{AllocateServiceIp, ReleaseServiceIp};
+use crate::raft::store::status::{ReportNode, SetStatusInterval};
 
 pub type NodeId = u64;
 
@@ -169,6 +173,20 @@ pub enum Request {
         names: Vec<String>,
         at: u64,
     },
+    /// Stores a sealed data key. See `store::keys`.
+    CreateDataKey(CreateDataKey),
+    /// Names the cluster key. See `store::keys`.
+    SetClusterKeyId(SetClusterKeyId),
+    /// Assigns a workload's replicas to nodes. See `store::place`.
+    PlaceReplicas(PlaceReplicas),
+    /// A node's status report. See `store::status`.
+    ReportNode(ReportNode),
+    /// Changes the status report interval. See `store::status`.
+    SetStatusInterval(SetStatusInterval),
+    /// Reserves a service IP. See `store::services`.
+    AllocateServiceIp(AllocateServiceIp),
+    /// Frees a service IP. See `store::services`.
+    ReleaseServiceIp(ReleaseServiceIp),
 }
 
 /// Result of applying one log entry.
@@ -325,6 +343,48 @@ mod tests {
             },
             Request::RemoveNode { node_id: 2 },
             Request::SetLease { secs: 600 },
+        ] {
+            let bytes = serde_json::to_vec(&req).unwrap();
+            assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn scaffold_requests_round_trip_through_json() {
+        let service = || ("shop".to_string(), "staging".to_string(), "web".to_string());
+        let (project, environment, workload) = service();
+        for req in [
+            Request::CreateDataKey(CreateDataKey {
+                key_id: "k1".into(),
+                sealed: vec![1, 2, 3],
+                at: 5,
+            }),
+            Request::SetClusterKeyId(SetClusterKeyId {
+                key_id: "c1".into(),
+            }),
+            Request::PlaceReplicas(PlaceReplicas {
+                project: project.clone(),
+                environment: environment.clone(),
+                workload: workload.clone(),
+                nodes: vec![1, 2],
+                at: 6,
+            }),
+            Request::ReportNode(ReportNode {
+                node_id: 2,
+                report: json!({"cpu": 1}),
+                at: 7,
+            }),
+            Request::SetStatusInterval(SetStatusInterval { secs: 15 }),
+            Request::AllocateServiceIp(AllocateServiceIp {
+                project: project.clone(),
+                environment: environment.clone(),
+                workload: workload.clone(),
+            }),
+            Request::ReleaseServiceIp(ReleaseServiceIp {
+                project,
+                environment,
+                workload,
+            }),
         ] {
             let bytes = serde_json::to_vec(&req).unwrap();
             assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap(), req);
