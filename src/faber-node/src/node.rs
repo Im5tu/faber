@@ -193,13 +193,8 @@ impl<C: CriClient + Clone> Node<C> {
                 let config = cri_config::container_config(
                     &replica, &container, &env, uid_base, attempt, &mounts,
                 );
-                // The runtime reads only the pod's identity from this.
-                let sandbox_config = faber_cri::PodSandboxConfig {
-                    metadata: sandbox.metadata,
-                    labels: sandbox.labels,
-                    annotations: sandbox.annotations,
-                    ..Default::default()
-                };
+                let sandbox_config =
+                    cri_config::container_sandbox_config(&replica, uid_base, sandbox.metadata);
                 let container_id = self
                     .cri
                     .create_container(&sandbox_id, config, sandbox_config)

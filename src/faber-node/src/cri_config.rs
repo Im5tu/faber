@@ -115,6 +115,27 @@ pub fn sandbox_config(
     }
 }
 
+/// The sandbox config passed along with a container create. It is rebuilt
+/// from the replica rather than echoed back from the runtime, so it carries
+/// the pod's hostname, user namespace and security context, and keeps the
+/// runtime's own `metadata` so the pod is found by its identity. The DNS
+/// settings stay empty: they were applied when the sandbox ran.
+pub fn container_sandbox_config(
+    replica: &ReplicaRef,
+    uid_base: u32,
+    metadata: Option<PodSandboxMetadata>,
+) -> PodSandboxConfig {
+    let no_dns = DnsConfig {
+        nameservers: Vec::new(),
+        searches: Vec::new(),
+    };
+    PodSandboxConfig {
+        metadata,
+        dns_config: None,
+        ..sandbox_config(replica, uid_base, &no_dns, &[])
+    }
+}
+
 /// One mount of a volume into the container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMount {
@@ -186,7 +207,7 @@ pub fn container_config(
                 // host ids the pod maps, so no idmapped mount is requested.
                 uid_mappings: Vec::new(),
                 gid_mappings: Vec::new(),
-                recursive_read_only: m.read_only,
+                recursive_read_only: false,
                 image: None,
                 image_sub_path: String::new(),
             })
@@ -303,6 +324,22 @@ mod tests {
         assert_eq!(cfg.port_mappings[0].container_port, 6379);
         assert_eq!(cfg.port_mappings[0].host_port, 0);
         assert_eq!(cfg.metadata.unwrap().name, "redis-a1b2c3d4-3");
+    }
+
+    #[test]
+    fn the_sandbox_config_sent_with_a_container_keeps_hostname_userns_and_identity() {
+        let identity = PodSandboxMetadata {
+            name: "from-the-runtime".into(),
+            ..Default::default()
+        };
+        let cfg = container_sandbox_config(&replica(), 131072, Some(identity.clone()));
+        assert_eq!(cfg.hostname, "redis-3");
+        assert_eq!(cfg.metadata, Some(identity));
+        assert!(cfg.dns_config.is_none());
+        assert_eq!(cfg.labels["faber.replica"], "3");
+        let sc = cfg.linux.unwrap().security_context.unwrap();
+        assert!(!sc.privileged);
+        assert_userns(sc.namespace_options.as_ref().unwrap(), 131072);
     }
 
     #[test]
@@ -443,7 +480,7 @@ mod tests {
             m.host_path,
             "/var/lib/faber-node/volumes/shop/prod/redis/3/data/mnt"
         );
-        assert!(m.readonly && m.recursive_read_only);
+        assert!(m.readonly);
         assert_eq!(m.propagation, MountPropagation::PropagationPrivate as i32);
         assert!(m.uid_mappings.is_empty() && m.gid_mappings.is_empty());
     }

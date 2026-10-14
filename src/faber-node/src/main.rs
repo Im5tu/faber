@@ -44,7 +44,7 @@ mod linux {
     use anyhow::Context;
     use faber_cri::GrpcCri;
     use faber_network_management::SystemRunner;
-    use faber_node::config::NodeConfig;
+    use faber_node::config::{NodeConfig, root_only_writable};
     use faber_node::listener;
     use faber_node::node::Node;
     use faber_node::peer::Authorizer;
@@ -54,7 +54,7 @@ mod linux {
     fn read_config(path: &Path) -> anyhow::Result<NodeConfig> {
         let meta =
             std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        if !root_only_writable(meta.uid(), meta.mode()) {
             anyhow::bail!(
                 "{} must be owned by root and not writable by group or others",
                 path.display()

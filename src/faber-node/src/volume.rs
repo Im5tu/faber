@@ -343,9 +343,13 @@ impl HostVolumes {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err("removing a stale volume image")(e)),
         }
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // The raw image holds the service's data, so only root may read it,
+        // whatever the mode of the directories above.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
             .open(&paths.staging)
             .map_err(io_err("creating the volume image"))?;
         // Sparse: no blocks are allocated until the filesystem writes them.
@@ -637,6 +641,23 @@ mod tests {
         let image = h.root.join("shop/prod/redis/1/data/disk.img");
         assert_eq!(std::fs::metadata(image).unwrap().len(), 8 << 20);
         assert!(!h.root.join("shop/prod/redis/1/data/disk.img.new").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_image_is_readable_by_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = harness();
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(h.root.join("shop/prod/redis/1/data/disk.img"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[tokio::test]

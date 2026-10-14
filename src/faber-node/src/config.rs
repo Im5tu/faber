@@ -23,6 +23,13 @@ pub enum ConfigError {
     Syntax { line: usize },
 }
 
+/// Whether a file or directory with this owner and mode can only be changed
+/// by root. `faber-node` trusts its env file and its socket directory only
+/// when this holds: anyone who can write there could redirect root.
+pub fn root_only_writable(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
 /// Host ids that pods may map: `[min, max)`, in whole blocks of
 /// [`USERNS_LENGTH`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +227,22 @@ FABER_NODE_FABER_GID=989
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn only_root_owned_unshared_paths_are_trusted() {
+        assert!(root_only_writable(0, 0o755));
+        assert!(root_only_writable(0, 0o600));
+        assert!(root_only_writable(0, 0o40755));
+        for (uid, mode) in [
+            (990, 0o755),
+            (0, 0o775),
+            (0, 0o757),
+            (0, 0o777),
+            (1000, 0o600),
+        ] {
+            assert!(!root_only_writable(uid, mode), "{uid} {mode:o}");
+        }
     }
 
     #[test]

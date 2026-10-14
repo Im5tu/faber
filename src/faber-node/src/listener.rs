@@ -1,6 +1,6 @@
 //! The Unix socket: owner, mode, accept loop.
 
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use nix::sys::stat::{Mode, umask};
 use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, root_only_writable};
 use crate::connection::{Limits, serve_connection};
 use crate::node::Node;
 use crate::peer::Authorizer;
@@ -21,9 +21,18 @@ const MAX_CONNECTIONS: usize = 64;
 /// Binds the socket as `root:<faber gid>` 0660.
 pub fn bind(config: &NodeConfig) -> anyhow::Result<UnixListener> {
     let path: &Path = &config.socket;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    let parent = path.parent().context("the socket path has no directory")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    // The socket is created, removed and given an owner by path. If anyone
+    // but root could write the directory, they could swap in a symlink and
+    // have root hand a file of theirs or root's to the faber group.
+    let meta = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("checking {}", parent.display()))?;
+    if !meta.is_dir() || !root_only_writable(meta.uid(), meta.mode()) {
+        anyhow::bail!(
+            "{} must be a directory owned by root and not writable by group or others",
+            parent.display()
+        );
     }
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
@@ -38,10 +47,10 @@ pub fn bind(config: &NodeConfig) -> anyhow::Result<UnixListener> {
     let bound = UnixListener::bind(path);
     umask(previous);
     let listener = bound.with_context(|| format!("binding {}", path.display()))?;
-    std::os::unix::fs::chown(path, Some(0), Some(config.faber_gid))
+    // The mode is already 0660 from the umask. `lchown`, so a swapped-in
+    // symlink is never followed.
+    std::os::unix::fs::lchown(path, Some(0), Some(config.faber_gid))
         .context("setting the socket owner")?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-        .context("setting the socket mode")?;
     Ok(listener)
 }
 
