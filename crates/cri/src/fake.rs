@@ -64,6 +64,8 @@ impl Call {
 #[derive(Default)]
 struct State {
     next_id: u64,
+    /// Fake clock in nanoseconds; advances by one per timestamp taken.
+    clock: i64,
     calls: Vec<Call>,
     failures: HashMap<&'static str, VecDeque<CriError>>,
     images: BTreeMap<String, Image>,
@@ -72,6 +74,11 @@ struct State {
 }
 
 impl State {
+    fn tick(&mut self) -> i64 {
+        self.clock += 1;
+        self.clock
+    }
+
     fn new_id(&mut self, prefix: &str) -> String {
         self.next_id += 1;
         format!("{prefix}-{}", self.next_id)
@@ -126,15 +133,24 @@ impl FakeCri {
         add_image(&mut s, reference)
     }
 
-    /// Simulates a container exiting on its own.
+    /// Simulates a container exiting on its own with `exit_code`.
     pub fn exit_container(&self, id: &str, exit_code: i32) {
         let mut s = self.lock();
+        let now = s.tick();
         if let Some((container, status)) = s.containers.get_mut(id) {
-            container.state = ContainerState::ContainerExited as i32;
-            status.state = ContainerState::ContainerExited as i32;
-            status.exit_code = exit_code;
+            finish(container, status, exit_code, now);
         }
     }
+}
+
+/// Exit code of a container killed after its stop grace period.
+const KILLED_EXIT_CODE: i32 = 137;
+
+fn finish(container: &mut Container, status: &mut ContainerStatus, exit_code: i32, now: i64) {
+    container.state = ContainerState::ContainerExited as i32;
+    status.state = ContainerState::ContainerExited as i32;
+    status.exit_code = exit_code;
+    status.finished_at = now;
 }
 
 fn add_image(s: &mut State, reference: &str) -> String {
@@ -211,12 +227,14 @@ impl CriClient for FakeCri {
                 runtime_handler: runtime_handler.to_owned(),
             })?;
             let id = s.new_id("sandbox");
+            let created_at = s.tick();
             s.sandboxes.insert(
                 id.clone(),
                 PodSandboxStatus {
                     id: id.clone(),
                     metadata: config.metadata,
                     state: PodSandboxState::SandboxReady as i32,
+                    created_at,
                     labels: config.labels,
                     annotations: config.annotations,
                     runtime_handler: runtime_handler.to_owned(),
@@ -236,12 +254,12 @@ impl CriClient for FakeCri {
                 .get_mut(id)
                 .ok_or_else(|| not_found("sandbox", id))?;
             sandbox.state = PodSandboxState::SandboxNotready as i32;
+            let now = s.tick();
             for (container, status) in s.containers.values_mut() {
                 if container.pod_sandbox_id == id
                     && container.state == ContainerState::ContainerRunning as i32
                 {
-                    container.state = ContainerState::ContainerExited as i32;
-                    status.state = ContainerState::ContainerExited as i32;
+                    finish(container, status, KILLED_EXIT_CODE, now);
                 }
             }
             Ok(())
@@ -308,8 +326,25 @@ impl CriClient for FakeCri {
             s.begin(Call::CreateContainer {
                 sandbox_id: sandbox_id.to_owned(),
             })?;
-            if !s.sandboxes.contains_key(sandbox_id) {
-                return Err(not_found("sandbox", sandbox_id));
+            let sandbox = s
+                .sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| not_found("sandbox", sandbox_id))?;
+            if sandbox.state != PodSandboxState::SandboxReady as i32 {
+                return Err(CriError::FailedPrecondition(format!(
+                    "sandbox {sandbox_id} is not ready"
+                )));
+            }
+            let wanted = config.metadata.as_ref();
+            let duplicate = s.containers.values().any(|(c, _)| {
+                c.pod_sandbox_id == sandbox_id
+                    && c.metadata.as_ref().map(|m| (&m.name, m.attempt))
+                        == wanted.map(|m| (&m.name, m.attempt))
+            });
+            if duplicate {
+                return Err(CriError::AlreadyExists(format!(
+                    "container name already reserved in sandbox {sandbox_id}"
+                )));
             }
             let image = config.image.clone().unwrap_or_default();
             let image_ref = match s
@@ -321,6 +356,7 @@ impl CriClient for FakeCri {
                 None => return Err(not_found("image", &image.image)),
             };
             let id = s.new_id("container");
+            let created_at = s.tick();
             let state = ContainerState::ContainerCreated as i32;
             let container = Container {
                 id: id.clone(),
@@ -330,7 +366,7 @@ impl CriClient for FakeCri {
                 image_ref: image_ref.clone(),
                 image_id: image_ref.clone(),
                 state,
-                created_at: 0,
+                created_at,
                 labels: config.labels.clone(),
                 annotations: config.annotations.clone(),
             };
@@ -338,6 +374,7 @@ impl CriClient for FakeCri {
                 id: id.clone(),
                 metadata: config.metadata,
                 state,
+                created_at,
                 image: Some(image),
                 image_ref,
                 labels: config.labels,
@@ -353,6 +390,7 @@ impl CriClient for FakeCri {
         Box::pin(async move {
             let mut s = self.lock();
             s.begin(Call::StartContainer(id.to_owned()))?;
+            let now = s.tick();
             let (container, status) = s
                 .containers
                 .get_mut(id)
@@ -364,6 +402,7 @@ impl CriClient for FakeCri {
             }
             container.state = ContainerState::ContainerRunning as i32;
             status.state = ContainerState::ContainerRunning as i32;
+            status.started_at = now;
             Ok(())
         })
     }
@@ -375,14 +414,14 @@ impl CriClient for FakeCri {
                 id: id.to_owned(),
                 timeout_secs,
             })?;
+            let now = s.tick();
             let (container, status) = s
                 .containers
                 .get_mut(id)
                 .ok_or_else(|| not_found("container", id))?;
             // Stopping an already stopped container succeeds, as in containerd.
             if container.state == ContainerState::ContainerRunning as i32 {
-                container.state = ContainerState::ContainerExited as i32;
-                status.state = ContainerState::ContainerExited as i32;
+                finish(container, status, KILLED_EXIT_CODE, now);
             }
             Ok(())
         })
@@ -599,6 +638,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn create_container_rejects_stopped_sandbox_and_duplicates() {
+        let cri = FakeCri::new();
+        cri.add_image("busybox");
+        let sb = cri
+            .run_pod_sandbox(sandbox_config("web"), "")
+            .await
+            .unwrap();
+        cri.create_container(&sb, container_config("busybox"), sandbox_config("web"))
+            .await
+            .unwrap();
+        let dup = cri
+            .create_container(&sb, container_config("busybox"), sandbox_config("web"))
+            .await
+            .unwrap_err();
+        assert!(matches!(dup, CriError::AlreadyExists(_)));
+        let mut second = container_config("busybox");
+        second.metadata.as_mut().unwrap().attempt = 1;
+        cri.create_container(&sb, second, sandbox_config("web"))
+            .await
+            .unwrap();
+
+        cri.stop_pod_sandbox(&sb).await.unwrap();
+        let mut third = container_config("busybox");
+        third.metadata.as_mut().unwrap().name = "other".to_owned();
+        let err = cri
+            .create_container(&sb, third, sandbox_config("web"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CriError::FailedPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn transitions_set_timestamps_and_exit_codes() {
+        let cri = FakeCri::new();
+        cri.add_image("busybox");
+        let sb = cri
+            .run_pod_sandbox(sandbox_config("web"), "")
+            .await
+            .unwrap();
+        let c = cri
+            .create_container(&sb, container_config("busybox"), sandbox_config("web"))
+            .await
+            .unwrap();
+        let created = cri.container_status(&c).await.unwrap();
+        assert!(created.created_at > 0);
+        assert_eq!((created.started_at, created.finished_at), (0, 0));
+
+        cri.start_container(&c).await.unwrap();
+        let running = cri.container_status(&c).await.unwrap();
+        assert!(running.started_at > running.created_at);
+
+        cri.stop_container(&c, 5).await.unwrap();
+        let stopped = cri.container_status(&c).await.unwrap();
+        assert_eq!(stopped.exit_code, 137);
+        assert!(stopped.finished_at > stopped.started_at);
+        let listed = cri.list_containers(None).await.unwrap();
+        assert_eq!(listed[0].created_at, created.created_at);
+
+        let d = cri
+            .create_container(
+                &sb,
+                {
+                    let mut c = container_config("busybox");
+                    c.metadata.as_mut().unwrap().name = "job".to_owned();
+                    c
+                },
+                sandbox_config("web"),
+            )
+            .await
+            .unwrap();
+        cri.start_container(&d).await.unwrap();
+        cri.exit_container(&d, 3);
+        let exited = cri.container_status(&d).await.unwrap();
+        assert_eq!(exited.exit_code, 3);
+        assert!(exited.finished_at > exited.started_at);
+        // A later stop does not overwrite the exit code.
+        cri.stop_container(&d, 5).await.unwrap();
+        assert_eq!(cri.container_status(&d).await.unwrap().exit_code, 3);
     }
 
     #[tokio::test]
