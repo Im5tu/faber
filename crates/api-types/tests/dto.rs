@@ -329,17 +329,21 @@ fn workload_constants() {
 fn minimal_container_json(name: &str, image: &str) -> Value {
     json!({
         "name": name, "image": image, "command": [], "args": [], "env": {},
-        "ports": [], "mounts": [], "resources": {"limits": {}, "requests": {}},
+        "ports": [], "mounts": [],
+        "resources": {"cpu_millis": 1000, "memory_bytes": 1_073_741_824},
         "capabilities": [], "read_only_root_fs": false
     })
 }
 
 fn minimal_spec() -> WorkloadSpec {
     WorkloadSpec {
-        scale: Scale::Replicas(1),
+        scale: Scale::Replicas {
+            count: 1,
+            strategy: Strategy::Spread,
+        },
         restart: RestartPolicy::Always,
         expose: Exposure::Environment,
-        placement: Placement { node: None },
+        placement: Placement { nodes: vec![] },
         stop_grace_secs: None,
         volumes: Default::default(),
         containers: vec![ContainerSpec::new("a", "b")],
@@ -348,50 +352,66 @@ fn minimal_spec() -> WorkloadSpec {
 
 fn minimal_spec_json() -> Value {
     json!({
-        "scale": {"replicas": 1}, "restart": "always", "expose": "environment",
-        "placement": {}, "volumes": {},
+        "scale": {"replicas": {"count": 1, "strategy": "spread"}},
+        "restart": "always", "expose": "environment",
+        "placement": {"nodes": []}, "volumes": {},
         "containers": [minimal_container_json("a", "b")]
     })
 }
 
 #[test]
 fn scale_shapes() {
-    assert_shape(Scale::Replicas(3), json!({"replicas": 3}));
-    assert_shape(Scale::Replicas(0), json!({"replicas": 0}));
-    assert_shape(Scale::PerNode, json!("per_node"));
-    assert_eq!(Scale::default(), Scale::Replicas(1));
+    assert_shape(
+        Scale::Replicas {
+            count: 3,
+            strategy: Strategy::Pack,
+        },
+        json!({"replicas": {"count": 3, "strategy": "pack"}}),
+    );
+    assert_shape(
+        Scale::Replicas {
+            count: 0,
+            strategy: Strategy::Spread,
+        },
+        json!({"replicas": {"count": 0, "strategy": "spread"}}),
+    );
+    assert_shape(Scale::Daemon, json!("daemon"));
+    assert_eq!(
+        Scale::default(),
+        Scale::Replicas {
+            count: 1,
+            strategy: Strategy::Spread
+        }
+    );
+    // The strategy may be left out.
+    assert_eq!(
+        serde_json::from_value::<Scale>(json!({"replicas": {"count": 2}})).unwrap(),
+        Scale::Replicas {
+            count: 2,
+            strategy: Strategy::Spread
+        }
+    );
     for bad in [
         json!(3),
         json!("replicas"),
-        json!({"per_node": null, "replicas": 1}),
-        json!({"replicas": -1}),
-        json!({"replicas": "3"}),
-        json!("PerNode"),
+        json!("per_node"),
+        json!({"per_node": null}),
+        json!({"replicas": 3}),
+        json!({"replicas": {}}),
+        json!({"replicas": {"count": -1}}),
+        json!({"replicas": {"count": "3"}}),
+        json!({"replicas": {"count": 1, "strategy": "random"}}),
+        json!({"replicas": {"count": 1}, "daemon": null}),
+        json!("Daemon"),
     ] {
         assert!(
             serde_json::from_value::<Scale>(bad.clone()).is_err(),
             "{bad}"
         );
     }
-}
-
-#[test]
-fn unit_enums_are_snake_case_strings() {
-    assert_shape(RestartPolicy::Always, json!("always"));
-    assert_shape(RestartPolicy::OnFailure, json!("on_failure"));
-    assert_shape(RestartPolicy::Never, json!("never"));
-    assert_eq!(RestartPolicy::default(), RestartPolicy::Always);
-    assert!(serde_json::from_value::<RestartPolicy>(json!("on-failure")).is_err());
-
-    assert_shape(Exposure::Environment, json!("environment"));
-    assert_shape(Exposure::Cluster, json!("cluster"));
-    assert_eq!(Exposure::default(), Exposure::Environment);
-    assert!(serde_json::from_value::<Exposure>(json!("public")).is_err());
-
-    assert_shape(Protocol::Tcp, json!("tcp"));
-    assert_shape(Protocol::Udp, json!("udp"));
-    assert_eq!(Protocol::default(), Protocol::Tcp);
-    assert!(serde_json::from_value::<Protocol>(json!("sctp")).is_err());
+    assert_shape(Strategy::Spread, json!("spread"));
+    assert_shape(Strategy::Pack, json!("pack"));
+    assert_eq!(Strategy::default(), Strategy::Spread);
     assert!(serde_json::from_value::<Protocol>(json!("TCP")).is_err());
 
     assert_shape(HttpScheme::Http, json!("http"));
@@ -402,44 +422,32 @@ fn unit_enums_are_snake_case_strings() {
 
 #[test]
 fn placement_shapes() {
-    assert_shape(Placement { node: None }, json!({}));
+    assert_shape(Placement { nodes: vec![] }, json!({"nodes": []}));
     assert_shape(
         Placement {
-            node: Some("node-1".into()),
+            nodes: vec!["node-1".into(), "node-2".into()],
         },
-        json!({"node": "node-1"}),
+        json!({"nodes": ["node-1", "node-2"]}),
+    );
+    assert_eq!(
+        serde_json::from_value::<Placement>(json!({})).unwrap(),
+        Placement::default()
     );
 }
 
 #[test]
 fn volume_source_shapes() {
     assert_shape(
-        VolumeSource::HostPath {
-            path: "/srv/data".into(),
-            create: true,
+        VolumeSource::Block {
+            size_bytes: 1_073_741_824,
         },
-        json!({"type": "host_path", "path": "/srv/data", "create": true}),
+        json!({"type": "block", "size_bytes": 1_073_741_824u64}),
     );
     assert_shape(
-        VolumeSource::Named {
-            name: "data".into(),
-            per_replica: false,
+        VolumeSource::Ramdisk {
+            size_bytes: 1_048_576,
         },
-        json!({"type": "named", "name": "data", "per_replica": false}),
-    );
-    assert_shape(
-        VolumeSource::Ephemeral {
-            memory: true,
-            size_bytes: Some(1024),
-        },
-        json!({"type": "ephemeral", "memory": true, "size_bytes": 1024}),
-    );
-    assert_shape(
-        VolumeSource::Ephemeral {
-            memory: false,
-            size_bytes: None,
-        },
-        json!({"type": "ephemeral", "memory": false}),
+        json!({"type": "ramdisk", "size_bytes": 1_048_576}),
     );
 }
 
@@ -483,24 +491,25 @@ fn port_and_mount_shapes() {
 
 #[test]
 fn resources_shapes() {
-    assert_shape(Resources::default(), json!({"limits": {}, "requests": {}}));
+    assert_shape(
+        Resources::default(),
+        json!({"cpu_millis": 1000, "memory_bytes": 1_073_741_824}),
+    );
     assert_shape(
         Resources {
-            limits: ResourceAmounts {
-                cpu_millis: Some(500),
-                memory_bytes: Some(268_435_456),
-            },
-            requests: ResourceAmounts {
-                cpu_millis: None,
-                memory_bytes: Some(1024),
-            },
+            cpu_millis: 500,
+            memory_bytes: 268_435_456,
         },
-        json!({
-            "limits": {"cpu_millis": 500, "memory_bytes": 268_435_456},
-            "requests": {"memory_bytes": 1024}
-        }),
+        json!({"cpu_millis": 500, "memory_bytes": 268_435_456}),
     );
-    assert_shape(ResourceAmounts::default(), json!({}));
+    // Each amount defaults on its own.
+    assert_eq!(
+        serde_json::from_value::<Resources>(json!({"cpu_millis": 250})).unwrap(),
+        Resources {
+            cpu_millis: 250,
+            memory_bytes: 1_073_741_824,
+        }
+    );
 }
 
 #[test]
@@ -509,25 +518,18 @@ fn probe_shapes() {
         Probe::new(ProbeAction::Tcp { port: 5432 }),
         json!({
             "action": {"type": "tcp", "port": 5432},
-            "initial_delay_secs": 0, "period_secs": 10, "timeout_secs": 1,
-            "success_threshold": 1, "failure_threshold": 3
+            "interval_secs": 5, "timeout_secs": 1
         }),
     );
     assert_shape(
         Probe {
-            action: ProbeAction::Exec {
-                command: vec!["pg_isready".into(), "-q".into()],
-            },
-            initial_delay_secs: 5,
-            period_secs: 2,
+            action: ProbeAction::Tcp { port: 5432 },
+            interval_secs: 30,
             timeout_secs: 3,
-            success_threshold: 4,
-            failure_threshold: 6,
         },
         json!({
-            "action": {"type": "exec", "command": ["pg_isready", "-q"]},
-            "initial_delay_secs": 5, "period_secs": 2, "timeout_secs": 3,
-            "success_threshold": 4, "failure_threshold": 6
+            "action": {"type": "tcp", "port": 5432},
+            "interval_secs": 30, "timeout_secs": 3
         }),
     );
     assert_shape(
@@ -553,6 +555,7 @@ fn probe_shapes() {
         },
         json!({"type": "http", "port": 80, "path": "/", "scheme": "http", "headers": {}}),
     );
+    assert_eq!(limits::PROBE_FAILURES_BEFORE_RESTART, 3);
 }
 
 #[test]
@@ -578,19 +581,10 @@ fn container_spec_shapes() {
         read_only: false,
         sub_path: None,
     }];
-    full.resources.limits.cpu_millis = Some(500);
+    full.resources.cpu_millis = 500;
     full.capabilities = vec!["NET_BIND_SERVICE".into()];
     full.read_only_root_fs = true;
-    full.liveness = Some(Probe::new(ProbeAction::Tcp { port: 8080 }));
-    full.readiness = Some(Probe::new(ProbeAction::Tcp { port: 8081 }));
-    full.startup = Some(Probe::new(ProbeAction::Tcp { port: 8082 }));
-    let probe = |port: u16| {
-        json!({
-            "action": {"type": "tcp", "port": port},
-            "initial_delay_secs": 0, "period_secs": 10, "timeout_secs": 1,
-            "success_threshold": 1, "failure_threshold": 3
-        })
-    };
+    full.probe = Some(Probe::new(ProbeAction::Tcp { port: 8080 }));
     assert_shape(
         full,
         json!({
@@ -600,10 +594,13 @@ fn container_spec_shapes() {
             "working_dir": "/srv", "user": "101:101",
             "ports": [{"name": "http", "port": 8080, "protocol": "tcp"}],
             "mounts": [{"volume": "data", "path": "/data", "read_only": false}],
-            "resources": {"limits": {"cpu_millis": 500}, "requests": {}},
+            "resources": {"cpu_millis": 500, "memory_bytes": 1_073_741_824},
             "capabilities": ["NET_BIND_SERVICE"],
             "read_only_root_fs": true,
-            "liveness": probe(8080), "readiness": probe(8081), "startup": probe(8082)
+            "probe": {
+                "action": {"type": "tcp", "port": 8080},
+                "interval_secs": 5, "timeout_secs": 1
+            }
         }),
     );
 }
@@ -613,27 +610,26 @@ fn workload_spec_shapes() {
     assert_shape(minimal_spec(), minimal_spec_json());
     assert_shape(
         WorkloadSpec {
-            scale: Scale::PerNode,
+            scale: Scale::Daemon,
             restart: RestartPolicy::Never,
             expose: Exposure::Cluster,
             placement: Placement {
-                node: Some("node-1".into()),
+                nodes: vec!["node-1".into()],
             },
             stop_grace_secs: Some(30),
             volumes: [(
                 "tmp".to_string(),
-                VolumeSource::Ephemeral {
-                    memory: false,
-                    size_bytes: None,
+                VolumeSource::Ramdisk {
+                    size_bytes: 1_048_576,
                 },
             )]
             .into(),
             containers: vec![ContainerSpec::new("a", "b"), ContainerSpec::new("c", "d")],
         },
         json!({
-            "scale": "per_node", "restart": "never", "expose": "cluster",
-            "placement": {"node": "node-1"}, "stop_grace_secs": 30,
-            "volumes": {"tmp": {"type": "ephemeral", "memory": false}},
+            "scale": "daemon", "restart": "never", "expose": "cluster",
+            "placement": {"nodes": ["node-1"]}, "stop_grace_secs": 30,
+            "volumes": {"tmp": {"type": "ramdisk", "size_bytes": 1_048_576}},
             "containers": [minimal_container_json("a", "b"), minimal_container_json("c", "d")]
         }),
     );
@@ -647,33 +643,6 @@ fn defaulted_fields_may_be_absent() {
         serde_json::from_value(json!({"containers": [{"name": "a", "image": "b"}]})).unwrap();
     assert_eq!(spec, minimal_spec());
     assert_eq!(serde_json::to_value(&spec).unwrap(), minimal_spec_json());
-
-    let decoded: VolumeSource =
-        serde_json::from_value(json!({"type": "host_path", "path": "/srv"})).unwrap();
-    assert_eq!(
-        decoded,
-        VolumeSource::HostPath {
-            path: "/srv".into(),
-            create: false,
-        }
-    );
-    let decoded: VolumeSource =
-        serde_json::from_value(json!({"type": "named", "name": "data"})).unwrap();
-    assert_eq!(
-        decoded,
-        VolumeSource::Named {
-            name: "data".into(),
-            per_replica: false,
-        }
-    );
-    let decoded: VolumeSource = serde_json::from_value(json!({"type": "ephemeral"})).unwrap();
-    assert_eq!(
-        decoded,
-        VolumeSource::Ephemeral {
-            memory: false,
-            size_bytes: None,
-        }
-    );
 
     let decoded: PortSpec = serde_json::from_value(json!({"port": 53})).unwrap();
     assert_eq!(
@@ -710,11 +679,8 @@ fn defaulted_fields_may_be_absent() {
                 host: None,
                 headers: Default::default(),
             },
-            initial_delay_secs: 0,
-            period_secs: 10,
+            interval_secs: 5,
             timeout_secs: 1,
-            success_threshold: 1,
-            failure_threshold: 3,
         }
     );
 
@@ -734,12 +700,12 @@ fn required_model_fields_are_required() {
         json!({"containers": [{"image": "b"}]}),
         json!({"containers": [{"name": "a", "image": "b", "ports": [{}]}]}),
         json!({"containers": [{"name": "a", "image": "b", "mounts": [{"volume": "v"}]}]}),
-        json!({"containers": [{"name": "a", "image": "b", "liveness": {}}]}),
+        json!({"containers": [{"name": "a", "image": "b", "probe": {}}]}),
         json!({"containers": [{"name": "a", "image": "b"}], "volumes": {"v": {}}}),
         json!({"containers": [{"name": "a", "image": "b"}],
-               "volumes": {"v": {"type": "host_path"}}}),
+               "volumes": {"v": {"type": "block"}}}),
         json!({"containers": [{"name": "a", "image": "b"}],
-               "volumes": {"v": {"type": "named"}}}),
+               "volumes": {"v": {"type": "ramdisk"}}}),
     ] {
         assert!(
             serde_json::from_value::<WorkloadSpec>(bad.clone()).is_err(),
@@ -747,7 +713,7 @@ fn required_model_fields_are_required() {
         );
     }
     for bad in [
-        json!({"type": "exec"}),
+        json!({"type": "exec", "command": ["true"]}),
         json!({"type": "http"}),
         json!({"type": "tcp"}),
         json!({"type": "grpc", "port": 1}),
@@ -772,17 +738,15 @@ fn model_types_refuse_unknown_fields() {
     refused::<PortSpec>(json!({"port": 80, "host_port": 8080}));
     refused::<MountSpec>(json!({"volume": "v", "path": "/v", "propagation": "shared"}));
     refused::<Resources>(json!({"reservations": {}}));
-    refused::<ResourceAmounts>(json!({"gpu": 1}));
+    refused::<Resources>(json!({"limits": {}}));
     refused::<Probe>(json!({"action": {"type": "tcp", "port": 1}, "grpc": 1}));
     refused::<ProbeAction>(json!({"type": "tcp", "port": 1, "host": "x"}));
-    refused::<ProbeAction>(json!({"type": "exec", "command": ["true"], "port": 1}));
     refused::<ProbeAction>(json!({"type": "http", "port": 1, "method": "POST"}));
-    refused::<VolumeSource>(json!({"type": "host_path", "path": "/srv", "kind": "File"}));
-    refused::<VolumeSource>(json!({"type": "named", "name": "data", "driver": "nfs"}));
-    refused::<VolumeSource>(json!({"type": "ephemeral", "medium": "Memory"}));
+    refused::<VolumeSource>(json!({"type": "block", "size_bytes": 1048576, "path": "/srv"}));
+    refused::<VolumeSource>(json!({"type": "ramdisk", "size_bytes": 1048576, "medium": "x"}));
+    refused::<VolumeSource>(json!({"type": "host_path", "path": "/srv", "size_bytes": 1}));
+    refused::<VolumeSource>(json!({"type": "ephemeral", "size_bytes": 1048576}));
     refused::<VolumeSource>(json!({"type": "nfs", "server": "x"}));
-    // A field of another variant is unknown too.
-    refused::<VolumeSource>(json!({"type": "ephemeral", "path": "/srv"}));
 }
 
 #[test]
@@ -882,14 +846,18 @@ fn workload_route_shapes() {
         environment: "staging".into(),
         name: "web".into(),
         fqdn: fqdn("web", "staging", "shop"),
-        scale: Scale::Replicas(3),
+        scale: Scale::Replicas {
+            count: 3,
+            strategy: Strategy::Spread,
+        },
         expose: Exposure::Cluster,
         revision: 7,
     };
     let summary_json = json!({
         "project": "shop", "environment": "staging", "name": "web",
         "fqdn": "web.staging.shop.faber.internal",
-        "scale": {"replicas": 3}, "expose": "cluster", "revision": 7
+        "scale": {"replicas": {"count": 3, "strategy": "spread"}},
+        "expose": "cluster", "revision": 7
     });
     assert_shape(summary.clone(), summary_json.clone());
     assert_shape(

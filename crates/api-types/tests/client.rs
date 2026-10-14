@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use faber_api_types::workload::{
-    CreateProjectRequest, DeployRequest, DeployResponse, Exposure, Scale, WorkloadQuery,
+    CreateProjectRequest, DeployRequest, DeployResponse, Exposure, Scale, Strategy, WorkloadQuery,
 };
 use faber_api_types::*;
 use serde_json::{Value, json};
@@ -763,14 +763,14 @@ async fn deploy_posts_the_workloads_and_returns_the_result() {
         .and(path(DEPLOY_PATH))
         .and(body_json(json!({
             "workloads": {"web": {
-                "scale": {"replicas": 1},
+                "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                 "restart": "always",
                 "expose": "environment",
-                "placement": {},
+                "placement": {"nodes": []},
                 "volumes": {},
                 "containers": [{
                     "name": "web", "image": "nginx", "command": [], "args": [], "env": {},
-                    "ports": [], "mounts": [], "resources": {"limits": {}, "requests": {}},
+                    "ports": [], "mounts": [], "resources": {"cpu_millis": 1000, "memory_bytes": 1073741824},
                     "capabilities": [], "read_only_root_fs": false
                 }]
             }},
@@ -858,7 +858,7 @@ async fn workload_list_sends_the_filters_that_are_set() {
             ResponseTemplate::new(200).set_body_json(json!({"workloads": [{
                 "project": "shop", "environment": "staging", "name": "web",
                 "fqdn": "web.staging.shop.faber.internal",
-                "scale": {"replicas": 3}, "expose": "cluster", "revision": 7
+                "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7
             }]})),
         )
         .expect(4)
@@ -869,7 +869,13 @@ async fn workload_list_sends_the_filters_that_are_set() {
     let got = c.workload_list(&WorkloadQuery::default()).await.unwrap();
     assert_eq!(got.workloads.len(), 1);
     assert_eq!(got.workloads[0].fqdn, "web.staging.shop.faber.internal");
-    assert_eq!(got.workloads[0].scale, Scale::Replicas(3));
+    assert_eq!(
+        got.workloads[0].scale,
+        Scale::Replicas {
+            count: 3,
+            strategy: Strategy::Spread
+        }
+    );
     assert_eq!(got.workloads[0].expose, Exposure::Cluster);
     assert_eq!(got.workloads[0].revision, 7);
 
