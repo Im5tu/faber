@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 use faber_api_types::workload::{
-    CreateProjectRequest, DeployRequest, DeployResponse, Exposure, Scale, WorkloadQuery,
+    CreateProjectRequest, DeployRequest, DeployResponse, Exposure, Scale, Strategy, WorkloadQuery,
     WorkloadSpec, fqdn,
 };
 use faber_api_types::{ClientError, FaberClient, error_code};
@@ -226,7 +226,10 @@ async fn projects_and_workloads_replicate_through_followers() {
     // Scale, placement and exposure are not part of the pod template: the
     // generation moves and the revision stays.
     let mut scaled = web.clone();
-    scaled.scale = Scale::Replicas(3);
+    scaled.scale = Scale::Replicas {
+        count: 3,
+        strategy: Strategy::Spread,
+    };
     scaled.expose = Exposure::Cluster;
     let second = deploy(
         &f3,
@@ -274,13 +277,19 @@ async fn projects_and_workloads_replicate_through_followers() {
         [
             (
                 "api.staging.shop.faber.internal",
-                Scale::Replicas(1),
+                Scale::Replicas {
+                    count: 1,
+                    strategy: Strategy::Spread
+                },
                 Exposure::Environment,
                 g1
             ),
             (
                 "web.staging.shop.faber.internal",
-                Scale::Replicas(3),
+                Scale::Replicas {
+                    count: 3,
+                    strategy: Strategy::Spread
+                },
                 Exposure::Cluster,
                 g3
             ),

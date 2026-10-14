@@ -580,7 +580,7 @@ impl ProjectIndex {
 #[cfg(test)]
 mod tests {
     use faber_api_types::error_code as ec;
-    use faber_api_types::workload::{ContainerSpec, RestartPolicy};
+    use faber_api_types::workload::{ContainerSpec, RestartPolicy, Strategy};
     use serde_json::json;
 
     use super::*;
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(v["updated_at"], 1_001);
         assert_eq!(
             v["workloads"]["web"]["spec"]["scale"],
-            json!({"replicas": 1})
+            json!({"replicas": {"count": 1, "strategy": "spread"}})
         );
         assert_eq!(
             serde_json::from_value::<EnvironmentRecord>(v).unwrap(),
@@ -1338,21 +1338,24 @@ mod tests {
     #[test]
     fn a_change_outside_the_pod_template_keeps_the_revision() {
         let mut scaled = spec("nginx");
-        scaled.scale = Scale::Replicas(3);
-        let mut per_node = spec("nginx");
-        per_node.scale = Scale::PerNode;
+        scaled.scale = Scale::Replicas {
+            count: 3,
+            strategy: Strategy::Spread,
+        };
+        let mut daemon = spec("nginx");
+        daemon.scale = Scale::Daemon;
         let mut placed = spec("nginx");
-        placed.placement.node = Some("node-2".into());
+        placed.placement.nodes = vec!["node-2".into()];
         let mut exposed = spec("nginx");
         exposed.expose = Exposure::Cluster;
         let mut all = scaled.clone();
-        all.placement.node = Some("node-3".into());
+        all.placement.nodes = vec!["node-3".into()];
         all.expose = Exposure::Cluster;
 
         let mut w = shop();
         w.apply("shop", "staging", &[("web", spec("nginx"))], false, 2, 1)
             .unwrap();
-        let changes = [scaled, per_node, placed, exposed, all, spec("nginx")];
+        let changes = [scaled, daemon, placed, exposed, all, spec("nginx")];
         for (index, changed) in (3..).zip(changes) {
             let applied = w
                 .apply(
@@ -1428,16 +1431,25 @@ mod tests {
 
         // A scale change keeps it. A template change that comes with a
         // scale change moves it, and the next scale change keeps that.
-        image.scale = Scale::Replicas(4);
+        image.scale = Scale::Replicas {
+            count: 4,
+            strategy: Strategy::Spread,
+        };
         w.apply("shop", "staging", &[("web", image.clone())], false, 50, 1)
             .unwrap();
         assert_eq!(w.record("shop", "staging").workloads["web"].revision, 11);
         image.containers[0].image = "nginx:3".into();
-        image.scale = Scale::Replicas(5);
+        image.scale = Scale::Replicas {
+            count: 5,
+            strategy: Strategy::Spread,
+        };
         w.apply("shop", "staging", &[("web", image.clone())], false, 51, 1)
             .unwrap();
         assert_eq!(w.record("shop", "staging").workloads["web"].revision, 51);
-        image.scale = Scale::Replicas(6);
+        image.scale = Scale::Replicas {
+            count: 6,
+            strategy: Strategy::Spread,
+        };
         w.apply("shop", "staging", &[("web", image)], false, 52, 1)
             .unwrap();
         assert_eq!(w.record("shop", "staging").workloads["web"].revision, 51);
@@ -1621,7 +1633,10 @@ mod tests {
         none.containers.clear();
         let mut odd = spec("");
         odd.containers[0].name = "Not A Label".into();
-        odd.scale = Scale::Replicas(u32::MAX);
+        odd.scale = Scale::Replicas {
+            count: u32::MAX,
+            strategy: Strategy::Spread,
+        };
         odd.containers.push(odd.containers[0].clone());
 
         let mut w = shop();

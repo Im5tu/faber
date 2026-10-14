@@ -763,7 +763,7 @@ fn op(req: &PeerWorkloadRequest) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
 
-    use faber_api_types::workload::{Exposure, Scale, WorkloadSpec, validate_workloads};
+    use faber_api_types::workload::{Exposure, Scale, Strategy, WorkloadSpec, validate_workloads};
     use faber_api_types::{CreateInviteRequest, error_code};
     use faber_container_runtime::ContainerRuntimeSpec;
     use serde_json::json;
@@ -1254,7 +1254,10 @@ mod tests {
             .unwrap();
         let mut exposed = spec("api:1");
         exposed.expose = Exposure::Cluster;
-        exposed.scale = Scale::Replicas(3);
+        exposed.scale = Scale::Replicas {
+            count: 3,
+            strategy: Strategy::Spread,
+        };
         let both = deploy_req(&[("web", spec("nginx")), ("api", exposed.clone())], false);
         let staging = svc.deploy("shop", "staging", both).await.unwrap();
         let web = || deploy_req(&[("web", spec("nginx"))], false);

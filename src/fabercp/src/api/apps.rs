@@ -175,7 +175,7 @@ async fn remove_workload(
 mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, header};
-    use faber_api_types::workload::{Exposure, Scale};
+    use faber_api_types::workload::{Exposure, Scale, Strategy};
     use faber_api_types::{ErrorBody, FORWARDED_HEADER, error_code};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
@@ -358,7 +358,7 @@ mod tests {
         let both = json!({"workloads": {
             "web": spec("nginx"),
             "api": {
-                "scale": {"replicas": 3},
+                "scale": {"replicas": {"count": 3}},
                 "expose": "cluster",
                 "containers": [{"name": "main", "image": "api:1", "env": {"TOKEN": "s3cret"}}],
             },
@@ -383,7 +383,13 @@ mod tests {
         assert_eq!(status, 200);
         let api = &list.workloads[0];
         assert_eq!(api.fqdn, "api.staging.shop.faber.internal");
-        assert_eq!(api.scale, Scale::Replicas(3));
+        assert_eq!(
+            api.scale,
+            Scale::Replicas {
+                count: 3,
+                strategy: Strategy::Spread
+            }
+        );
         assert_eq!(api.expose, Exposure::Cluster);
         assert_eq!(api.revision, first.generation);
         // A summary carries no part of the spec that can hold a secret.
@@ -707,8 +713,8 @@ mod tests {
             json!({"privileged": true, "containers": [{"name": "main", "image": "nginx"}]}),
             json!({"containers": [{"name": "main", "image": "nginx", "privileged": true}]}),
             json!({"containers": [{"name": "main", "image": "nginx",
-                                   "resources": {"limits": {"gpus": 1}}}]}),
-            json!({"volumes": {"data": {"type": "host_path", "path": "/data", "mode": 511}},
+                                   "resources": {"gpus": 1}}]}),
+            json!({"volumes": {"data": {"type": "block", "size_bytes": 1048576, "mode": 511}},
                    "containers": [{"name": "main", "image": "nginx"}]}),
         ];
         for spec in unknown {

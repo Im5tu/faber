@@ -630,15 +630,15 @@ mod tests {
                 json!({"ApplyWorkloads": {
                     "project": "shop", "environment": "staging",
                     "workloads": {"web": {
-                        "scale": {"replicas": 1},
+                        "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                         "restart": "always",
                         "expose": "environment",
-                        "placement": {},
+                        "placement": {"nodes": []},
                         "volumes": {},
                         "containers": [{
                             "name": "web", "image": "nginx", "command": [], "args": [],
                             "env": {}, "ports": [], "mounts": [],
-                            "resources": {"limits": {}, "requests": {}},
+                            "resources": {"cpu_millis": 1000, "memory_bytes": 1073741824},
                             "capabilities": [], "read_only_root_fs": false
                         }]
                     }},
