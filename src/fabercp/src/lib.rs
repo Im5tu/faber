@@ -557,6 +557,7 @@ pub async fn start_with(
             MeshMembership {
                 service: service.clone(),
                 state_dir: config.state_dir.clone(),
+                data_dir: config.data_dir.clone(),
                 wg_endpoint,
                 reader: reader.clone(),
                 gate: raft_gate,
@@ -903,6 +904,9 @@ async fn claim_interface(
 struct MeshMembership {
     service: FaberService,
     state_dir: PathBuf,
+    /// Where the raft data is: the file system whose free space this node
+    /// reports as its disk capacity.
+    data_dir: PathBuf,
     wg_endpoint: Option<SocketAddr>,
     reader: StateReader,
     /// Opened once the mesh has accepted this node's registration, closed
@@ -1058,7 +1062,28 @@ async fn mesh_membership(ctx: MeshMembership, mut identity: Identity, host: Opti
             stop.cancel();
             end
         };
-        if let ((), LeaseEnd::Removed(evidence)) = tokio::join!(endpoint, lease) {
+        // Reports this node's status every interval, which an admin sets for
+        // the cluster, in lease seconds. It has no runner to ask yet, so it
+        // reports no replicas.
+        let status = async {
+            let Some((node_id, instance_id)) = ctx.service.report_identity() else {
+                return;
+            };
+            let reporter = status::Reporter::new(
+                node_id,
+                instance_id,
+                ctx.service.clone(),
+                Arc::new(status::NoReplicas),
+                status::system_probe(ctx.data_dir.clone()),
+            );
+            let interval = || {
+                ctx.reader
+                    .status_interval()
+                    .unwrap_or(raft::store::status::DEFAULT_INTERVAL_SECS)
+            };
+            reporter.run(interval, ctx.lease_second, &stop).await;
+        };
+        if let ((), LeaseEnd::Removed(evidence), ()) = tokio::join!(endpoint, lease, status) {
             tracing::error!(
                 evidence = evidence.as_str(),
                 "the mesh has removed this node: its lease ran out, or another machine took \

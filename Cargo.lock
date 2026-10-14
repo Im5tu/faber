@@ -802,6 +802,7 @@ dependencies = [
  "http-body-util",
  "if-addrs",
  "ipnet",
+ "nix",
  "openraft",
  "reqwest",
  "rmcp",

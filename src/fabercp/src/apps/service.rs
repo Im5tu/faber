@@ -244,6 +244,12 @@ impl FaberService {
         } else {
             masked_workload(&stored)
         };
+        // Reports are stamped with the lease clock, so staleness is judged on
+        // it. Without a mesh nothing has reported.
+        let now = self.read_mesh()?.map_or(0, |mesh| mesh.clock);
+        let replicas = crate::status::view(self.state(), now)
+            .map_err(|e| read_error("status", e))?
+            .workload(project, environment, workload);
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),
@@ -252,6 +258,7 @@ impl FaberService {
             revision: stored.revision,
             generation,
             spec,
+            replicas,
         })
     }
 
@@ -1474,6 +1481,7 @@ mod tests {
                 revision: staging.generation,
                 generation: staging.generation,
                 spec: exposed,
+                replicas: Vec::new(),
             }
         );
         for (project, environment, workload) in [
@@ -1694,6 +1702,99 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_workload_shows_what_its_nodes_reported() {
+        use crate::raft::store::status::{Capacity, ReplicaReport, ReportNode};
+        use faber_api_types::workload::{ReplicaState, ReplicaStatus};
+
+        let node = shop().await;
+        let svc = &node.service;
+        svc.deploy(
+            "shop",
+            "staging",
+            deploy_req(&[("web", spec("nginx"))], false),
+        )
+        .await
+        .unwrap();
+        // Nothing reported: no replicas, and no mesh to read a clock from.
+        assert!(
+            svc.workload("shop", "staging", "web")
+                .await
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
+
+        seed_mesh(&node).await;
+        let report = |index: u32, state, pod_ip: Option<&str>| ReplicaReport {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workload: "web".into(),
+            revision: 1,
+            replica_index: index,
+            state,
+            pod_ip: pod_ip.map(|ip| ip.parse().unwrap()),
+            detail: None,
+        };
+        svc.propose(Request::ReportNode(ReportNode {
+            node_id: 1,
+            instance_id: "ab".repeat(16),
+            capacity: Capacity::default(),
+            replicas: vec![
+                report(1, ReplicaState::Deploying, None),
+                report(0, ReplicaState::Available, Some("10.200.1.2")),
+            ],
+        }))
+        .await
+        .unwrap();
+        let want = |state| {
+            vec![
+                ReplicaStatus {
+                    node: 1,
+                    replica_index: 0,
+                    revision: 1,
+                    state: if state {
+                        ReplicaState::Available
+                    } else {
+                        ReplicaState::Unavailable
+                    },
+                    pod_ip: Some("10.200.1.2".parse().unwrap()),
+                },
+                ReplicaStatus {
+                    node: 1,
+                    replica_index: 1,
+                    revision: 1,
+                    state: if state {
+                        ReplicaState::Deploying
+                    } else {
+                        ReplicaState::Unavailable
+                    },
+                    pod_ip: None,
+                },
+            ]
+        };
+        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        assert_eq!(got.replicas, want(true));
+        // Another workload of the environment shows none of them.
+        let other = deploy_req(&[("db", spec("pg"))], false);
+        svc.deploy("shop", "staging", other).await.unwrap();
+        assert!(
+            svc.workload("shop", "staging", "db")
+                .await
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
+
+        // Three intervals of five seconds later, with no new report.
+        svc.propose(Request::AdvanceClock { elapsed_secs: 16 })
+            .await
+            .unwrap();
+        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        assert_eq!(got.replicas, want(false));
+        node.shutdown().await;
     }
 
     /// Node 1 is registered; node 2 only holds an invite, so its mesh IP
