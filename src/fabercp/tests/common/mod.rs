@@ -15,9 +15,20 @@ use tokio::net::TcpListener;
 
 pub const WAIT: Duration = Duration::from_secs(20);
 
+/// The cluster key every test node holds.
+pub fn test_cluster_key() -> faber_crypto::ClusterKey {
+    faber_crypto::ClusterKey::from_bytes([7; faber_crypto::KEY_LEN])
+}
+
 /// Short Raft timings so elections settle quickly in tests.
 pub fn fast_config(node_id: u64, dir: &Path) -> Config {
     let mut c = Config::new(node_id, dir);
+    // One cluster key for every node of a test, so that a follower opens
+    // the data keys the leader made.
+    std::fs::create_dir_all(dir).unwrap();
+    let key_file = dir.join("cluster.key");
+    std::fs::write(&key_file, test_cluster_key().to_base64()).unwrap();
+    c.cluster_key_file = Some(key_file);
     c.heartbeat_ms = 50;
     c.election_min_ms = 150;
     c.election_max_ms = 300;

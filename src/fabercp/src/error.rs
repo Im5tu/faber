@@ -15,6 +15,7 @@
 //! | Rejected `invite_expired` | 410 | `invite_expired` |
 //! | Rejected `mesh_*` (a refused lease renewal is `mesh_node_removed` or `mesh_lease_expired`) | 409 | the code |
 //! | Rejected `project_exists`, `not_empty`, `workloads_exhausted` | 409 | the code |
+//! | Rejected `key_unavailable` (no cluster key, or the wrong one) | 503 | `key_unavailable` |
 //! | Rejected `forbidden` (a lease renewal by another machine) | 403 | `forbidden` |
 //! | Forbidden | 403 | `forbidden` |
 //! | Upstream | the peer's status | the peer's body |
@@ -111,6 +112,7 @@ fn rejection_status(code: &str) -> StatusCode {
         | error_code::WORKLOADS_EXHAUSTED
         | error_code::ALREADY_INITIALIZED => StatusCode::CONFLICT,
         error_code::INVITE_EXPIRED => StatusCode::GONE,
+        error_code::KEY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         error_code::NOT_FOUND => StatusCode::NOT_FOUND,
         error_code::FORBIDDEN => StatusCode::FORBIDDEN,
         _ => StatusCode::BAD_REQUEST,

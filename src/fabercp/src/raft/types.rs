@@ -6,12 +6,11 @@ use std::fmt;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
 
-use faber_api_types::workload::WorkloadSpec;
 use faber_container_runtime::ContainerRuntimeSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::apps::Applied;
+use crate::apps::{Applied, StoredWorkload};
 use crate::mesh::{Allocation, MeshConfig, NodeRecord, Rejection};
 use crate::raft::store::keys::{CreateDataKey, SetClusterKeyId};
 use crate::raft::store::place::PlaceReplicas;
@@ -161,7 +160,7 @@ pub enum Request {
         project: String,
         environment: String,
         /// The workloads by name.
-        workloads: BTreeMap<String, WorkloadSpec>,
+        workloads: BTreeMap<String, StoredWorkload>,
         prune: bool,
         at: u64,
     },
@@ -280,6 +279,8 @@ pub type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError
 
 #[cfg(test)]
 mod tests {
+    use faber_api_types::workload::WorkloadSpec;
+
     use super::*;
     use serde_json::json;
 
@@ -355,9 +356,14 @@ mod tests {
         let (project, environment, workload) = service();
         for req in [
             Request::CreateDataKey(CreateDataKey {
+                scope: "shop/staging".into(),
+                wrapped: faber_crypto::wrap(
+                    &faber_crypto::ClusterKey::generate().unwrap(),
+                    &faber_crypto::DataKey::generate().unwrap(),
+                    "shop/staging",
+                )
+                .unwrap(),
                 key_id: "k1".into(),
-                sealed: vec![1, 2, 3],
-                at: 5,
             }),
             Request::SetClusterKeyId(SetClusterKeyId {
                 key_id: "c1".into(),
@@ -584,6 +590,13 @@ mod tests {
         serde_json::from_value(json!({"containers": [{"name": "web", "image": "nginx"}]})).unwrap()
     }
 
+    fn web() -> StoredWorkload {
+        StoredWorkload {
+            spec: web_spec(),
+            env: BTreeMap::new(),
+        }
+    }
+
     /// The wire format of the project and workload commands.
     #[test]
     fn app_requests_have_pinned_shapes() {
@@ -623,13 +636,13 @@ mod tests {
                 Request::ApplyWorkloads {
                     project: "shop".into(),
                     environment: "staging".into(),
-                    workloads: BTreeMap::from([("web".to_string(), web_spec())]),
+                    workloads: BTreeMap::from([("web".to_string(), web())]),
                     prune: true,
                     at: 1_002,
                 },
                 json!({"ApplyWorkloads": {
                     "project": "shop", "environment": "staging",
-                    "workloads": {"web": {
+                    "workloads": {"web": {"spec": {
                         "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                         "restart": "always",
                         "expose": "environment",
@@ -641,7 +654,7 @@ mod tests {
                             "resources": {"cpu_millis": 1000, "memory_bytes": 1073741824},
                             "capabilities": [], "read_only_root_fs": false
                         }]
-                    }},
+                    }, "env": {}}},
                     "prune": true, "at": 1_002
                 }}),
             ),
@@ -727,14 +740,20 @@ mod tests {
     /// what they hold.
     #[test]
     fn debug_of_a_workload_command_hides_env_values() {
-        let mut spec = web_spec();
-        spec.containers[0]
-            .env
-            .insert("API_KEY".into(), "hunter2".into());
+        let key = faber_crypto::DataKey::generate().unwrap();
+        let sealed = faber_crypto::seal(&key, b"hunter2", &["API_KEY"]).unwrap();
+        let mut stored = web();
+        stored.env.insert(
+            "web".into(),
+            crate::apps::SealedEnv {
+                digest: [0; 32],
+                values: BTreeMap::from([("API_KEY".to_string(), sealed)]),
+            },
+        );
         let req = Request::ApplyWorkloads {
             project: "shop".into(),
             environment: "staging".into(),
-            workloads: BTreeMap::from([("web".to_string(), spec)]),
+            workloads: BTreeMap::from([("web".to_string(), stored)]),
             prune: false,
             at: 1,
         };

@@ -17,6 +17,7 @@ use faber_api_types::workload::{
     CreateProjectRequest, DeployRequest, DeployResponse, ProjectListResponse, ProjectResponse,
     WorkloadListResponse, WorkloadQuery, WorkloadResponse, limits,
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::ApiJson;
@@ -151,13 +152,25 @@ async fn list_workloads(
     Ok(Json(svc.list_workloads(query).await?))
 }
 
-/// 200 with the workload and its spec. The response carries env values; it
-/// must never be logged.
+/// Query of the workload read: `?reveal=true` asks for env values in clear.
+#[derive(Debug, Default, Deserialize)]
+struct RevealQuery {
+    #[serde(default)]
+    reveal: bool,
+}
+
+/// 200 with the workload and its spec. Every env value is `***` unless the
+/// query says `reveal=true`; a revealed response carries them in clear and
+/// must never be logged. 503 `key_unavailable` when this node cannot open
+/// them.
 async fn workload(
     State(svc): State<FaberService>,
     Names((project, environment, workload)): Names<(String, String, String)>,
+    ApiQuery(RevealQuery { reveal }): ApiQuery<RevealQuery>,
 ) -> ServiceResult<Json<WorkloadResponse>> {
-    let found = svc.workload(&project, &environment, &workload).await?;
+    let found = svc
+        .workload(&project, &environment, &workload, reveal)
+        .await?;
     Ok(Json(found))
 }
 
@@ -397,7 +410,22 @@ mod tests {
         assert!(!raw.to_string().contains("s3cret"), "{raw}");
 
         let uri = format!("{STAGING}/workloads/api");
-        let (status, api): (_, WorkloadResponse) = call(&node, Method::GET, &uri, None).await;
+        // By default every value is masked, and the response says no more.
+        let (status, masked): (_, Value) = call(&node, Method::GET, &uri, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(masked["spec"]["containers"][0]["env"]["TOKEN"], "***");
+        assert!(!masked.to_string().contains("s3cret"), "{masked}");
+        for query in ["?reveal=false", "?other=1"] {
+            let (_, got): (_, Value) =
+                call(&node, Method::GET, &format!("{uri}{query}"), None).await;
+            assert_eq!(got, masked, "{query}");
+        }
+        let (status, _): (_, Value) =
+            call(&node, Method::GET, &format!("{uri}?reveal=maybe"), None).await;
+        assert_eq!(status, 400);
+
+        let revealed = format!("{uri}?reveal=true");
+        let (status, api): (_, WorkloadResponse) = call(&node, Method::GET, &revealed, None).await;
         assert_eq!(status, 200);
         assert_eq!(
             (api.project.as_str(), api.environment.as_str()),
@@ -1040,7 +1068,7 @@ mod tests {
             .insert(header::HOST, "127.0.0.1:7400".parse().unwrap());
         let resp = local(&node).oneshot(req).await.unwrap();
         assert_eq!(resp.status().as_u16(), 404);
-        let stored = node.service.workload("shop", "staging", "web").await;
+        let stored = node.service.workload("shop", "staging", "web", true).await;
         assert_eq!(stored.unwrap().spec.containers[0].image, "nginx");
         node.shutdown().await;
     }

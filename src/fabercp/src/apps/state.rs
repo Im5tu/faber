@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use faber_api_types::error_code;
 use faber_api_types::name::validate_dns_label;
 use faber_api_types::workload::{Exposure, Placement, Scale, WorkloadSpec, limits};
+use faber_crypto::Sealed;
 use serde::{Deserialize, Serialize};
 
 use crate::mesh::Rejection;
@@ -96,13 +97,72 @@ pub struct EnvironmentRecord {
 }
 
 /// One workload of an [`EnvironmentRecord`].
+///
+/// `spec` never holds an env value: every container's `env` is empty, and
+/// the values are in `env`, sealed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadRecord {
     /// The raft log index of the entry that last changed the pod template:
-    /// everything in the spec except `scale`, `placement` and `expose`. The
-    /// runner restarts pods only when it moves.
+    /// everything in the spec except `scale`, `placement` and `expose`, and
+    /// the env. The runner restarts pods only when it moves.
     pub revision: u64,
     pub spec: WorkloadSpec,
+    /// The sealed env of each container, by container name.
+    #[serde(default)]
+    pub env: BTreeMap<String, SealedEnv>,
+}
+
+/// The env of one container, sealed under the data key of the environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedEnv {
+    /// `faber_crypto::env_digest` of the plaintext env. Two envs are the
+    /// same when their digests are, whatever their ciphertexts.
+    #[serde(with = "faber_crypto::digest_serde")]
+    pub digest: [u8; 32],
+    /// The sealed value of each variable, by name.
+    pub values: BTreeMap<String, Sealed>,
+}
+
+/// What `ApplyWorkloads` carries for one workload: a [`WorkloadRecord`]
+/// without its revision. The service seals the env before it proposes, so
+/// the log holds no plaintext and `apply` stays deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredWorkload {
+    /// The spec with every container's `env` empty.
+    pub spec: WorkloadSpec,
+    /// The sealed env of each container, by container name.
+    #[serde(default)]
+    pub env: BTreeMap<String, SealedEnv>,
+}
+
+impl StoredWorkload {
+    /// Whether every container's `env` is empty, as it must be.
+    fn is_sealed(&self) -> bool {
+        self.spec.containers.iter().all(|c| c.env.is_empty())
+    }
+}
+
+/// The digest of each container's env, by container name.
+fn digests(env: &BTreeMap<String, SealedEnv>) -> impl Iterator<Item = (&String, &[u8; 32])> {
+    env.iter().map(|(container, env)| (container, &env.digest))
+}
+
+impl WorkloadRecord {
+    /// Whether `new` is the same workload, the env compared by digest: the
+    /// ciphertexts differ on every seal.
+    fn is_same_as(&self, new: &StoredWorkload) -> bool {
+        self.spec == new.spec && self.same_env_as(new)
+    }
+
+    fn same_env_as(&self, new: &StoredWorkload) -> bool {
+        digests(&self.env).eq(digests(&new.env))
+    }
+
+    /// Whether the pod template differs: see [`pod_template`]. A changed
+    /// env is a changed template.
+    fn template_differs_from(&self, new: &StoredWorkload) -> bool {
+        pod_template(&self.spec) != pod_template(&new.spec) || !self.same_env_as(new)
+    }
 }
 
 /// What `ApplyWorkloads` did, as `Response::Applied` reports it. Every
@@ -367,9 +427,10 @@ impl ProjectIndex {
     /// `ApplyWorkloads`: creates or updates each of `workloads` in
     /// `record`, the stored record of the environment (`None` when
     /// [`env_key`] holds nothing, which counts as an empty record). With
-    /// `prune` it removes every other workload. A workload whose spec is
-    /// `==` the stored one is unchanged. One whose pod template changed
-    /// gets `revision = index`.
+    /// `prune` it removes every other workload. A workload whose spec and
+    /// env digests are those of the stored one is unchanged; the ciphertexts
+    /// are not compared. One whose pod template or env changed gets
+    /// `revision = index`.
     ///
     /// When anything changed, the environment's generation becomes `index`
     /// and its `updated_at` becomes `at`, in the returned record and in
@@ -386,7 +447,7 @@ impl ProjectIndex {
         record: Option<EnvironmentRecord>,
         project: &str,
         environment: &str,
-        workloads: BTreeMap<String, WorkloadSpec>,
+        workloads: BTreeMap<String, StoredWorkload>,
         prune: bool,
         index: u64,
         at: u64,
@@ -398,8 +459,15 @@ impl ProjectIndex {
         // not called here, on purpose: the service runs them before it
         // proposes, and a rule that changes there must not change how a
         // logged command replays.
-        for name in workloads.keys() {
+        for (name, workload) in &workloads {
             check_name("workload", name)?;
+            // The log must never hold a plaintext env value.
+            if !workload.is_sealed() {
+                return Err(Rejection::new(
+                    error_code::BAD_REQUEST,
+                    format!("workload {name:?} carries env values that are not sealed"),
+                ));
+            }
         }
         if json_len(&workloads)? > limits::MAX_DEPLOY_REQUEST_BYTES as u64 {
             return Err(Rejection::new(
@@ -423,22 +491,27 @@ impl ProjectIndex {
                 record.workloads.remove(name);
             }
         }
-        for (name, spec) in workloads {
+        for (name, workload) in workloads {
             match record.workloads.get_mut(&name) {
                 None => {
-                    let workload = WorkloadRecord {
+                    let StoredWorkload { spec, env } = workload;
+                    let created = WorkloadRecord {
                         revision: index,
                         spec,
+                        env,
                     };
-                    record.workloads.insert(name.clone(), workload);
+                    record.workloads.insert(name.clone(), created);
                     applied.created.push(name);
                 }
-                Some(stored) if stored.spec == spec => applied.unchanged.push(name),
+                // The same by digest: the stored ciphertext stays.
+                Some(stored) if stored.is_same_as(&workload) => applied.unchanged.push(name),
                 Some(stored) => {
-                    if pod_template(&stored.spec) != pod_template(&spec) {
+                    if stored.template_differs_from(&workload) {
                         stored.revision = index;
                     }
+                    let StoredWorkload { spec, env } = workload;
                     stored.spec = spec;
+                    stored.env = env;
                     applied.updated.push(name);
                 }
             }
@@ -599,11 +672,16 @@ mod tests {
         }
     }
 
-    /// A workload that exists for its size: `pad` bytes of env value.
+    /// A workload that exists for its size: `pad` bytes of image name. The
+    /// size is exact, which sealed env values (base64) would not be.
     fn padded(pad: usize) -> WorkloadSpec {
-        let mut s = spec("img");
-        s.containers[0].env.insert("PAD".into(), "x".repeat(pad));
-        s
+        spec(&"x".repeat(pad))
+    }
+
+    /// `spec` with its env sealed under a fixed key, as the service does.
+    fn sealed(spec: &WorkloadSpec) -> StoredWorkload {
+        let key = faber_crypto::DataKey::from_bytes([9; 32]);
+        crate::secrets::seal_workload(&key, "shop", "staging", "w", spec, None).unwrap()
     }
 
     fn strings(names: &[&str]) -> Vec<String> {
@@ -689,7 +767,7 @@ mod tests {
             let stored = self.records.get(&key(project, environment)).cloned();
             let workloads = workloads
                 .iter()
-                .map(|(name, spec)| (name.to_string(), spec.clone()))
+                .map(|(name, spec)| (name.to_string(), sealed(spec)))
                 .collect();
             let done =
                 next.apply_workloads(stored, project, environment, workloads, prune, index, at)?;
@@ -755,7 +833,7 @@ mod tests {
                     self.records.get(&key(project, environment)).cloned(),
                     project,
                     environment,
-                    BTreeMap::from([(name.to_string(), padded(pad))]),
+                    BTreeMap::from([(name.to_string(), sealed(&padded(pad)))]),
                     false,
                     index,
                     1,
@@ -937,6 +1015,63 @@ mod tests {
             serde_json::from_value::<EnvironmentRecord>(v).unwrap(),
             record
         );
+    }
+
+    /// The sealed env of a workload: a digest and the values by name.
+    #[test]
+    fn a_workload_record_keeps_sealed_env_by_container() {
+        let mut with_env = spec("nginx");
+        with_env.containers[0]
+            .env
+            .insert("TOKEN".into(), "x".into());
+        let record = WorkloadRecord {
+            revision: 5,
+            spec: sealed(&with_env).spec,
+            env: sealed(&with_env).env,
+        };
+        let v = serde_json::to_value(&record).unwrap();
+        assert_eq!(v["spec"]["containers"][0]["env"], json!({}));
+        let env = &v["env"]["main"];
+        assert!(env["digest"].is_string());
+        assert!(env["values"]["TOKEN"].is_string());
+        assert_eq!(serde_json::from_value::<WorkloadRecord>(v).unwrap(), record);
+    }
+
+    /// The ciphertexts differ on every seal: sameness is the digest's.
+    #[test]
+    fn an_env_is_compared_by_digest_not_by_ciphertext() {
+        let with = |value: &str| {
+            let mut s = spec("nginx");
+            s.containers[0].env.insert("TOKEN".into(), value.into());
+            s
+        };
+        let mut w = shop();
+        let apply = |w: &mut World, value: &str, index: u64| {
+            w.apply("shop", "staging", &[("web", with(value))], false, index, 1)
+                .unwrap()
+        };
+        assert_eq!(apply(&mut w, "a", 2).created, strings(&["web"]));
+        let sealed_once = w.record("shop", "staging").workloads["web"].env.clone();
+
+        // Sealed again, the same env is unchanged: nothing is written and
+        // the stored ciphertext stays.
+        assert_ne!(sealed(&with("a")).env, sealed_once);
+        assert_eq!(apply(&mut w, "a", 3).unchanged, strings(&["web"]));
+        let record = w.record("shop", "staging");
+        assert_eq!(record.workloads["web"].env, sealed_once);
+        assert_eq!(
+            (record.generation, record.workloads["web"].revision),
+            (2, 2)
+        );
+
+        // Another value is a template change.
+        assert_eq!(apply(&mut w, "b", 4).updated, strings(&["web"]));
+        let record = w.record("shop", "staging");
+        assert_eq!(
+            (record.generation, record.workloads["web"].revision),
+            (4, 4)
+        );
+        assert_ne!(record.workloads["web"].env, sealed_once);
     }
 
     #[test]
@@ -1263,6 +1398,7 @@ mod tests {
             WorkloadRecord {
                 revision: 7,
                 spec: spec("nginx"),
+                env: sealed(&spec("nginx")).env,
             }
         );
         assert_eq!(record.workloads["api"].revision, 7);
@@ -1291,7 +1427,7 @@ mod tests {
                     "staging",
                     workloads
                         .iter()
-                        .map(|(n, s)| (n.to_string(), s.clone()))
+                        .map(|(n, s)| (n.to_string(), sealed(s)))
                         .collect(),
                     prune,
                     9,

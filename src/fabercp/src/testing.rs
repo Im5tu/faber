@@ -9,8 +9,19 @@ use tokio::net::TcpListener;
 use crate::raft::store::StateReader;
 use crate::{Config, FaberService, NodeHandle, start};
 
+/// The cluster key of every test node, so that nodes of one test open each
+/// other's data keys.
+pub fn test_cluster_key() -> faber_crypto::ClusterKey {
+    faber_crypto::ClusterKey::from_bytes([7; faber_crypto::KEY_LEN])
+}
+
+/// A config with short timers and a cluster key file in `dir`.
 pub fn fast_config(node_id: u64, dir: &std::path::Path) -> Config {
     let mut c = Config::new(node_id, dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let key_file = dir.join("cluster.key");
+    std::fs::write(&key_file, test_cluster_key().to_base64()).unwrap();
+    c.cluster_key_file = Some(key_file);
     c.heartbeat_ms = 50;
     c.election_min_ms = 150;
     c.election_max_ms = 300;

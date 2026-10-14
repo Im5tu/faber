@@ -88,7 +88,7 @@ impl Pending<'_> {
 
 /// Whether only typed commands may write `key`: `Request::Set` is refused.
 fn is_reserved(key: &str) -> bool {
-    RESERVED_KEYS.contains(&key) || is_reserved_key(key)
+    RESERVED_KEYS.contains(&key) || is_reserved_key(key) || keys::is_reserved_key(key)
 }
 
 fn reject(code: &str, message: impl Into<String>) -> Response {
@@ -201,9 +201,11 @@ impl StateMachineStore {
                 | Request::ApplyWorkloads { .. }
                 | Request::RemoveWorkloads { .. }),
             ) => self.apply_apps(pending, req, entry.log_id.index)?,
-            EntryPayload::Normal(Request::CreateDataKey(cmd)) => keys::apply_create_data_key(cmd),
+            EntryPayload::Normal(Request::CreateDataKey(cmd)) => {
+                self.apply_create_data_key(pending, cmd)?
+            }
             EntryPayload::Normal(Request::SetClusterKeyId(cmd)) => {
-                keys::apply_set_cluster_key_id(cmd)
+                self.apply_set_cluster_key_id(pending, cmd)?
             }
             EntryPayload::Normal(Request::PlaceReplicas(cmd)) => place::apply_place_replicas(cmd),
             EntryPayload::Normal(Request::ReportNode(cmd)) => status::apply_report_node(cmd),
@@ -221,6 +223,43 @@ impl StateMachineStore {
                 pending.membership = Some(StoredMembership::new(Some(entry.log_id), m));
                 Response::None
             }
+        })
+    }
+
+    /// Applies `CreateDataKey`: the first key for a scope is stored, and a
+    /// later one changes nothing. Both answer `Response::None`; the
+    /// proposer reads the key back.
+    fn apply_create_data_key(
+        &self,
+        pending: &mut Pending<'_>,
+        cmd: keys::CreateDataKey,
+    ) -> Result<Response, StorageError> {
+        let key = keys::data_key_key(&cmd.scope);
+        let existing: Option<keys::DataKeyRecord> = self.typed(pending, &key)?;
+        Ok(match keys::create_data_key(existing.as_ref(), cmd) {
+            Ok(Some(record)) => {
+                pending.put(&key, &record)?;
+                Response::None
+            }
+            Ok(None) => Response::None,
+            Err(rejection) => rejection.into(),
+        })
+    }
+
+    /// Applies `SetClusterKeyId`: the id is recorded once.
+    fn apply_set_cluster_key_id(
+        &self,
+        pending: &mut Pending<'_>,
+        cmd: keys::SetClusterKeyId,
+    ) -> Result<Response, StorageError> {
+        let existing: Option<keys::ClusterKeyId> = self.typed(pending, keys::KEY_CLUSTER_ID)?;
+        Ok(match keys::set_cluster_key_id(existing.as_ref(), cmd) {
+            Ok(Some(record)) => {
+                pending.put(keys::KEY_CLUSTER_ID, &record)?;
+                Response::None
+            }
+            Ok(None) => Response::None,
+            Err(rejection) => rejection.into(),
         })
     }
 
@@ -773,6 +812,16 @@ impl StateReader {
         // Key order is not name order: `-` sorts before `/`.
         found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         Ok(found)
+    }
+
+    /// The data key stored for `scope` (`cluster` or `<project>/<environment>`).
+    pub fn data_key(&self, scope: &str) -> Result<Option<keys::DataKeyRecord>, ReadError> {
+        self.typed(&keys::data_key_key(scope))
+    }
+
+    /// The id of the cluster key, once a `SetClusterKeyId` was applied.
+    pub fn cluster_key_id(&self) -> Result<Option<keys::ClusterKeyId>, ReadError> {
+        self.typed(keys::KEY_CLUSTER_ID)
     }
 
     fn typed<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, ReadError> {
@@ -2141,6 +2190,14 @@ mod tests {
         serde_json::from_value(json!({"containers": [{"name": "main", "image": image}]})).unwrap()
     }
 
+    /// `workload(image)` with its (empty) env sealed under a fixed key, as the
+    /// service does before it proposes.
+    fn stored_workload(image: &str) -> crate::apps::StoredWorkload {
+        let key = faber_crypto::DataKey::from_bytes([9; 32]);
+        crate::secrets::seal_workload(&key, "shop", "staging", "web", &workload(image), None)
+            .unwrap()
+    }
+
     fn strings(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
     }
@@ -2181,7 +2238,7 @@ mod tests {
             environment: "staging".into(),
             workloads: workloads
                 .iter()
-                .map(|(name, image)| (name.to_string(), workload(image)))
+                .map(|(name, image)| (name.to_string(), stored_workload(image)))
                 .collect(),
             prune,
             at: 1_001,
@@ -2259,6 +2316,166 @@ mod tests {
         replies.into_iter().next().unwrap()
     }
 
+    fn create_data_key(scope: &str) -> Request {
+        let cluster = faber_crypto::ClusterKey::generate().unwrap();
+        let data = faber_crypto::DataKey::generate().unwrap();
+        Request::CreateDataKey(keys::CreateDataKey {
+            scope: scope.into(),
+            wrapped: faber_crypto::wrap(&cluster, &data, scope).unwrap(),
+            key_id: faber_crypto::key_id(&cluster),
+        })
+    }
+
+    #[tokio::test]
+    async fn the_first_data_key_for_a_scope_wins_in_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        assert_eq!(s.reader.data_key("shop/staging").unwrap(), None);
+
+        let first = create_data_key("shop/staging");
+        let second = create_data_key("shop/staging");
+        let Request::CreateDataKey(first_cmd) = first.clone() else {
+            unreachable!()
+        };
+        assert_eq!(apply_one(&mut s, 1, first).await, Response::None);
+        let stored = s.reader.data_key("shop/staging").unwrap().unwrap();
+        assert_eq!(stored.wrapped, first_cmd.wrapped);
+        let before = dump(&s);
+
+        // A later key for the scope is answered like the first and writes
+        // nothing, so a losing proposer reads the winner's key.
+        assert_eq!(apply_one(&mut s, 2, second).await, Response::None);
+        assert_eq!(dump(&s), before);
+        assert_eq!(s.reader.data_key("shop/staging").unwrap().unwrap(), stored);
+
+        // Another scope is independent.
+        assert_eq!(
+            apply_one(&mut s, 3, create_data_key("cluster")).await,
+            Response::None
+        );
+        assert!(s.reader.data_key("cluster").unwrap().is_some());
+
+        let bad = apply_one(&mut s, 4, create_data_key("shop")).await;
+        assert!(rejected(ec::BAD_REQUEST)(&bad), "{bad:?}");
+        assert_eq!(s.reader.data_key("shop").unwrap(), None);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn the_cluster_key_id_is_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let set_id =
+            |id: &str| Request::SetClusterKeyId(keys::SetClusterKeyId { key_id: id.into() });
+        assert_eq!(s.reader.cluster_key_id().unwrap(), None);
+        assert_eq!(apply_one(&mut s, 1, set_id("abc123")).await, Response::None);
+        let before = dump(&s);
+        assert_eq!(apply_one(&mut s, 2, set_id("abc123")).await, Response::None);
+        assert_eq!(dump(&s), before);
+
+        let other = apply_one(&mut s, 3, set_id("def456")).await;
+        assert!(rejected(ec::BAD_REQUEST)(&other), "{other:?}");
+        assert_eq!(dump(&s), before);
+        assert_eq!(s.reader.cluster_key_id().unwrap().unwrap().key_id, "abc123");
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn set_cannot_write_the_key_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let replies = s
+            .state_machine
+            .apply([
+                set(1, 1, keys::KEY_CLUSTER_ID, json!({"key_id": "forged"})),
+                set(1, 2, "keys/data/shop/staging", json!({"forged": true})),
+                set(1, 3, "keys/data/cluster", json!({})),
+            ])
+            .await
+            .unwrap();
+        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
+        assert_eq!(dump(&s), BTreeMap::new());
+        drop(s);
+    }
+
+    /// A deploy whose env holds `marker`, sealed as the service does.
+    fn deploy_with_secret(marker: &str) -> Request {
+        let mut spec = workload("nginx");
+        spec.containers[0]
+            .env
+            .insert("TOKEN".into(), marker.to_string());
+        let key = faber_crypto::DataKey::from_bytes([9; 32]);
+        let sealed =
+            crate::secrets::seal_workload(&key, "shop", "staging", "web", &spec, None).unwrap();
+        Request::ApplyWorkloads {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workloads: BTreeMap::from([("web".to_string(), sealed)]),
+            prune: false,
+            at: 1_001,
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[tokio::test]
+    async fn a_sealed_deploy_leaves_no_plaintext_in_the_log_state_or_snapshot() {
+        const MARKER: &str = "plain-marker-7f3a9c";
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        apply_one(&mut s, 1, create_project("shop")).await;
+        let deploy = deploy_with_secret(MARKER);
+        // A log entry is the JSON of the request.
+        let logged = serde_json::to_vec(&deploy).unwrap();
+        assert!(!contains(&logged, MARKER.as_bytes()));
+        assert!(matches!(
+            apply_one(&mut s, 2, deploy).await,
+            Response::Applied { .. }
+        ));
+
+        let state: Vec<u8> = dump(&s).into_values().flatten().collect();
+        assert!(!contains(&state, MARKER.as_bytes()));
+        assert!(contains(&state, b"TOKEN"), "the env names stay");
+
+        let snap = s
+            .state_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snap.snapshot.into_inner();
+        assert!(!bytes.is_empty());
+        assert!(!contains(&bytes, MARKER.as_bytes()));
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_workload_with_plaintext_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        apply_one(&mut s, 1, create_project("shop")).await;
+        let before = dump(&s);
+
+        let mut plain = stored_workload("nginx");
+        plain.spec.containers[0]
+            .env
+            .insert("TOKEN".into(), "hunter2".into());
+        let deploy = Request::ApplyWorkloads {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workloads: BTreeMap::from([("web".to_string(), plain)]),
+            prune: false,
+            at: 1_001,
+        };
+        let reply = apply_one(&mut s, 2, deploy).await;
+        assert!(rejected(ec::BAD_REQUEST)(&reply), "{reply:?}");
+        assert_eq!(dump(&s), before);
+        drop(s);
+    }
+
     /// Every command, one batch each, on a cluster that has no mesh.
     #[tokio::test]
     async fn app_commands_apply_without_a_mesh() {
@@ -2315,6 +2532,7 @@ mod tests {
             WorkloadRecord {
                 revision: 3,
                 spec: workload("nginx"),
+                env: stored_workload("nginx").env,
             }
         );
 
@@ -2469,14 +2687,6 @@ mod tests {
         let before = dump(&s);
 
         let commands = [
-            Request::CreateDataKey(keys::CreateDataKey {
-                key_id: "k1".into(),
-                sealed: vec![1],
-                at: 1,
-            }),
-            Request::SetClusterKeyId(keys::SetClusterKeyId {
-                key_id: "c1".into(),
-            }),
             Request::PlaceReplicas(place::PlaceReplicas {
                 project: "shop".into(),
                 environment: "staging".into(),
@@ -2507,7 +2717,7 @@ mod tests {
             .map(|(n, req)| normal(2 + n as u64, req))
             .collect();
         let replies = s.state_machine.apply(entries).await.unwrap();
-        assert_eq!(replies.len(), 7);
+        assert_eq!(replies.len(), 5);
         assert!(replies.iter().all(rejected("internal")), "{replies:?}");
         assert_eq!(dump(&s), before);
         drop(s);

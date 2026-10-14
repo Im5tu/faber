@@ -9,6 +9,6 @@ pub mod service;
 pub mod state;
 
 pub use state::{
-    Applied, EnvironmentIndexEntry, EnvironmentRecord, ProjectIndex, ProjectRecord, WorkloadRecord,
-    WorkloadsApplied,
+    Applied, EnvironmentIndexEntry, EnvironmentRecord, ProjectIndex, ProjectRecord, SealedEnv,
+    StoredWorkload, WorkloadRecord, WorkloadsApplied,
 };

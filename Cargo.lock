@@ -782,6 +782,7 @@ dependencies = [
  "clap",
  "faber-api-types",
  "faber-container-runtime",
+ "faber-crypto",
  "faber-network-management",
  "getrandom 0.4.3",
  "http-body-util",

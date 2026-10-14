@@ -38,6 +38,7 @@ use crate::mesh::{
 };
 use crate::raft::store::StateReader;
 use crate::raft::types::{Node, NodeId, Raft, Request, Response};
+use crate::secrets::{ClusterKeyProvider, NoClusterKey};
 
 /// How long `init` and `join` wait for the local node to see the result.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
@@ -135,6 +136,8 @@ pub struct MeshLocal {
 #[derive(Clone)]
 pub struct FaberService {
     inner: Arc<Inner>,
+    /// Where this node gets the cluster key that seals and opens env values.
+    cluster_keys: Arc<dyn ClusterKeyProvider>,
 }
 
 struct Inner {
@@ -181,7 +184,19 @@ impl FaberService {
                 mesh,
                 strict_peer_source,
             }),
+            cluster_keys: Arc::new(NoClusterKey),
         })
+    }
+
+    /// Takes the cluster key from `provider`. Without one every deploy and
+    /// every revealing read fails with `key_unavailable`.
+    pub fn with_cluster_keys(mut self, provider: Arc<dyn ClusterKeyProvider>) -> Self {
+        self.cluster_keys = provider;
+        self
+    }
+
+    pub(crate) fn cluster_keys(&self) -> &Arc<dyn ClusterKeyProvider> {
+        &self.cluster_keys
     }
 
     pub fn node_id(&self) -> NodeId {

@@ -12,6 +12,7 @@
 //! from there and costs no log entry. Apply stays the judge of everything
 //! that is proposed. No spec and no env value is ever logged.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -23,12 +24,16 @@ use faber_api_types::workload::{
     WorkloadResponse, WorkloadSummary, fqdn, limits, validate_workloads,
 };
 
+use faber_crypto::{ClusterKey, DataKey, key_id, unwrap, wrap};
+
 use crate::apps::state::{KEY_PROJECTS, env_key};
-use crate::apps::{Applied, EnvironmentRecord, ProjectIndex, ProjectRecord};
+use crate::apps::{Applied, EnvironmentRecord, ProjectIndex, ProjectRecord, StoredWorkload};
 use crate::dto::{PeerWorkloadRequest, PeerWorkloadResponse};
 use crate::mesh::Rejection;
 use crate::raft::store::ReadError;
+use crate::raft::store::keys::CreateDataKey;
 use crate::raft::types::{Request, Response};
+use crate::secrets::{env_scope, masked_workload, reveal_workload, seal_workload};
 use crate::service::{FaberService, ServiceError, ServiceResult, now_secs, source_is_registered};
 
 /// How long a follower waits to apply a write it forwarded before it
@@ -197,11 +202,16 @@ impl FaberService {
     }
 
     /// `GET /api/v1/projects/{project}/environments/{environment}/workloads/{workload}`
+    ///
+    /// Every env value reads `***` unless `reveal`; then they are opened
+    /// with this node's cluster key, and a node without it answers
+    /// `key_unavailable`.
     pub async fn workload(
         &self,
         project: &str,
         environment: &str,
         workload: &str,
+        reveal: bool,
     ) -> ServiceResult<WorkloadResponse> {
         check_name("project", project)?;
         check_name("environment", environment)?;
@@ -223,6 +233,17 @@ impl FaberService {
                 ))
             }));
         };
+        let has_values = stored.env.values().any(|env| !env.values.is_empty());
+        let spec = if reveal && has_values {
+            let key = self.data_key(project, environment, false).await?;
+            reveal_workload(&key, project, environment, workload, &stored).map_err(|_| {
+                key_unavailable(format!(
+                    "the env of workload {workload:?} cannot be opened with this node's cluster key"
+                ))
+            })?
+        } else {
+            masked_workload(&stored)
+        };
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),
@@ -230,7 +251,7 @@ impl FaberService {
             fqdn: fqdn(workload, environment, project),
             revision: stored.revision,
             generation,
-            spec: stored.spec,
+            spec,
         })
     }
 
@@ -336,7 +357,9 @@ impl FaberService {
     /// it ends: a write that apply would refuse and a deploy that would
     /// change nothing are answered here and cost no log entry.
     async fn write_as_leader(&self, req: PeerWorkloadRequest) -> ServiceResult<Written> {
-        match self.settled_verdict(&req).await? {
+        // Sealed once: the dry run and the proposal see the same bytes.
+        let sealed = self.seal_deploy(&req).await?;
+        match self.settled_verdict(&req, sealed.as_ref()).await? {
             Verdict::Refuse(refusal) => return Err(refusal),
             Verdict::Unchanged(applied) => {
                 return Ok(Written {
@@ -354,7 +377,7 @@ impl FaberService {
             PeerWorkloadRequest::AddEnvironment { project, .. } => Some(project.clone()),
             _ => None,
         };
-        let (index, resp) = self.write(command(req, now_secs())).await?;
+        let (index, resp) = self.write(command(req, sealed, now_secs())?).await?;
         let applied = match resp {
             Response::Applied {
                 generation,
@@ -397,16 +420,25 @@ impl FaberService {
     /// from such a state. So anything but `Propose` is looked at again
     /// after [`Self::settle`]. When that cannot confirm in time, the write
     /// is proposed and apply judges it.
-    async fn settled_verdict(&self, req: &PeerWorkloadRequest) -> ServiceResult<Verdict> {
-        if matches!(self.dry_run(req)?, Verdict::Propose) || self.settle().await.is_err() {
+    async fn settled_verdict(
+        &self,
+        req: &PeerWorkloadRequest,
+        sealed: Option<&BTreeMap<String, StoredWorkload>>,
+    ) -> ServiceResult<Verdict> {
+        if matches!(self.dry_run(req, sealed)?, Verdict::Propose) || self.settle().await.is_err() {
             return Ok(Verdict::Propose);
         }
-        self.dry_run(req)
+        self.dry_run(req, sealed)
     }
 
     /// Runs `req` on a copy of this node's state, with the functions apply
-    /// uses, and writes nothing.
-    fn dry_run(&self, req: &PeerWorkloadRequest) -> ServiceResult<Verdict> {
+    /// uses, and writes nothing. `sealed` is what a deploy proposes in place
+    /// of its plaintext workloads.
+    fn dry_run(
+        &self,
+        req: &PeerWorkloadRequest,
+        sealed: Option<&BTreeMap<String, StoredWorkload>>,
+    ) -> ServiceResult<Verdict> {
         let mut index = self.read_index()?;
         if let Some(missing) = missing(&index, req) {
             return Ok(Verdict::Refuse(missing));
@@ -426,14 +458,14 @@ impl FaberService {
             PeerWorkloadRequest::ApplyWorkloads {
                 project,
                 environment,
-                workloads,
                 prune,
+                ..
             } => {
                 let record = self.read_environment(project, environment)?;
                 if !same_batch(&index, project, environment, record.as_ref()) {
                     return Ok(Verdict::Propose);
                 }
-                let workloads = workloads.clone();
+                let workloads = sealed.cloned().ok_or_else(unsealed)?;
                 index
                     .apply_workloads(record, project, environment, workloads, *prune, 0, 0)
                     // No record to write: nothing would change.
@@ -458,6 +490,104 @@ impl FaberService {
             Ok(Some(applied)) => Verdict::Unchanged(deploy_response(applied)),
             Ok(None) => Verdict::Propose,
         })
+    }
+
+    /// The workloads of a deploy with their env sealed under the data key of
+    /// the environment, which the first deploy to it creates. `None` for
+    /// every other write.
+    ///
+    /// A deploy to a project or environment that does not exist is refused
+    /// here, so that no key is made for it.
+    async fn seal_deploy(
+        &self,
+        req: &PeerWorkloadRequest,
+    ) -> ServiceResult<Option<BTreeMap<String, StoredWorkload>>> {
+        let PeerWorkloadRequest::ApplyWorkloads {
+            project,
+            environment,
+            workloads,
+            ..
+        } = req
+        else {
+            return Ok(None);
+        };
+        if missing(&self.read_index()?, req).is_some() && self.settle().await.is_ok() {
+            // Looked at again on a leader that has applied everything.
+            if let Some(refusal) = missing(&self.read_index()?, req) {
+                return Err(refusal);
+            }
+        }
+        let key = self.data_key(project, environment, true).await?;
+        let record = self.read_environment(project, environment)?;
+        let mut sealed = BTreeMap::new();
+        for (name, spec) in workloads {
+            let previous = record.as_ref().and_then(|r| r.workloads.get(name));
+            let workload = seal_workload(&key, project, environment, name, spec, previous)
+                .map_err(|e| ServiceError::Internal(format!("sealing workload {name:?}: {e}")))?;
+            sealed.insert(name.clone(), workload);
+        }
+        Ok(Some(sealed))
+    }
+
+    /// The cluster key of this node. The file is read on a blocking thread.
+    async fn cluster_key(&self) -> ServiceResult<ClusterKey> {
+        let provider = self.cluster_keys().clone();
+        let read = tokio::task::spawn_blocking(move || provider.cluster_key()).await;
+        read.map_err(|e| ServiceError::Internal(format!("reading the cluster key: {e}")))?
+            .map_err(|e| key_unavailable(e.to_string()))
+    }
+
+    /// The data key of an environment, opened with the cluster key. With
+    /// `create` the first call makes it: a new key is proposed and then
+    /// the stored one is read back and used, so that two proposers agree on
+    /// the winner's key.
+    async fn data_key(
+        &self,
+        project: &str,
+        environment: &str,
+        create: bool,
+    ) -> ServiceResult<DataKey> {
+        let cluster = self.cluster_key().await?;
+        let scope = env_scope(project, environment);
+        let stored = match self.read_data_key(&scope)? {
+            Some(stored) => stored,
+            None if create => {
+                let internal = |e: faber_crypto::CryptoError| {
+                    ServiceError::Internal(format!("making a data key: {e}"))
+                };
+                let data = DataKey::generate().map_err(internal)?;
+                let create = CreateDataKey {
+                    scope: scope.clone(),
+                    wrapped: wrap(&cluster, &data, &scope).map_err(internal)?,
+                    key_id: key_id(&cluster),
+                };
+                self.propose(Request::CreateDataKey(create)).await?;
+                self.read_data_key(&scope)?.ok_or_else(|| {
+                    ServiceError::Internal("the data key is missing after it was written".into())
+                })?
+            }
+            None => {
+                return Err(key_unavailable(format!(
+                    "environment {environment:?} of project {project:?} has no data key on this node"
+                )));
+            }
+        };
+        if stored.key_id != key_id(&cluster) {
+            return Err(key_unavailable(
+                "this node's cluster key is not the one that sealed the cluster's data keys",
+            ));
+        }
+        unwrap(&cluster, &stored.wrapped, &scope).map_err(|_| {
+            key_unavailable("this node's cluster key cannot open the data key of the environment")
+        })
+    }
+
+    fn read_data_key(
+        &self,
+        scope: &str,
+    ) -> ServiceResult<Option<crate::raft::store::keys::DataKeyRecord>> {
+        let stored = self.state().data_key(scope);
+        stored.map_err(|e| read_error(&crate::raft::store::keys::data_key_key(scope), e))
     }
 
     /// This node's copy of the project index.
@@ -706,9 +836,15 @@ fn invalid_workloads(violations: Vec<Violation>) -> ServiceError {
     ServiceError::BadRequest(message)
 }
 
-/// The raft command of `req`, stamped with `at`.
-fn command(req: PeerWorkloadRequest, at: u64) -> Request {
-    match req {
+/// The raft command of `req`, stamped with `at`. A deploy carries `sealed`
+/// in place of the plaintext workloads of `req`, which never leave this
+/// function.
+fn command(
+    req: PeerWorkloadRequest,
+    sealed: Option<BTreeMap<String, StoredWorkload>>,
+    at: u64,
+) -> ServiceResult<Request> {
+    Ok(match req {
         PeerWorkloadRequest::CreateProject { name, environments } => Request::CreateProject {
             name,
             environments,
@@ -724,12 +860,12 @@ fn command(req: PeerWorkloadRequest, at: u64) -> Request {
         PeerWorkloadRequest::ApplyWorkloads {
             project,
             environment,
-            workloads,
             prune,
+            ..
         } => Request::ApplyWorkloads {
             project,
             environment,
-            workloads,
+            workloads: sealed.ok_or_else(unsealed)?,
             prune,
             at,
         },
@@ -743,6 +879,19 @@ fn command(req: PeerWorkloadRequest, at: u64) -> Request {
             names,
             at,
         },
+    })
+}
+
+fn unsealed() -> ServiceError {
+    ServiceError::Internal("a deploy reached the log step without its env sealed".into())
+}
+
+/// The error for a cluster key that is missing or does not fit. The
+/// message never holds key material.
+fn key_unavailable(message: impl Into<String>) -> ServiceError {
+    ServiceError::Rejected {
+        code: error_code::KEY_UNAVAILABLE.into(),
+        message: message.into(),
     }
 }
 
@@ -980,7 +1129,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.created, vec!["web"]);
-        let stored = svc.workload("shop", "staging", "web").await.unwrap();
+        let stored = svc.workload("shop", "staging", "web", true).await.unwrap();
         assert_eq!(stored.generation, first.generation);
         assert_eq!(stored.revision, first.generation);
 
@@ -1021,7 +1170,7 @@ mod tests {
         assert_eq!(nothing.unchanged, Vec::<String>::new());
         // None of them was written.
         assert_eq!(next_index(&node).await, before + 1);
-        let stored = svc.workload("shop", "staging", "web").await.unwrap();
+        let stored = svc.workload("shop", "staging", "web", true).await.unwrap();
         assert_eq!(stored.generation, first.generation);
 
         // A change moves it to the index of its entry.
@@ -1228,9 +1377,9 @@ mod tests {
             bad_request(svc.deploy("shop", bad, web()).await, bad);
             let named = deploy_req(&[(bad, spec("nginx"))], false);
             bad_request(svc.deploy("shop", "staging", named).await, bad);
-            bad_request(svc.workload(bad, "staging", "web").await, bad);
-            bad_request(svc.workload("shop", bad, "web").await, bad);
-            bad_request(svc.workload("shop", "staging", bad).await, bad);
+            bad_request(svc.workload(bad, "staging", "web", true).await, bad);
+            bad_request(svc.workload("shop", bad, "web", true).await, bad);
+            bad_request(svc.workload("shop", "staging", bad, true).await, bad);
             bad_request(svc.remove_workload(bad, "staging", "web").await, bad);
             bad_request(svc.remove_workload("shop", bad, "web").await, bad);
             bad_request(svc.remove_workload("shop", "staging", bad).await, bad);
@@ -1316,7 +1465,7 @@ mod tests {
         assert_eq!(api.revision, staging.generation);
 
         assert_eq!(
-            svc.workload("shop", "staging", "api").await.unwrap(),
+            svc.workload("shop", "staging", "api", true).await.unwrap(),
             WorkloadResponse {
                 project: "shop".into(),
                 environment: "staging".into(),
@@ -1334,7 +1483,7 @@ mod tests {
             ("shop", "production", "api"),
         ] {
             // Both say what is missing, each in its own words.
-            let read = missing(svc.workload(project, environment, workload).await);
+            let read = missing(svc.workload(project, environment, workload, true).await);
             let removed = missing(svc.remove_workload(project, environment, workload).await);
             let want = match (project, environment) {
                 ("wiki", _) => r#"project "wiki" does not exist"#.to_string(),
@@ -1572,7 +1721,10 @@ mod tests {
             node.state(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .with_cluster_keys(std::sync::Arc::new(crate::secrets::StaticClusterKey(
+            crate::testing::test_cluster_key(),
+        )));
         let create_shop = || PeerWorkloadRequest::CreateProject {
             name: "shop".into(),
             environments: vec!["staging".into()],
@@ -1623,6 +1775,263 @@ mod tests {
             .unwrap();
 
         drop(strict);
+        node.shutdown().await;
+    }
+
+    const MARKER: &str = "plain-marker-7f3a9c";
+
+    /// A workload that runs `image` with the env `TOKEN`.
+    fn with_token(image: &str, token: &str) -> WorkloadSpec {
+        let mut s = spec(image);
+        s.containers[0].env.insert("TOKEN".into(), token.into());
+        s.containers[0].env.insert("MODE".into(), "prod".into());
+        s
+    }
+
+    fn env_of(read: &WorkloadResponse) -> Vec<(String, String)> {
+        read.spec.containers[0]
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_masks_env_values_unless_revealed() {
+        let node = shop().await;
+        let svc = &node.service;
+        let web = [("web", with_token("nginx", MARKER))];
+        svc.deploy("shop", "staging", deploy_req(&web, false))
+            .await
+            .unwrap();
+
+        let masked = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(
+            env_of(&masked),
+            [
+                ("MODE".into(), "***".into()),
+                ("TOKEN".into(), "***".into())
+            ]
+        );
+        let shown = svc.workload("shop", "staging", "web", true).await.unwrap();
+        assert_eq!(
+            env_of(&shown),
+            [
+                ("MODE".into(), "prod".into()),
+                ("TOKEN".into(), MARKER.into())
+            ]
+        );
+        // Nothing else differs.
+        let mut unmasked = shown.clone();
+        unmasked.spec.containers[0].env = masked.spec.containers[0].env.clone();
+        assert_eq!(unmasked, masked);
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_revision_follows_the_env_by_digest_not_by_ciphertext() {
+        let node = shop().await;
+        let svc = &node.service;
+        let web = [("web", with_token("nginx", MARKER))];
+        let first = svc
+            .deploy("shop", "staging", deploy_req(&web, false))
+            .await
+            .unwrap();
+        let read = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(read.revision, first.generation);
+        let before = next_index(&node).await;
+
+        // The same env deployed again is unchanged: same revision, same
+        // generation, and no log entry.
+        let again = svc
+            .deploy("shop", "staging", deploy_req(&web, false))
+            .await
+            .unwrap();
+        assert_eq!(again.unchanged, vec!["web"]);
+        assert_eq!(next_index(&node).await, before + 1);
+        let read = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(read.revision, first.generation);
+
+        // A scale change leaves the revision; an env change moves it.
+        let mut scaled = with_token("nginx", MARKER);
+        scaled.scale = Scale::Replicas {
+            count: 2,
+            strategy: Strategy::Spread,
+        };
+        let scaled = svc
+            .deploy("shop", "staging", deploy_req(&[("web", scaled)], false))
+            .await
+            .unwrap();
+        assert_eq!(scaled.updated, vec!["web"]);
+        let read = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(read.revision, first.generation);
+
+        let mut changed = with_token("nginx", "another");
+        changed.scale = Scale::Replicas {
+            count: 2,
+            strategy: Strategy::Spread,
+        };
+        let changed = svc
+            .deploy("shop", "staging", deploy_req(&[("web", changed)], false))
+            .await
+            .unwrap();
+        assert_eq!(changed.updated, vec!["web"]);
+        let read = svc.workload("shop", "staging", "web", true).await.unwrap();
+        assert_eq!(read.revision, changed.generation);
+        assert_eq!(env_of(&read)[1], ("TOKEN".into(), "another".into()));
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_environment_keeps_one_data_key() {
+        let node = shop().await;
+        let svc = &node.service;
+        assert_eq!(node.state().data_key("shop/staging").unwrap(), None);
+        let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+        svc.deploy("shop", "staging", web).await.unwrap();
+        let first = node.state().data_key("shop/staging").unwrap().unwrap();
+        assert_eq!(
+            first.key_id,
+            faber_crypto::key_id(&crate::testing::test_cluster_key())
+        );
+
+        let api = deploy_req(&[("api", with_token("api:1", "x"))], false);
+        svc.deploy("shop", "staging", api).await.unwrap();
+        assert_eq!(
+            node.state().data_key("shop/staging").unwrap().unwrap(),
+            first
+        );
+        // Another environment gets its own.
+        let prod = deploy_req(&[("web", with_token("nginx", "y"))], false);
+        svc.deploy("shop", "production", prod).await.unwrap();
+        let other = node.state().data_key("shop/production").unwrap().unwrap();
+        assert_ne!(other.wrapped, first.wrapped);
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deploy_to_a_missing_environment_makes_no_key() {
+        let node = shop().await;
+        let svc = &node.service;
+        let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+        missing(svc.deploy("shop", "nowhere", web.clone()).await);
+        missing(svc.deploy("blog", "staging", web).await);
+        assert_eq!(node.state().data_key("shop/nowhere").unwrap(), None);
+        assert_eq!(node.state().data_key("blog/staging").unwrap(), None);
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_log_and_snapshot_hold_no_plaintext_env() {
+        let node = shop().await;
+        let svc = &node.service;
+        let web = [("web", with_token("nginx", MARKER))];
+
+        // The command a deploy proposes is what the log carries.
+        let req = apply_req("shop", &web);
+        let sealed = svc.seal_deploy(&req).await.unwrap();
+        let logged = command(req, sealed, 1).unwrap();
+        let bytes = serde_json::to_vec(&logged).unwrap();
+        assert!(!bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()));
+        assert!(format!("{logged:?}").contains("TOKEN"));
+
+        svc.deploy("shop", "staging", deploy_req(&web, false))
+            .await
+            .unwrap();
+        let raft = svc.raft();
+        raft.trigger().snapshot().await.unwrap();
+        let mut built = None;
+        for _ in 0..100 {
+            built = raft.get_snapshot().await.unwrap();
+            if built.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let bytes = built.expect("the snapshot is built").snapshot.into_inner();
+        assert!(
+            bytes.windows(5).any(|w| w == b"TOKEN"),
+            "the snapshot has the env"
+        );
+        assert!(!bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()));
+
+        let records = node.state().environments().unwrap();
+        let stored = serde_json::to_vec(&records).unwrap();
+        assert!(!stored.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()));
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deploy_without_a_cluster_key_fails_cleanly() {
+        let node = shop().await;
+        let svc = node.service.clone().with_cluster_keys(std::sync::Arc::new(
+            crate::secrets::FileClusterKey::new("no/such/cluster.key"),
+        ));
+        let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+        let before = next_index(&node).await;
+        let err = svc.deploy("shop", "staging", web).await.unwrap_err();
+        match &err {
+            ServiceError::Rejected { code, message } => {
+                assert_eq!(code, error_code::KEY_UNAVAILABLE);
+                assert!(message.contains("cluster key"), "{message}");
+                assert!(!message.contains(MARKER));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing was written, and no key was made.
+        assert_eq!(next_index(&node).await, before + 1);
+        assert_eq!(node.state().data_key("shop/staging").unwrap(), None);
+        assert!(
+            svc.list_workloads(query(None, None))
+                .await
+                .unwrap()
+                .workloads
+                .is_empty()
+        );
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revealing_read_needs_the_cluster_key_a_masked_one_does_not() {
+        let node = shop().await;
+        let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+        node.service.deploy("shop", "staging", web).await.unwrap();
+
+        let without = node
+            .service
+            .clone()
+            .with_cluster_keys(std::sync::Arc::new(crate::secrets::NoClusterKey));
+        let masked = without
+            .workload("shop", "staging", "web", false)
+            .await
+            .unwrap();
+        assert!(env_of(&masked).iter().all(|(_, v)| v == "***"));
+        let err = without
+            .workload("shop", "staging", "web", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServiceError::Rejected { code, .. } if code == error_code::KEY_UNAVAILABLE),
+            "{err:?}"
+        );
+
+        // Another cluster key is told apart from a missing one.
+        let other = faber_crypto::ClusterKey::from_bytes([1; faber_crypto::KEY_LEN]);
+        let wrong = node
+            .service
+            .clone()
+            .with_cluster_keys(std::sync::Arc::new(crate::secrets::StaticClusterKey(other)));
+        let err = wrong
+            .workload("shop", "staging", "web", true)
+            .await
+            .unwrap_err();
+        match err {
+            ServiceError::Rejected { code, message } => {
+                assert_eq!(code, error_code::KEY_UNAVAILABLE);
+                assert!(message.contains("not the one"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
         node.shutdown().await;
     }
 }

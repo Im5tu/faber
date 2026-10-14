@@ -31,6 +31,8 @@ pub const DEFAULT_API_LISTEN: SocketAddr = SocketAddr::new(
 pub const DEFAULT_DATA_DIR: &str = "./data";
 /// Default `--state-dir`.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/faber";
+/// Name of the cluster key file in `--state-dir`.
+pub const CLUSTER_KEY_FILE: &str = "cluster.key";
 /// Default `--containerd-conf-dir`.
 pub const DEFAULT_CONTAINERD_CONF_DIR: &str = "/etc/containerd/conf.d";
 /// Default `--cni-conf-dir`.
@@ -114,6 +116,12 @@ pub struct Config {
     /// Directory holding identity.json.
     #[arg(long, env = "FABER_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     pub state_dir: PathBuf,
+
+    /// File holding the cluster key, 32 bytes as base64. It seals and opens
+    /// the data keys of the environments, and is read when a deploy or a
+    /// revealing read needs it. Defaults to `cluster.key` in --state-dir.
+    #[arg(long, env = "FABER_CLUSTER_KEY_FILE")]
+    pub cluster_key_file: Option<PathBuf>,
 
     /// Create a new mesh with this node as the founder. Only used while the
     /// node has no identity. Cannot be combined with --join-token-file (see
@@ -215,6 +223,7 @@ impl Config {
             keep_logs: DEFAULT_KEEP_LOGS,
             mcp_allowed_hosts: Vec::new(),
             state_dir: PathBuf::from(DEFAULT_STATE_DIR),
+            cluster_key_file: None,
             new_mesh: false,
             mesh_cidr: DEFAULT_MESH_CIDR,
             container_cidr: DEFAULT_CONTAINER_CIDR,
@@ -337,6 +346,14 @@ impl Config {
                  (use --new-mesh or --join-token-file to create one)"
             ),
         }
+    }
+
+    /// The cluster key file: `--cluster-key-file`, or `cluster.key` in
+    /// `--state-dir`.
+    pub fn cluster_key_path(&self) -> PathBuf {
+        self.cluster_key_file
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join(CLUSTER_KEY_FILE))
     }
 
     /// The WireGuard interface the node manages: `--wg-interface`, or
