@@ -2,6 +2,9 @@
 //!
 //! Image references are passed to the runtime as given; no normalisation.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use faber_cri::{BoxFuture, CriClient, CriError, RegistryCredentials};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,25 +56,50 @@ impl RegistryAuth for Anonymous {
 pub struct ImagePuller<C, A = Anonymous> {
     cri: C,
     auth: A,
+    /// One lock per image reference being ensured, so concurrent callers for
+    /// the same reference share a single pull.
+    in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<C: CriClient> ImagePuller<C> {
     pub fn new(cri: C) -> Self {
-        Self {
-            cri,
-            auth: Anonymous,
-        }
+        Self::with_auth(cri, Anonymous)
     }
 }
 
 impl<C: CriClient, A: RegistryAuth> ImagePuller<C, A> {
     pub fn with_auth(cri: C, auth: A) -> Self {
-        Self { cri, auth }
+        Self {
+            cri,
+            auth,
+            in_flight: Mutex::default(),
+        }
     }
 
     /// Returns the image id, pulling `image` first if the runtime does not
     /// have it.
+    ///
+    /// Concurrent calls for the same reference are serialised, so the image
+    /// is pulled once and the others find it present.
     pub async fn ensure(&self, image: &str) -> Result<String, ImageError> {
+        let lock = {
+            let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(map.entry(image.to_owned()).or_default())
+        };
+        let result = {
+            let _guard = lock.lock().await;
+            self.ensure_locked(image).await
+        };
+        // Drop the map entry once nobody else holds or waits on it. Waiters
+        // clone the Arc under the map lock, so a count of 2 (map + ours) is exact.
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&lock) == 2 {
+            map.remove(image);
+        }
+        result
+    }
+
+    async fn ensure_locked(&self, image: &str) -> Result<String, ImageError> {
         let wrap = |source| ImageError::Cri {
             image: image.to_owned(),
             source,
@@ -164,6 +192,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_pulls_once() {
+        let cri = FakeCri::new();
+        let puller = ImagePuller::new(cri.clone());
+        let (a, b, c) = tokio::join!(
+            puller.ensure("nginx:1"),
+            puller.ensure("nginx:1"),
+            puller.ensure("nginx:1")
+        );
+        let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+        assert_eq!((&a, &b), (&b, &c));
+        let pulls = cri
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::PullImage { .. }))
+            .count();
+        assert_eq!(pulls, 1);
+        assert!(puller.in_flight.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

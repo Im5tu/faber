@@ -207,12 +207,13 @@ impl CriClient for FakeCri {
         auth: Option<RegistryCredentials>,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let mut s = self.lock();
-            s.begin(Call::PullImage {
+            self.lock().begin(Call::PullImage {
                 image: image.to_owned(),
                 auth,
             })?;
-            Ok(add_image(&mut s, image))
+            // A real pull takes time; yielding lets concurrent callers interleave.
+            tokio::task::yield_now().await;
+            Ok(add_image(&mut self.lock(), image))
         })
     }
 

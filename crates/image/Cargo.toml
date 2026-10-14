@@ -9,6 +9,4 @@ license.workspace = true
 [dependencies]
 faber-cri = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
