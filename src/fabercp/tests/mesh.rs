@@ -1510,12 +1510,16 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (term_after, index_after) = n1.log_position();
     // A new term adds an entry of its own, which says nothing about this.
-    // The restarted node also renews its lease, once.
+    // The restarted node also renews its lease, once. Every node reports
+    // its status when it starts and then every five seconds, so up to three
+    // `ReportNode` entries may be in the window as well: the restarted
+    // node's first report and one periodic report of each node. A write
+    // proposed again and again would add far more.
     if term_after == term {
-        assert_eq!(
-            index_after,
-            index.map(|i| i + 2),
-            "one RenewLease and one SetEndpoint entry expected"
+        let added = index_after.zip(index).map(|(after, before)| after - before);
+        assert!(
+            matches!(added, Some(2..=5)),
+            "one RenewLease, one SetEndpoint and a few reports expected, got {added:?}"
         );
     }
 
