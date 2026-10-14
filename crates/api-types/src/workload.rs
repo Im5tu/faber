@@ -68,17 +68,20 @@ pub mod limits {
     pub const MAX_PATH_BYTES: usize = 4096;
     /// Highest `stop_grace_secs`: one hour.
     pub const MAX_STOP_GRACE_SECS: u32 = 3600;
-    /// Highest `cpu_millis`: 1000 cores.
-    pub const MAX_CPU_MILLIS: u64 = 1_000_000;
-    /// Highest `memory_bytes`: `i64::MAX`. A container runtime reads a
-    /// larger number as "no limit".
-    pub const MAX_MEMORY_BYTES: u64 = i64::MAX as u64;
+    /// Highest `cpu_millis`: 256 cores.
+    pub const MAX_CPU_MILLIS: u64 = 256_000;
+    /// Highest `memory_bytes`: 4 TiB.
+    pub const MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
     /// Lowest `size_bytes` of a volume: 1 MiB.
     pub const MIN_VOLUME_BYTES: u64 = 1024 * 1024;
     /// Highest `size_bytes` of a block volume: 1 TiB.
     pub const MAX_BLOCK_VOLUME_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
     /// Highest `size_bytes` of a ramdisk volume: 64 GiB.
     pub const MAX_RAMDISK_VOLUME_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+    /// Bytes of all block volumes of one workload together: 4 TiB.
+    pub const MAX_TOTAL_BLOCK_BYTES_PER_WORKLOAD: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+    /// Bytes of all ramdisk volumes of one workload together: 256 GiB.
+    pub const MAX_TOTAL_RAMDISK_BYTES_PER_WORKLOAD: u64 = 256 * 1024 * 1024 * 1024;
     /// Nodes in `placement.nodes`.
     pub const MAX_PLACEMENT_NODES: usize = 64;
     /// Highest `interval_secs` of a probe: one hour.
@@ -351,6 +354,7 @@ fn check_spec(spec: &WorkloadSpec, out: &mut Vec<Violation>) {
             ),
         ));
     }
+    let (mut block_total, mut ramdisk_total) = (0u128, 0u128);
     for (name, source) in &spec.volumes {
         let at = format!("volumes.{}", segment(name));
         check_label(&at, name, out);
@@ -362,6 +366,10 @@ fn check_spec(spec: &WorkloadSpec, out: &mut Vec<Violation>) {
                 ("ramdisk", *size_bytes, limits::MAX_RAMDISK_VOLUME_BYTES)
             }
         };
+        match source {
+            VolumeSource::Block { .. } => block_total += u128::from(size_bytes),
+            VolumeSource::Ramdisk { .. } => ramdisk_total += u128::from(size_bytes),
+        }
         let at = format!("{at}.size_bytes");
         if size_bytes < limits::MIN_VOLUME_BYTES {
             out.push(Violation::new(
@@ -372,6 +380,25 @@ fn check_spec(spec: &WorkloadSpec, out: &mut Vec<Violation>) {
             out.push(Violation::new(
                 at,
                 format!("must be at most {most} for a {kind} volume"),
+            ));
+        }
+    }
+    for (kind, total, most) in [
+        (
+            "block",
+            block_total,
+            limits::MAX_TOTAL_BLOCK_BYTES_PER_WORKLOAD,
+        ),
+        (
+            "ramdisk",
+            ramdisk_total,
+            limits::MAX_TOTAL_RAMDISK_BYTES_PER_WORKLOAD,
+        ),
+    ] {
+        if total > u128::from(most) {
+            out.push(Violation::new(
+                "volumes",
+                format!("{kind} volumes total {total} bytes, at most {most} are allowed"),
             ));
         }
     }
@@ -540,6 +567,43 @@ fn check_container(
             check_sub_path(&format!("{at}.sub_path"), sub_path, out);
         }
     }
+    // A mount under another hides it or is hidden by it. Equal paths are
+    // reported as duplicates above.
+    for (i, mount) in container.mounts.iter().enumerate() {
+        let inside = |outer: &str, inner: &str| {
+            inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        if container.mounts[..i]
+            .iter()
+            .any(|earlier| inside(&earlier.path, &mount.path) || inside(&mount.path, &earlier.path))
+        {
+            out.push(Violation::new(
+                format!("{at}.mounts[{i}].path"),
+                "overlaps another mount path",
+            ));
+        }
+    }
+    // A ramdisk is memory of the container's cgroup.
+    let mut ramdisks = BTreeSet::new();
+    let mut ramdisk_bytes = 0u128;
+    for mount in &container.mounts {
+        if let Some(VolumeSource::Ramdisk { size_bytes }) = volumes.get(&mount.volume)
+            && ramdisks.insert(mount.volume.as_str())
+        {
+            ramdisk_bytes += u128::from(*size_bytes);
+        }
+    }
+    if ramdisk_bytes > u128::from(container.resources.memory_bytes) {
+        out.push(Violation::new(
+            format!("{at}.mounts"),
+            format!(
+                "ramdisk volumes total {ramdisk_bytes} bytes, more than memory_bytes ({})",
+                container.resources.memory_bytes
+            ),
+        ));
+    }
 
     let at_resources = format!("{at}.resources");
     check_amount(
@@ -692,6 +756,15 @@ fn check_sub_path(at: &str, path: &str, out: &mut Vec<Violation>) {
     if path.split('/').any(|part| part == "..") {
         out.push(Violation::new(at, "must not contain .. components"));
     }
+    if path.split('/').any(|part| part == ".") {
+        out.push(Violation::new(at, "must not contain . components"));
+    }
+    if path.contains("//") {
+        out.push(Violation::new(at, "must not contain //"));
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        out.push(Violation::new(at, "must not end with /"));
+    }
 }
 
 /// A decimal `u32` in its one spelling: digits only, no leading zero.
@@ -764,7 +837,8 @@ fn check_probe(at: &str, probe: &Probe, out: &mut Vec<Violation>) {
     } else if probe.timeout_secs >= probe.interval_secs {
         out.push(Violation::new(
             format!("{at}.timeout_secs"),
-            "must be less than interval_secs",
+            "must be less than interval_secs (the default timeout_secs is 1 s, so interval_secs \
+             must be at least 2)",
         ));
     }
     let at = format!("{at}.action");
@@ -802,11 +876,29 @@ fn check_probe(at: &str, probe: &Probe, out: &mut Vec<Violation>) {
                     ));
                 }
                 check_ascii_word(&format!("{at}.host"), host, out);
+                let clean = host.is_ascii()
+                    && !host
+                        .bytes()
+                        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control());
+                if clean && !host.is_empty() && !is_host_or_host_port(host) {
+                    out.push(Violation::new(
+                        format!("{at}.host"),
+                        "must be a hostname or host:port",
+                    ));
+                }
             }
             for (name, value) in headers {
                 let at = format!("{at}.headers.{}", segment(name));
                 if !is_http_token(name) {
                     out.push(Violation::new(at.as_str(), "name must be an HTTP token"));
+                } else if RESERVED_PROBE_HEADERS
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+                {
+                    out.push(Violation::new(
+                        at.as_str(),
+                        "name is reserved: the runner sets it",
+                    ));
                 }
                 if value.contains(['\r', '\n', '\0']) {
                     out.push(Violation::new(at, "value must not contain CR, LF or NUL"));
@@ -819,6 +911,46 @@ fn check_probe(at: &str, probe: &Probe, out: &mut Vec<Violation>) {
             }
         }
     }
+}
+
+/// Headers the runner sets itself; a probe cannot override them.
+const RESERVED_PROBE_HEADERS: [&str; 4] =
+    ["Host", "Content-Length", "Transfer-Encoding", "Connection"];
+
+/// `name`, `name:port`, `[v6]` or `[v6]:port`. A name is dot-separated DNS
+/// labels (letters, digits, hyphens; no hyphen at either end); a port is
+/// 1 to 65535.
+fn is_host_or_host_port(host: &str) -> bool {
+    let is_port = |p: &str| {
+        !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+    };
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((addr, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        let addr_ok = !addr.is_empty()
+            && addr.contains(':')
+            && addr
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'));
+        return addr_ok && (tail.is_empty() || tail.strip_prefix(':').is_some_and(is_port));
+    }
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    port.is_none_or(is_port)
+        && !name.is_empty()
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// A `token` of RFC 9110: what the name of a header may be.
@@ -1715,8 +1847,8 @@ mod tests {
         assert_eq!(limits::MAX_COMMAND_ENTRY_BYTES, 8_192);
         assert_eq!(limits::MAX_PATH_BYTES, 4_096);
         assert_eq!(limits::MAX_STOP_GRACE_SECS, 3_600);
-        assert_eq!(limits::MAX_CPU_MILLIS, 1_000_000);
-        assert_eq!(limits::MAX_MEMORY_BYTES, 9_223_372_036_854_775_807);
+        assert_eq!(limits::MAX_CPU_MILLIS, 256_000);
+        assert_eq!(limits::MAX_MEMORY_BYTES, 4_398_046_511_104);
         assert_eq!(limits::MIN_VOLUME_BYTES, 1_048_576);
         assert_eq!(limits::MAX_BLOCK_VOLUME_BYTES, 1 << 40);
         assert_eq!(limits::MAX_RAMDISK_VOLUME_BYTES, 64 << 30);
@@ -1728,6 +1860,7 @@ mod tests {
     const LABEL_LENGTH: &str = "name must be between 1 and 63 characters";
     const LABEL_CHARS: &str = "name may only contain a-z, 0-9 and hyphens";
     const LABEL_HYPHEN: &str = "name must not start or end with a hyphen";
+    const OVERLAP: &str = "overlaps another mount path";
     const MOUNT_RESERVED: &str = "must not be /proc, /sys or /dev or under them, except /dev/shm";
 
     /// One container `web` running `nginx`, everything else at its default.
@@ -1800,6 +1933,12 @@ mod tests {
         }
     }
 
+    /// Three labels of 63 characters and one of `last`: 253 bytes for 61.
+    fn long_host(last: usize) -> String {
+        let label = "a".repeat(63);
+        format!("{label}.{label}.{label}.{}", "a".repeat(last))
+    }
+
     fn replicas(count: u32, strategy: Strategy) -> Scale {
         Scale::Replicas { count, strategy }
     }
@@ -1859,7 +1998,7 @@ mod tests {
                     {"volume": "data", "path": "/data", "sub_path": "web/a"},
                     {"volume": "tmp", "path": "/tmp", "read_only": true},
                 ],
-                "resources": {"cpu_millis": 500, "memory_bytes": 1024},
+                "resources": {"cpu_millis": 500, "memory_bytes": 2097152},
                 "capabilities": ["NET_BIND_SERVICE", "CHOWN"],
                 "probe": {"action": {
                     "type": "http", "port": 8080, "path": "/ready?x=1",
@@ -2633,7 +2772,6 @@ mod tests {
                 |s| {
                     s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = [
-                        "/dev/shm",
                         "/dev/shm/cache",
                         "/device",
                         "/procfs",
@@ -2678,6 +2816,10 @@ mod tests {
                     ("containers[0].mounts[4].path", MOUNT_RESERVED),
                     ("containers[0].mounts[5].path", MOUNT_RESERVED),
                     ("containers[0].mounts[6].path", MOUNT_RESERVED),
+                    ("containers[0].mounts[1].path", OVERLAP),
+                    ("containers[0].mounts[3].path", OVERLAP),
+                    ("containers[0].mounts[5].path", OVERLAP),
+                    ("containers[0].mounts[6].path", OVERLAP),
                 ],
             ),
             (
@@ -2827,11 +2969,11 @@ mod tests {
                 &[
                     (
                         "containers[0].resources.cpu_millis",
-                        "must be at most 1000000",
+                        "must be at most 256000",
                     ),
                     (
                         "containers[0].resources.memory_bytes",
-                        "must be at most 9223372036854775807",
+                        "must be at most 4398046511104",
                     ),
                 ],
             ),
@@ -3175,7 +3317,7 @@ mod tests {
                 },
                 &[(
                     "containers[0].probe.timeout_secs",
-                    "must be less than interval_secs",
+                    "must be less than interval_secs (the default timeout_secs is 1 s, so interval_secs must be at least 2)",
                 )],
             ),
             (
@@ -3189,7 +3331,7 @@ mod tests {
                 },
                 &[(
                     "containers[0].probe.timeout_secs",
-                    "must be less than interval_secs",
+                    "must be less than interval_secs (the default timeout_secs is 1 s, so interval_secs must be at least 2)",
                 )],
             ),
             (
@@ -3277,12 +3419,12 @@ mod tests {
             ),
             (
                 "http probe with the longest host",
-                |s| s.containers[0].probe = Some(Probe::new(http_host(&"a".repeat(253)))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host(&long_host(61)))),
                 &[],
             ),
             (
                 "http probe with a host too long",
-                |s| s.containers[0].probe = Some(Probe::new(http_host(&"a".repeat(254)))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host(&long_host(62)))),
                 &[(
                     "containers[0].probe.action.host",
                     "must be at most 253 bytes",
@@ -3541,5 +3683,277 @@ mod tests {
         .unwrap();
         assert_eq!(one.spec.containers[0].image, "nginx");
         assert_eq!(serde_json::to_value(&one).unwrap()["generation"], 9);
+    }
+
+    /// Mounts every volume of `s` into the first container, each under
+    /// `/v/<name>`.
+    fn mount_all(s: &mut WorkloadSpec) {
+        s.containers[0].mounts = s
+            .volumes
+            .keys()
+            .map(|name| mount(name, &format!("/v/{name}")))
+            .collect();
+    }
+
+    fn ram(size_bytes: u64) -> VolumeSource {
+        VolumeSource::Ramdisk { size_bytes }
+    }
+
+    #[test]
+    fn aggregate_volume_rules() {
+        const GIB: u64 = 1 << 30;
+        check_rows(&[
+            (
+                "block volumes at the total cap",
+                |s| {
+                    for i in 0..4 {
+                        s.volumes
+                            .insert(format!("b{i}"), block(limits::MAX_BLOCK_VOLUME_BYTES));
+                    }
+                },
+                &[],
+            ),
+            (
+                "block volumes above the total cap",
+                |s| {
+                    for i in 0..4 {
+                        s.volumes
+                            .insert(format!("b{i}"), block(limits::MAX_BLOCK_VOLUME_BYTES));
+                    }
+                    s.volumes
+                        .insert("extra".into(), block(limits::MIN_VOLUME_BYTES));
+                },
+                &[(
+                    "volumes",
+                    "block volumes total 4398047559680 bytes, at most 4398046511104 are allowed",
+                )],
+            ),
+            (
+                "ramdisk volumes at the total cap",
+                |s| {
+                    for i in 0..4 {
+                        s.volumes.insert(format!("r{i}"), ram(64 * GIB));
+                    }
+                },
+                &[],
+            ),
+            (
+                "ramdisk volumes above the total cap",
+                |s| {
+                    for i in 0..4 {
+                        s.volumes.insert(format!("r{i}"), ram(64 * GIB));
+                    }
+                    s.volumes.insert("extra".into(), ramdisk());
+                },
+                &[(
+                    "volumes",
+                    "ramdisk volumes total 274878955520 bytes, at most 274877906944 are allowed",
+                )],
+            ),
+            (
+                "ramdisks mounted within the memory",
+                |s| {
+                    s.volumes.insert("a".into(), ram(512 << 20));
+                    s.volumes.insert("b".into(), ram(512 << 20));
+                    mount_all(s);
+                },
+                &[],
+            ),
+            (
+                "ramdisks mounted beyond the memory",
+                |s| {
+                    s.volumes.insert("a".into(), ram(512 << 20));
+                    s.volumes.insert("b".into(), ram(513 << 20));
+                    mount_all(s);
+                },
+                &[(
+                    "containers[0].mounts",
+                    "ramdisk volumes total 1074790400 bytes, more than memory_bytes (1073741824)",
+                )],
+            ),
+            (
+                "one ramdisk mounted twice counts once",
+                |s| {
+                    s.volumes.insert("a".into(), ram(800 << 20));
+                    s.containers[0].mounts = vec![mount("a", "/one"), mount("a", "/two")];
+                },
+                &[],
+            ),
+            (
+                "ramdisk mounted by no container is not counted",
+                |s| {
+                    s.volumes.insert("a".into(), ram(8 * GIB));
+                },
+                &[],
+            ),
+            (
+                "block volumes do not count against the memory",
+                |s| {
+                    s.volumes.insert("a".into(), block(8 * GIB));
+                    mount_all(s);
+                },
+                &[],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn sub_path_is_normalised() {
+        fn with(sub: &str) -> Vec<(String, String)> {
+            let mut s = base();
+            s.volumes.insert("a".into(), ramdisk());
+            let mut m = mount("a", "/a");
+            m.sub_path = Some(sub.to_string());
+            s.containers[0].mounts = vec![m];
+            violations(&s)
+        }
+        let at = "containers[0].mounts[0].sub_path";
+        let one = |msg: &str| vec![(at.to_string(), msg.to_string())];
+        assert_eq!(with("a/b"), vec![]);
+        assert_eq!(with("a..b/.c"), vec![]);
+        assert_eq!(with("."), one("must not contain . components"));
+        assert_eq!(with("a/./b"), one("must not contain . components"));
+        assert_eq!(with("a//b"), one("must not contain //"));
+        assert_eq!(with("a/"), one("must not end with /"));
+        assert_eq!(with(""), one("must not be empty"));
+        assert_eq!(with("a/../b"), one("must not contain .. components"));
+    }
+
+    #[test]
+    fn nested_and_overlapping_mounts_are_refused() {
+        fn with(paths: &[&str]) -> Vec<(String, String)> {
+            let mut s = base();
+            s.volumes.insert("a".into(), ramdisk());
+            s.containers[0].mounts = paths.iter().map(|p| mount("a", p)).collect();
+            violations(&s)
+        }
+        assert_eq!(with(&["/a", "/ab", "/b/a"]), vec![]);
+        let nested = |at: usize| {
+            vec![(
+                format!("containers[0].mounts[{at}].path"),
+                "overlaps another mount path".to_string(),
+            )]
+        };
+        assert_eq!(with(&["/a", "/a/b"]), nested(1));
+        assert_eq!(with(&["/a/b", "/a"]), nested(1));
+        assert_eq!(with(&["/a", "/x", "/a/b/c"]), nested(2));
+    }
+
+    #[test]
+    fn probe_host_and_header_rules() {
+        let probe = |action| {
+            let mut s = base();
+            s.containers[0].probe = Some(Probe::new(action));
+            violations(&s)
+        };
+        let host_msg = "must be a hostname or host:port";
+        let at = "containers[0].probe.action";
+        for ok in [
+            "web.local",
+            "web.local:8080",
+            "10.0.0.1:80",
+            "a",
+            "[::1]:80",
+            "[::1]",
+        ] {
+            assert_eq!(probe(http_host(ok)), vec![], "{ok}");
+        }
+        for bad in [
+            "-a.b", "a.b-", "a..b", "a:b:c", "a:", "a:0", "a:65536", "a:x", ":80", "[::1", "[]:80",
+            "a_b!",
+        ] {
+            assert_eq!(
+                probe(http_host(bad)),
+                vec![(format!("{at}.host"), host_msg.to_string())],
+                "{bad}"
+            );
+        }
+        for name in [
+            "Host",
+            "host",
+            "Content-Length",
+            "TRANSFER-ENCODING",
+            "connection",
+        ] {
+            assert_eq!(
+                probe(http_header(name, "x")),
+                vec![(
+                    format!("{at}.headers.{name}"),
+                    "name is reserved: the runner sets it".to_string()
+                )],
+                "{name}"
+            );
+        }
+        assert_eq!(probe(http_header("X-Host", "x")), vec![]);
+    }
+
+    #[test]
+    fn resource_ceilings_are_realistic() {
+        assert_eq!(limits::MAX_CPU_MILLIS, 256_000);
+        assert_eq!(limits::MAX_MEMORY_BYTES, 4 << 40);
+    }
+
+    #[test]
+    fn a_replica_count_of_zero_alone_is_valid() {
+        let spec: WorkloadSpec = serde_json::from_value(json!({
+            "scale": {"replicas": {"count": 0}},
+            "containers": [{"name": "web", "image": "nginx"}],
+        }))
+        .unwrap();
+        assert_eq!(spec.scale, replicas(0, Strategy::Spread));
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_interval_of_one_second_says_what_the_default_timeout_is() {
+        let mut s = base();
+        s.containers[0].probe = Some(Probe {
+            interval_secs: 1,
+            ..Probe::new(ProbeAction::Tcp { port: 1 })
+        });
+        assert_eq!(
+            violations(&s),
+            vec![(
+                "containers[0].probe.timeout_secs".to_string(),
+                "must be less than interval_secs (the default timeout_secs is 1 s, so interval_secs must be at least 2)"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// One test per shape of an earlier version.
+    macro_rules! old_shape_refused {
+        ($($name:ident: $json:expr;)*) => {$(
+            #[test]
+            fn $name() {
+                let err = serde_json::from_value::<WorkloadSpec>($json).unwrap_err();
+                assert!(!err.to_string().is_empty());
+            }
+        )*};
+    }
+
+    old_shape_refused! {
+        refuses_replicas_as_a_number: json!({"scale": {"replicas": 3},
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_per_node: json!({"scale": "per_node",
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_placement_node: json!({"placement": {"node": "n1"},
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_host_path_volume: json!({"volumes": {"v": {"type": "host_path", "path": "/srv"}},
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_named_volume: json!({"volumes": {"v": {"type": "named", "name": "v"}},
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_ephemeral_volume: json!({"volumes": {"v": {"type": "ephemeral"}},
+            "containers": [{"name": "web", "image": "nginx"}]});
+        refuses_resource_limits: container_with(json!({"resources": {"limits": {"cpu_millis": 1}}}));
+        refuses_resource_requests: container_with(json!({"resources": {"requests": {}}}));
+        refuses_exec_probe: container_with(json!({"probe":
+            {"action": {"type": "exec", "command": ["true"]}}}));
+        refuses_liveness: container_with(json!({"liveness":
+            {"action": {"type": "tcp", "port": 1}}}));
+        refuses_readiness: container_with(json!({"readiness":
+            {"action": {"type": "tcp", "port": 1}}}));
+        refuses_startup: container_with(json!({"startup":
+            {"action": {"type": "tcp", "port": 1}}}));
     }
 }
