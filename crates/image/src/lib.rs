@@ -2,7 +2,7 @@
 //!
 //! Image references are passed to the runtime as given; no normalisation.
 
-use faber_cri::{AuthConfig, CriClient, CriError};
+use faber_cri::{AuthConfig, BoxFuture, CriClient, CriError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
@@ -12,14 +12,28 @@ pub enum ImageError {
         #[source]
         source: CriError,
     },
+    #[error("image {image}: {source}")]
+    Auth {
+        image: String,
+        #[source]
+        source: AuthError,
+    },
     #[error("image {0}: the runtime returned no image reference")]
     EmptyReference(String),
 }
 
+/// Credentials could not be obtained for a registry.
+#[derive(Debug, thiserror::Error)]
+#[error("registry auth: {0}")]
+pub struct AuthError(pub String);
+
 /// Supplies registry credentials for an image reference.
 pub trait RegistryAuth: Send + Sync {
     /// `None` means pull anonymously.
-    fn auth_for(&self, image: &str) -> Option<AuthConfig>;
+    fn auth_for<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>>;
 }
 
 /// No credentials, for public registries.
@@ -27,8 +41,11 @@ pub trait RegistryAuth: Send + Sync {
 pub struct Anonymous;
 
 impl RegistryAuth for Anonymous {
-    fn auth_for(&self, _image: &str) -> Option<AuthConfig> {
-        None
+    fn auth_for<'a>(
+        &'a self,
+        _image: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -62,11 +79,15 @@ impl<C: CriClient, A: RegistryAuth> ImagePuller<C, A> {
         if let Some(present) = self.cri.image_status(image).await.map_err(wrap)? {
             return Ok(present.id);
         }
-        let id = self
-            .cri
-            .pull_image(image, self.auth.auth_for(image))
+        let auth = self
+            .auth
+            .auth_for(image)
             .await
-            .map_err(wrap)?;
+            .map_err(|source| ImageError::Auth {
+                image: image.to_owned(),
+                source,
+            })?;
+        let id = self.cri.pull_image(image, auth).await.map_err(wrap)?;
         if id.is_empty() {
             return Err(ImageError::EmptyReference(image.to_owned()));
         }
@@ -82,13 +103,47 @@ mod tests {
     struct Fixed;
 
     impl RegistryAuth for Fixed {
-        fn auth_for(&self, image: &str) -> Option<AuthConfig> {
-            Some(AuthConfig {
-                username: "bot".to_owned(),
-                server_address: image.split('/').next().unwrap_or_default().to_owned(),
-                ..Default::default()
+        fn auth_for<'a>(
+            &'a self,
+            image: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+            Box::pin(async move {
+                Ok(Some(AuthConfig {
+                    username: "bot".to_owned(),
+                    server_address: image.split('/').next().unwrap_or_default().to_owned(),
+                    ..Default::default()
+                }))
             })
         }
+    }
+
+    struct Broken;
+
+    impl RegistryAuth for Broken {
+        fn auth_for<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AuthConfig>, AuthError>> {
+            Box::pin(async { Err(AuthError("vault sealed".to_owned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_failure_skips_the_pull() {
+        let cri = FakeCri::new();
+        let err = ImagePuller::with_auth(cri.clone(), Broken)
+            .ensure("reg.example/app:2")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ImageError::Auth { .. }));
+        assert_eq!(
+            err.to_string(),
+            "image reg.example/app:2: registry auth: vault sealed"
+        );
+        assert_eq!(
+            cri.calls(),
+            vec![Call::ImageStatus("reg.example/app:2".to_owned())]
+        );
     }
 
     #[tokio::test]
