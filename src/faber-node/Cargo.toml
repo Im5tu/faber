@@ -6,13 +6,29 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "faber_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "faber-node"
 path = "src/main.rs"
 
 [dependencies]
+faber-api-types = { workspace = true }
+faber-cri = { workspace = true }
+faber-image = { workspace = true }
+faber-network-management = { workspace = true }
 faber-node-protocol = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

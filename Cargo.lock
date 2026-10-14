@@ -759,8 +759,18 @@ name = "faber-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "faber-api-types",
+ "faber-cri",
+ "faber-image",
+ "faber-network-management",
  "faber-node-protocol",
  "nix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
