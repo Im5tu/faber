@@ -60,8 +60,7 @@ pub mod limits {
     pub const MAX_IMAGE_BYTES: usize = 512;
     /// Bytes in the name of one environment variable.
     pub const MAX_ENV_NAME_BYTES: usize = 256;
-    /// Entries of `command` and `args` of one container together, and of
-    /// the command of one exec probe.
+    /// Entries of `command` and `args` of one container together.
     pub const MAX_COMMAND_ENTRIES: usize = 256;
     /// Bytes in one entry of a command: 8 KiB.
     pub const MAX_COMMAND_ENTRY_BYTES: usize = 8 * 1024;
@@ -71,9 +70,22 @@ pub mod limits {
     pub const MAX_STOP_GRACE_SECS: u32 = 3600;
     /// Highest `cpu_millis`: 1000 cores.
     pub const MAX_CPU_MILLIS: u64 = 1_000_000;
-    /// Highest `memory_bytes` and `size_bytes`: `i64::MAX`. A container
-    /// runtime reads a larger number as "no limit".
+    /// Highest `memory_bytes`: `i64::MAX`. A container runtime reads a
+    /// larger number as "no limit".
     pub const MAX_MEMORY_BYTES: u64 = i64::MAX as u64;
+    /// Lowest `size_bytes` of a volume: 1 MiB.
+    pub const MIN_VOLUME_BYTES: u64 = 1024 * 1024;
+    /// Highest `size_bytes` of a block volume: 1 TiB.
+    pub const MAX_BLOCK_VOLUME_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+    /// Highest `size_bytes` of a ramdisk volume: 64 GiB.
+    pub const MAX_RAMDISK_VOLUME_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+    /// Nodes in `placement.nodes`.
+    pub const MAX_PLACEMENT_NODES: usize = 64;
+    /// Highest `interval_secs` of a probe: one hour.
+    pub const MAX_PROBE_INTERVAL_SECS: u32 = 3600;
+    /// Failed probes in a row that make the runner restart the container.
+    /// The first failure already takes the replica out of DNS.
+    pub const PROBE_FAILURES_BEFORE_RESTART: u32 = 3;
 }
 
 /// The capabilities a container may list in
@@ -298,19 +310,27 @@ fn check_label(at: &str, name: &str, out: &mut Vec<Violation>) {
 }
 
 fn check_spec(spec: &WorkloadSpec, out: &mut Vec<Violation>) {
-    match spec.scale {
-        Scale::Replicas(n) if n > limits::MAX_REPLICAS => out.push(Violation::new(
-            "scale.replicas",
+    if let Scale::Replicas { count, .. } = spec.scale
+        && count > limits::MAX_REPLICAS
+    {
+        out.push(Violation::new(
+            "scale.replicas.count",
             format!("must be at most {}", limits::MAX_REPLICAS),
-        )),
-        Scale::PerNode if spec.placement.node.is_some() => out.push(Violation::new(
-            "placement.node",
-            "cannot be set when scale is per_node",
-        )),
-        _ => {}
+        ));
     }
-    if let Some(node) = &spec.placement.node {
-        check_label("placement.node", node, out);
+    if spec.placement.nodes.len() > limits::MAX_PLACEMENT_NODES {
+        out.push(Violation::new(
+            "placement.nodes",
+            format!("must hold at most {} nodes", limits::MAX_PLACEMENT_NODES),
+        ));
+    }
+    let mut nodes = BTreeSet::new();
+    for (i, node) in spec.placement.nodes.iter().enumerate() {
+        let at = format!("placement.nodes[{i}]");
+        check_label(&at, node, out);
+        if !nodes.insert(node.as_str()) {
+            out.push(Violation::new(at, "duplicate node"));
+        }
     }
     if spec
         .stop_grace_secs
@@ -334,21 +354,25 @@ fn check_spec(spec: &WorkloadSpec, out: &mut Vec<Violation>) {
     for (name, source) in &spec.volumes {
         let at = format!("volumes.{}", segment(name));
         check_label(&at, name, out);
-        match source {
-            VolumeSource::HostPath { path, .. } => {
-                let at = format!("{at}.path");
-                check_absolute_path(&at, path, out);
-                if path == "/" {
-                    out.push(Violation::new(at, "must not be /"));
-                }
+        let (kind, size_bytes, most) = match source {
+            VolumeSource::Block { size_bytes } => {
+                ("block", *size_bytes, limits::MAX_BLOCK_VOLUME_BYTES)
             }
-            VolumeSource::Named { name, .. } => check_label(&format!("{at}.name"), name, out),
-            VolumeSource::Ephemeral { size_bytes, .. } => check_amount(
-                &format!("{at}.size_bytes"),
-                *size_bytes,
-                limits::MAX_MEMORY_BYTES,
-                out,
-            ),
+            VolumeSource::Ramdisk { size_bytes } => {
+                ("ramdisk", *size_bytes, limits::MAX_RAMDISK_VOLUME_BYTES)
+            }
+        };
+        let at = format!("{at}.size_bytes");
+        if size_bytes < limits::MIN_VOLUME_BYTES {
+            out.push(Violation::new(
+                at,
+                format!("must be at least {}", limits::MIN_VOLUME_BYTES),
+            ));
+        } else if size_bytes > most {
+            out.push(Violation::new(
+                at,
+                format!("must be at most {most} for a {kind} volume"),
+            ));
         }
     }
 
@@ -517,25 +541,19 @@ fn check_container(
         }
     }
 
-    let Resources {
-        limits: most,
-        requests,
-    } = &container.resources;
-    check_amounts(&format!("{at}.resources.limits"), most, out);
-    check_amounts(&format!("{at}.resources.requests"), requests, out);
-    for (field, limit, request) in [
-        ("cpu_millis", most.cpu_millis, requests.cpu_millis),
-        ("memory_bytes", most.memory_bytes, requests.memory_bytes),
-    ] {
-        if let (Some(limit), Some(request)) = (limit, request)
-            && request > limit
-        {
-            out.push(Violation::new(
-                format!("{at}.resources.requests.{field}"),
-                "must not exceed the limit",
-            ));
-        }
-    }
+    let at_resources = format!("{at}.resources");
+    check_amount(
+        &format!("{at_resources}.cpu_millis"),
+        container.resources.cpu_millis,
+        limits::MAX_CPU_MILLIS,
+        out,
+    );
+    check_amount(
+        &format!("{at_resources}.memory_bytes"),
+        container.resources.memory_bytes,
+        limits::MAX_MEMORY_BYTES,
+        out,
+    );
 
     let mut capabilities = BTreeSet::new();
     for (i, capability) in container.capabilities.iter().enumerate() {
@@ -565,14 +583,8 @@ fn check_container(
         }
     }
 
-    for (field, probe) in [
-        ("liveness", &container.liveness),
-        ("readiness", &container.readiness),
-        ("startup", &container.startup),
-    ] {
-        if let Some(probe) = probe {
-            check_probe(&format!("{at}.{field}"), probe, out);
-        }
+    if let Some(probe) = &container.probe {
+        check_probe(&format!("{at}.probe"), probe, out);
     }
 }
 
@@ -719,24 +731,11 @@ fn check_user(at: &str, user: &str, out: &mut Vec<Violation>) {
     }
 }
 
-fn check_amounts(at: &str, amounts: &ResourceAmounts, out: &mut Vec<Violation>) {
-    for (field, amount, most) in [
-        ("cpu_millis", amounts.cpu_millis, limits::MAX_CPU_MILLIS),
-        (
-            "memory_bytes",
-            amounts.memory_bytes,
-            limits::MAX_MEMORY_BYTES,
-        ),
-    ] {
-        check_amount(&format!("{at}.{field}"), amount, most, out);
-    }
-}
-
-/// An amount that is set is from 1 to `most`.
-fn check_amount(at: &str, amount: Option<u64>, most: u64, out: &mut Vec<Violation>) {
+/// An amount is from 1 to `most`.
+fn check_amount(at: &str, amount: u64, most: u64, out: &mut Vec<Violation>) {
     match amount {
-        Some(0) => out.push(Violation::new(at, "must be greater than 0")),
-        Some(n) if n > most => out.push(Violation::new(at, format!("must be at most {most}"))),
+        0 => out.push(Violation::new(at, "must be greater than 0")),
+        n if n > most => out.push(Violation::new(at, format!("must be at most {most}"))),
         _ => {}
     }
 }
@@ -745,33 +744,31 @@ fn check_amount(at: &str, amount: Option<u64>, most: u64, out: &mut Vec<Violatio
 const MAX_PROBE_HOST_BYTES: usize = 253;
 
 fn check_probe(at: &str, probe: &Probe, out: &mut Vec<Violation>) {
-    for (field, value) in [
-        ("period_secs", probe.period_secs),
-        ("timeout_secs", probe.timeout_secs),
-        ("success_threshold", probe.success_threshold),
-        ("failure_threshold", probe.failure_threshold),
-    ] {
-        if value == 0 {
-            out.push(Violation::new(
-                format!("{at}.{field}"),
-                "must be at least 1",
-            ));
-        }
+    if probe.interval_secs == 0 {
+        out.push(Violation::new(
+            format!("{at}.interval_secs"),
+            "must be at least 1",
+        ));
+    }
+    if probe.interval_secs > limits::MAX_PROBE_INTERVAL_SECS {
+        out.push(Violation::new(
+            format!("{at}.interval_secs"),
+            format!("must be at most {}", limits::MAX_PROBE_INTERVAL_SECS),
+        ));
+    }
+    if probe.timeout_secs == 0 {
+        out.push(Violation::new(
+            format!("{at}.timeout_secs"),
+            "must be at least 1",
+        ));
+    } else if probe.timeout_secs >= probe.interval_secs {
+        out.push(Violation::new(
+            format!("{at}.timeout_secs"),
+            "must be less than interval_secs",
+        ));
     }
     let at = format!("{at}.action");
     match &probe.action {
-        ProbeAction::Exec { command } => {
-            if command.is_empty() {
-                out.push(Violation::new(format!("{at}.command"), "must not be empty"));
-            }
-            if command.len() > limits::MAX_COMMAND_ENTRIES {
-                out.push(Violation::new(
-                    format!("{at}.command"),
-                    format!("must hold at most {} entries", limits::MAX_COMMAND_ENTRIES),
-                ));
-            }
-            check_command_entries(&format!("{at}.command"), command, out);
-        }
         ProbeAction::Http {
             port,
             path,
@@ -849,21 +846,41 @@ fn is_http_token(name: &str) -> bool {
         })
 }
 
-/// How many pods a workload runs.
+/// How many pods a workload runs, and where.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Scale {
-    /// This many pods: `{"replicas": 3}`. 0 to 1024.
-    Replicas(u32),
-    /// One pod on every node: `"per_node"`.
-    PerNode,
+    /// This many pods: `{"replicas": {"count": 3, "strategy": "spread"}}`.
+    /// `count` is 0 to 1024.
+    Replicas {
+        count: u32,
+        #[serde(default)]
+        strategy: Strategy,
+    },
+    /// One pod on every node: `"daemon"`. With `placement.nodes`, one pod on
+    /// each listed node.
+    Daemon,
 }
 
 impl Default for Scale {
-    /// One replica.
+    /// One replica, spread.
     fn default() -> Self {
-        Scale::Replicas(1)
+        Scale::Replicas {
+            count: 1,
+            strategy: Strategy::Spread,
+        }
     }
+}
+
+/// How the replicas of a workload are laid out over the nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    /// As few replicas per node as capacity allows.
+    #[default]
+    Spread,
+    /// As many replicas per node as capacity allows.
+    Pack,
 }
 
 /// When the runner restarts a container that has exited.
@@ -892,40 +909,22 @@ pub enum Exposure {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
-    /// The name of the one node that runs the workload. Any node when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
+    /// Names of the nodes that may run the workload: unique DNS labels, at
+    /// most 64. Any node when empty. With [`Scale::Daemon`] the workload runs
+    /// once on each listed node.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
-/// Where the data of a volume lives.
+/// A volume of the pod. Both kinds have a fixed size from 1 MiB.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VolumeSource {
-    /// A directory of the node. The runner refuses a path outside the
-    /// node's allow-list (`FABER_HOST_PATH_ALLOW`).
-    HostPath {
-        /// Absolute path on the node.
-        path: String,
-        /// Create the directory when it is missing.
-        #[serde(default)]
-        create: bool,
-    },
-    /// A volume the node keeps under a name. It is local to the node, and
-    /// its identity is (project, environment, name).
-    Named {
-        name: String,
-        /// Every replica gets its own volume instead of sharing one.
-        #[serde(default)]
-        per_replica: bool,
-    },
-    /// Scratch space that lives as long as the pod.
-    Ephemeral {
-        /// Keep it in memory (tmpfs) instead of on disk.
-        #[serde(default)]
-        memory: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        size_bytes: Option<u64>,
-    },
+    /// A fixed-size filesystem image on the node, up to 1 TiB. It is local to
+    /// the node and outlives the pod.
+    Block { size_bytes: u64 },
+    /// Memory (tmpfs), up to 64 GiB. It is gone when the pod stops.
+    Ramdisk { size_bytes: u64 },
 }
 
 /// One container of a workload.
@@ -968,15 +967,11 @@ pub struct ContainerSpec {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub read_only_root_fs: bool,
-    /// Failing restarts the container.
+    /// One failure takes the replica out of DNS;
+    /// [`limits::PROBE_FAILURES_BEFORE_RESTART`] in a row restart the
+    /// container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub liveness: Option<Probe>,
-    /// Failing takes the pod out of DNS. It never restarts the container.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readiness: Option<Probe>,
-    /// Holds the other two probes back until it has passed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub startup: Option<Probe>,
+    pub probe: Option<Probe>,
 }
 
 impl ContainerSpec {
@@ -996,9 +991,7 @@ impl ContainerSpec {
             resources: Resources::default(),
             capabilities: Vec::new(),
             read_only_root_fs: false,
-            liveness: None,
-            readiness: None,
-            startup: None,
+            probe: None,
         }
     }
 }
@@ -1020,9 +1013,7 @@ impl fmt::Debug for ContainerSpec {
             .field("resources", &self.resources)
             .field("capabilities", &self.capabilities)
             .field("read_only_root_fs", &self.read_only_root_fs)
-            .field("liveness", &self.liveness)
-            .field("readiness", &self.readiness)
-            .field("startup", &self.startup)
+            .field("probe", &self.probe)
             .finish()
     }
 }
@@ -1062,48 +1053,50 @@ pub struct MountSpec {
     pub sub_path: Option<String>,
 }
 
-/// What a container may use (`limits`) and what it is guaranteed
-/// (`requests`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The most a container may use. They are maximums: the kernel limit of the
+/// container, and what placement reserves on the node for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
-    #[serde(default)]
-    pub limits: ResourceAmounts,
-    #[serde(default)]
-    pub requests: ResourceAmounts,
+    /// Thousandths of a CPU: 500 is half a core. Default 1000.
+    #[serde(default = "default_cpu_millis")]
+    pub cpu_millis: u64,
+    /// Default 1 GiB.
+    #[serde(default = "default_memory_bytes")]
+    pub memory_bytes: u64,
 }
 
-/// CPU and memory amounts. An absent amount is not set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceAmounts {
-    /// Thousandths of a CPU: 500 is half a core.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_millis: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_bytes: Option<u64>,
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            cpu_millis: default_cpu_millis(),
+            memory_bytes: default_memory_bytes(),
+        }
+    }
 }
 
-/// A check the runner makes against a container, and how often.
+fn default_cpu_millis() -> u64 {
+    1000
+}
+
+fn default_memory_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+/// A check against a container. One failure takes the replica out of DNS;
+/// [`limits::PROBE_FAILURES_BEFORE_RESTART`] in a row restart the container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probe {
     pub action: ProbeAction,
-    /// Seconds after the container starts before the first check. Default 0.
-    #[serde(default)]
-    pub initial_delay_secs: u32,
-    /// Seconds between checks. Default 10.
-    #[serde(default = "default_period_secs")]
-    pub period_secs: u32,
-    /// Seconds after which a check counts as failed. Default 1.
+    /// Seconds between checks, 1 to 3600. Also the delay before the first
+    /// check. Default 5.
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u32,
+    /// Seconds after which a check counts as failed: at least 1 and less than
+    /// `interval_secs`. Default 1.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u32,
-    /// Passes in a row that make the probe pass. Default 1.
-    #[serde(default = "default_success_threshold")]
-    pub success_threshold: u32,
-    /// Failures in a row that make the probe fail. Default 3.
-    #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: u32,
 }
 
 impl Probe {
@@ -1111,29 +1104,18 @@ impl Probe {
     pub fn new(action: ProbeAction) -> Self {
         Self {
             action,
-            initial_delay_secs: 0,
-            period_secs: default_period_secs(),
+            interval_secs: default_interval_secs(),
             timeout_secs: default_timeout_secs(),
-            success_threshold: default_success_threshold(),
-            failure_threshold: default_failure_threshold(),
         }
     }
 }
 
-fn default_period_secs() -> u32 {
-    10
+fn default_interval_secs() -> u32 {
+    5
 }
 
 fn default_timeout_secs() -> u32 {
     1
-}
-
-fn default_success_threshold() -> u32 {
-    1
-}
-
-fn default_failure_threshold() -> u32 {
-    3
 }
 
 /// What a [`Probe`] does.
@@ -1143,8 +1125,6 @@ fn default_failure_threshold() -> u32 {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProbeAction {
-    /// Runs a command in the container. Exit code 0 passes.
-    Exec { command: Vec<String> },
     /// Sends a GET to the pod. A status from 200 to 399 passes.
     Http {
         port: u16,
@@ -1165,9 +1145,6 @@ pub enum ProbeAction {
 impl fmt::Debug for ProbeAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProbeAction::Exec { command } => {
-                f.debug_struct("Exec").field("command", command).finish()
-            }
             ProbeAction::Http {
                 port,
                 path,
@@ -1361,17 +1338,24 @@ mod tests {
         let spec: WorkloadSpec =
             serde_json::from_value(json!({"containers": [{"name": "web", "image": "nginx"}]}))
                 .unwrap();
-        assert_eq!(spec.scale, Scale::Replicas(1));
+        assert_eq!(spec.scale, Scale::default());
+        assert_eq!(
+            spec.scale,
+            Scale::Replicas {
+                count: 1,
+                strategy: Strategy::Spread
+            }
+        );
         assert_eq!(spec.restart, RestartPolicy::Always);
         assert_eq!(spec.expose, Exposure::Environment);
         assert_eq!(spec.containers, vec![ContainerSpec::new("web", "nginx")]);
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
             json!({
-                "scale": {"replicas": 1},
+                "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                 "restart": "always",
                 "expose": "environment",
-                "placement": {},
+                "placement": {"nodes": []},
                 "volumes": {},
                 "containers": [{
                     "name": "web",
@@ -1381,7 +1365,7 @@ mod tests {
                     "env": {},
                     "ports": [],
                     "mounts": [],
-                    "resources": {"limits": {}, "requests": {}},
+                    "resources": {"cpu_millis": 1000, "memory_bytes": 1_073_741_824},
                     "capabilities": [],
                     "read_only_root_fs": false,
                 }],
@@ -1409,20 +1393,14 @@ mod tests {
             sub_path: Some("web".into()),
         }];
         web.resources = Resources {
-            limits: ResourceAmounts {
-                cpu_millis: Some(500),
-                memory_bytes: Some(268_435_456),
-            },
-            requests: ResourceAmounts {
-                cpu_millis: Some(100),
-                memory_bytes: None,
-            },
+            cpu_millis: 500,
+            memory_bytes: 268_435_456,
         };
         web.capabilities = vec!["NET_BIND_SERVICE".into()];
         web.read_only_root_fs = true;
-        web.liveness = Some(Probe::new(ProbeAction::Tcp { port: 8080 }));
-        web.readiness = Some(Probe {
-            initial_delay_secs: 5,
+        web.probe = Some(Probe {
+            interval_secs: 10,
+            timeout_secs: 2,
             ..Probe::new(ProbeAction::Http {
                 port: 8080,
                 path: "/ready".into(),
@@ -1431,52 +1409,42 @@ mod tests {
                 headers: BTreeMap::from([("x-probe".to_string(), "1".to_string())]),
             })
         });
-        web.startup = Some(Probe::new(ProbeAction::Exec {
-            command: vec!["true".into()],
-        }));
         let spec = WorkloadSpec {
-            scale: Scale::PerNode,
+            scale: Scale::Replicas {
+                count: 3,
+                strategy: Strategy::Pack,
+            },
             restart: RestartPolicy::OnFailure,
             expose: Exposure::Cluster,
             placement: Placement {
-                node: Some("node-1".into()),
+                nodes: vec!["node-1".into(), "node-2".into()],
             },
             stop_grace_secs: Some(30),
             volumes: BTreeMap::from([
                 (
                     "data".to_string(),
-                    VolumeSource::Named {
-                        name: "data".into(),
-                        per_replica: true,
-                    },
-                ),
-                (
-                    "host".to_string(),
-                    VolumeSource::HostPath {
-                        path: "/srv/host".into(),
-                        create: false,
+                    VolumeSource::Block {
+                        size_bytes: 1_073_741_824,
                     },
                 ),
                 (
                     "tmp".to_string(),
-                    VolumeSource::Ephemeral {
-                        memory: true,
-                        size_bytes: Some(1024),
+                    VolumeSource::Ramdisk {
+                        size_bytes: 1_048_576,
                     },
                 ),
             ]),
             containers: vec![web],
         };
         let want = json!({
-            "scale": "per_node",
+            "scale": {"replicas": {"count": 3, "strategy": "pack"}},
             "restart": "on_failure",
             "expose": "cluster",
-            "placement": {"node": "node-1"},
+            "placement": {"nodes": ["node-1", "node-2"]},
             "stop_grace_secs": 30,
             "volumes": {
-                "data": {"type": "named", "name": "data", "per_replica": true},
-                "host": {"type": "host_path", "path": "/srv/host", "create": false},
-                "tmp": {"type": "ephemeral", "memory": true, "size_bytes": 1024},
+                "data": {"type": "block", "size_bytes": 1_073_741_824},
+                "tmp": {"type": "ramdisk", "size_bytes": 1_048_576},
             },
             "containers": [{
                 "name": "web",
@@ -1490,29 +1458,17 @@ mod tests {
                 "mounts": [{
                     "volume": "data", "path": "/data", "read_only": true, "sub_path": "web",
                 }],
-                "resources": {
-                    "limits": {"cpu_millis": 500, "memory_bytes": 268_435_456},
-                    "requests": {"cpu_millis": 100},
-                },
+                "resources": {"cpu_millis": 500, "memory_bytes": 268_435_456},
                 "capabilities": ["NET_BIND_SERVICE"],
                 "read_only_root_fs": true,
-                "liveness": {
-                    "action": {"type": "tcp", "port": 8080},
-                    "initial_delay_secs": 0, "period_secs": 10, "timeout_secs": 1,
-                    "success_threshold": 1, "failure_threshold": 3,
-                },
-                "readiness": {
+                "capabilities": ["NET_BIND_SERVICE"],
+                "read_only_root_fs": true,
+                "probe": {
                     "action": {
                         "type": "http", "port": 8080, "path": "/ready", "scheme": "https",
                         "host": "web.local", "headers": {"x-probe": "1"},
                     },
-                    "initial_delay_secs": 5, "period_secs": 10, "timeout_secs": 1,
-                    "success_threshold": 1, "failure_threshold": 3,
-                },
-                "startup": {
-                    "action": {"type": "exec", "command": ["true"]},
-                    "initial_delay_secs": 0, "period_secs": 10, "timeout_secs": 1,
-                    "success_threshold": 1, "failure_threshold": 3,
+                    "interval_secs": 10, "timeout_secs": 2,
                 },
             }],
         });
@@ -1521,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_and_volume_defaults_apply_when_absent() {
+    fn defaults_apply_when_absent() {
         let probe: Probe =
             serde_json::from_value(json!({"action": {"type": "http", "port": 80}})).unwrap();
         assert_eq!(
@@ -1534,12 +1490,38 @@ mod tests {
                 headers: BTreeMap::new(),
             })
         );
+        assert_eq!((probe.interval_secs, probe.timeout_secs), (5, 1));
         assert_eq!(
-            serde_json::from_value::<VolumeSource>(json!({"type": "ephemeral"})).unwrap(),
-            VolumeSource::Ephemeral {
-                memory: false,
-                size_bytes: None,
+            serde_json::to_value(&probe).unwrap(),
+            json!({
+                "action": {"type": "http", "port": 80, "path": "/", "scheme": "http",
+                           "headers": {}},
+                "interval_secs": 5, "timeout_secs": 1,
+            })
+        );
+        let resources = Resources {
+            cpu_millis: 1000,
+            memory_bytes: 1 << 30,
+        };
+        assert_eq!(
+            serde_json::from_value::<Resources>(json!({})).unwrap(),
+            resources
+        );
+        assert_eq!(Resources::default(), resources);
+        assert_eq!(
+            serde_json::from_value::<Scale>(json!({"replicas": {"count": 2}})).unwrap(),
+            Scale::Replicas {
+                count: 2,
+                strategy: Strategy::Spread,
             }
+        );
+        assert_eq!(
+            serde_json::from_value::<Scale>(json!("daemon")).unwrap(),
+            Scale::Daemon
+        );
+        assert_eq!(
+            serde_json::from_value::<Placement>(json!({})).unwrap(),
+            Placement { nodes: vec![] }
         );
         assert_eq!(
             serde_json::from_value::<PortSpec>(json!({"port": 53})).unwrap(),
@@ -1552,6 +1534,39 @@ mod tests {
     }
 
     #[test]
+    fn scale_and_volume_shapes_are_pinned() {
+        assert_eq!(
+            serde_json::to_value(Scale::Daemon).unwrap(),
+            json!("daemon")
+        );
+        assert_eq!(
+            serde_json::to_value(Scale::Replicas {
+                count: 0,
+                strategy: Strategy::Pack
+            })
+            .unwrap(),
+            json!({"replicas": {"count": 0, "strategy": "pack"}})
+        );
+        assert_eq!(
+            serde_json::to_value(VolumeSource::Block { size_bytes: 7 }).unwrap(),
+            json!({"type": "block", "size_bytes": 7})
+        );
+        assert_eq!(
+            serde_json::to_value(VolumeSource::Ramdisk { size_bytes: 7 }).unwrap(),
+            json!({"type": "ramdisk", "size_bytes": 7})
+        );
+    }
+
+    /// A spec with one container `web`, whose JSON gets `extra` merged in.
+    fn container_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut c = json!({"name": "web", "image": "nginx"});
+        c.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({ "containers": [c] })
+    }
+
+    #[test]
     fn unknown_fields_are_refused_at_every_level() {
         let container = json!({"name": "web", "image": "nginx"});
         for bad in [
@@ -1559,19 +1574,91 @@ mod tests {
             json!({"containers": [{"name": "web", "image": "nginx", "privileged": true}]}),
             json!({"containers": [container.clone()], "placement": {"zone": "a"}}),
             json!({"containers": [container.clone()],
-                   "volumes": {"v": {"type": "ephemeral", "medium": "Memory"}}}),
+                   "volumes": {"v": {"type": "ramdisk", "size_bytes": 1048576, "medium": "x"}}}),
             json!({"containers": [container.clone()],
                    "volumes": {"v": {"type": "nfs", "server": "x"}}}),
-            json!({"containers": [{"name": "web", "image": "nginx",
-                   "liveness": {"action": {"type": "tcp", "port": 1}, "grpc": 1}}]}),
-            json!({"containers": [{"name": "web", "image": "nginx",
-                   "liveness": {"action": {"type": "tcp", "port": 1, "host": "x"}}}]}),
-            json!({"containers": [{"name": "web", "image": "nginx",
-                   "resources": {"limits": {"gpu": 1}}}]}),
+            container_with(json!({"probe": {"action": {"type": "tcp", "port": 1}, "grpc": 1}})),
+            container_with(json!({"probe": {"action": {"type": "tcp", "port": 1, "host": "x"}}})),
+            container_with(json!({"resources": {"gpu": 1}})),
+            json!({"containers": [container.clone()],
+                   "scale": {"replicas": {"count": 1, "zone": "a"}}}),
         ] {
             assert!(
                 serde_json::from_value::<WorkloadSpec>(bad.clone()).is_err(),
                 "{bad}"
+            );
+        }
+    }
+
+    /// Shapes of earlier versions are refused, not migrated.
+    #[test]
+    fn old_shapes_are_refused() {
+        let web = json!([{"name": "web", "image": "nginx"}]);
+        let tcp = json!({"action": {"type": "tcp", "port": 1}});
+        for (case, old) in [
+            (
+                "replicas as a number",
+                json!({"scale": {"replicas": 3}, "containers": web}),
+            ),
+            ("per_node", json!({"scale": "per_node", "containers": web})),
+            (
+                "placement.node",
+                json!({"placement": {"node": "n1"}, "containers": web}),
+            ),
+            (
+                "host_path",
+                json!({"volumes": {"v": {"type": "host_path", "path": "/srv"}}, "containers": web}),
+            ),
+            (
+                "named",
+                json!({"volumes": {"v": {"type": "named", "name": "v"}}, "containers": web}),
+            ),
+            (
+                "ephemeral",
+                json!({"volumes": {"v": {"type": "ephemeral"}}, "containers": web}),
+            ),
+            (
+                "block without a size",
+                json!({"volumes": {"v": {"type": "block"}}, "containers": web}),
+            ),
+            ("liveness", container_with(json!({"liveness": tcp.clone()}))),
+            (
+                "readiness",
+                container_with(json!({"readiness": tcp.clone()})),
+            ),
+            ("startup", container_with(json!({"startup": tcp.clone()}))),
+            (
+                "exec probe",
+                container_with(json!({"probe":
+                    {"action": {"type": "exec", "command": ["true"]}}})),
+            ),
+            (
+                "period_secs",
+                container_with(json!({"probe":
+                    {"action": {"type": "tcp", "port": 1}, "period_secs": 5}})),
+            ),
+            (
+                "failure_threshold",
+                container_with(json!({"probe":
+                    {"action": {"type": "tcp", "port": 1}, "failure_threshold": 3}})),
+            ),
+            (
+                "initial_delay_secs",
+                container_with(json!({"probe":
+                    {"action": {"type": "tcp", "port": 1}, "initial_delay_secs": 3}})),
+            ),
+            (
+                "limits",
+                container_with(json!({"resources": {"limits": {"cpu_millis": 1}}})),
+            ),
+            (
+                "requests",
+                container_with(json!({"resources": {"requests": {}}})),
+            ),
+        ] {
+            assert!(
+                serde_json::from_value::<WorkloadSpec>(old.clone()).is_err(),
+                "{case}: {old}"
             );
         }
     }
@@ -1630,6 +1717,12 @@ mod tests {
         assert_eq!(limits::MAX_STOP_GRACE_SECS, 3_600);
         assert_eq!(limits::MAX_CPU_MILLIS, 1_000_000);
         assert_eq!(limits::MAX_MEMORY_BYTES, 9_223_372_036_854_775_807);
+        assert_eq!(limits::MIN_VOLUME_BYTES, 1_048_576);
+        assert_eq!(limits::MAX_BLOCK_VOLUME_BYTES, 1 << 40);
+        assert_eq!(limits::MAX_RAMDISK_VOLUME_BYTES, 64 << 30);
+        assert_eq!(limits::MAX_PLACEMENT_NODES, 64);
+        assert_eq!(limits::MAX_PROBE_INTERVAL_SECS, 3_600);
+        assert_eq!(limits::PROBE_FAILURES_BEFORE_RESTART, 3);
     }
 
     const LABEL_LENGTH: &str = "name must be between 1 and 63 characters";
@@ -1650,18 +1743,14 @@ mod tests {
         }
     }
 
-    fn ephemeral() -> VolumeSource {
-        VolumeSource::Ephemeral {
-            memory: false,
-            size_bytes: None,
+    fn ramdisk() -> VolumeSource {
+        VolumeSource::Ramdisk {
+            size_bytes: limits::MIN_VOLUME_BYTES,
         }
     }
 
-    fn host_path(path: &str) -> VolumeSource {
-        VolumeSource::HostPath {
-            path: path.to_string(),
-            create: false,
-        }
+    fn block(size_bytes: u64) -> VolumeSource {
+        VolumeSource::Block { size_bytes }
     }
 
     fn mount(volume: &str, path: &str) -> MountSpec {
@@ -1711,6 +1800,10 @@ mod tests {
         }
     }
 
+    fn replicas(count: u32, strategy: Strategy) -> Scale {
+        Scale::Replicas { count, strategy }
+    }
+
     fn violations(spec: &WorkloadSpec) -> Vec<(String, String)> {
         match spec.validate() {
             Ok(()) => Vec::new(),
@@ -1746,13 +1839,12 @@ mod tests {
     fn the_base_spec_and_the_full_spec_are_valid() {
         assert_eq!(base().validate(), Ok(()));
         let full: WorkloadSpec = serde_json::from_value(json!({
-            "scale": {"replicas": 3},
-            "placement": {"node": "node-1"},
+            "scale": {"replicas": {"count": 3, "strategy": "pack"}},
+            "placement": {"nodes": ["node-1", "node-2"]},
             "stop_grace_secs": 30,
             "volumes": {
-                "data": {"type": "named", "name": "data"},
-                "host": {"type": "host_path", "path": "/srv/host"},
-                "tmp": {"type": "ephemeral", "memory": true, "size_bytes": 1024},
+                "data": {"type": "block", "size_bytes": 1048576},
+                "tmp": {"type": "ramdisk", "size_bytes": 1048576},
             },
             "containers": [{
                 "name": "web",
@@ -1765,20 +1857,14 @@ mod tests {
                 "ports": [{"name": "http", "port": 8080}, {"port": 8080, "protocol": "udp"}],
                 "mounts": [
                     {"volume": "data", "path": "/data", "sub_path": "web/a"},
-                    {"volume": "tmp", "path": "/tmp"},
-                    {"volume": "host", "path": "/host", "read_only": true},
+                    {"volume": "tmp", "path": "/tmp", "read_only": true},
                 ],
-                "resources": {
-                    "limits": {"cpu_millis": 500, "memory_bytes": 1024},
-                    "requests": {"cpu_millis": 500},
-                },
+                "resources": {"cpu_millis": 500, "memory_bytes": 1024},
                 "capabilities": ["NET_BIND_SERVICE", "CHOWN"],
-                "liveness": {"action": {"type": "tcp", "port": 8080}},
-                "readiness": {"action": {
+                "probe": {"action": {
                     "type": "http", "port": 8080, "path": "/ready?x=1",
                     "host": "web.local", "headers": {"X-Probe": "a b"},
-                }},
-                "startup": {"action": {"type": "exec", "command": ["true"]}},
+                }, "interval_secs": 3, "timeout_secs": 2},
             }, {
                 "name": "sidecar",
                 "image": "envoy",
@@ -1791,40 +1877,69 @@ mod tests {
     #[test]
     fn workload_level_rules() {
         check_rows(&[
-            ("zero replicas", |s| s.scale = Scale::Replicas(0), &[]),
             (
-                "most replicas",
-                |s| s.scale = Scale::Replicas(limits::MAX_REPLICAS),
+                "zero replicas",
+                |s| s.scale = replicas(0, Strategy::Spread),
+                &[],
+            ),
+            (
+                "most replicas, packed",
+                |s| s.scale = replicas(limits::MAX_REPLICAS, Strategy::Pack),
                 &[],
             ),
             (
                 "too many replicas",
-                |s| s.scale = Scale::Replicas(limits::MAX_REPLICAS + 1),
-                &[("scale.replicas", "must be at most 1024")],
+                |s| s.scale = replicas(limits::MAX_REPLICAS + 1, Strategy::Spread),
+                &[("scale.replicas.count", "must be at most 1024")],
             ),
-            ("per node", |s| s.scale = Scale::PerNode, &[]),
+            ("daemon", |s| s.scale = Scale::Daemon, &[]),
             (
-                "per node with a node pin",
+                "daemon on listed nodes",
                 |s| {
-                    s.scale = Scale::PerNode;
-                    s.placement.node = Some("node-1".into());
+                    s.scale = Scale::Daemon;
+                    s.placement.nodes = vec!["node-1".into(), "node-2".into()];
                 },
-                &[("placement.node", "cannot be set when scale is per_node")],
-            ),
-            (
-                "node pin",
-                |s| s.placement.node = Some("node-1".into()),
                 &[],
             ),
             (
-                "node pin that is no label",
-                |s| s.placement.node = Some("Node_1".into()),
-                &[("placement.node", LABEL_CHARS)],
+                "replicas on listed nodes",
+                |s| s.placement.nodes = vec!["node-1".into()],
+                &[],
             ),
             (
-                "empty node pin",
-                |s| s.placement.node = Some(String::new()),
-                &[("placement.node", LABEL_LENGTH)],
+                "node that is no label",
+                |s| s.placement.nodes = vec!["node-1".into(), "Node_1".into()],
+                &[("placement.nodes[1]", LABEL_CHARS)],
+            ),
+            (
+                "empty node name",
+                |s| s.placement.nodes = vec![String::new()],
+                &[("placement.nodes[0]", LABEL_LENGTH)],
+            ),
+            (
+                "node listed twice",
+                |s| {
+                    s.placement.nodes = vec!["a".into(), "b".into(), "a".into()];
+                },
+                &[("placement.nodes[2]", "duplicate node")],
+            ),
+            (
+                "most nodes",
+                |s| {
+                    s.placement.nodes = (0..limits::MAX_PLACEMENT_NODES)
+                        .map(|i| format!("n{i}"))
+                        .collect();
+                },
+                &[],
+            ),
+            (
+                "too many nodes",
+                |s| {
+                    s.placement.nodes = (0..=limits::MAX_PLACEMENT_NODES)
+                        .map(|i| format!("n{i}"))
+                        .collect();
+                },
+                &[("placement.nodes", "must hold at most 64 nodes")],
             ),
             (
                 "longest stop grace",
@@ -1893,12 +2008,13 @@ mod tests {
 
     #[test]
     fn volume_rules() {
+        const MIN: u64 = limits::MIN_VOLUME_BYTES;
         check_rows(&[
             (
                 "most volumes",
                 |s| {
                     s.volumes = (0..limits::MAX_VOLUMES_PER_WORKLOAD)
-                        .map(|i| (format!("v{i}"), ephemeral()))
+                        .map(|i| (format!("v{i}"), ramdisk()))
                         .collect();
                 },
                 &[],
@@ -1907,7 +2023,7 @@ mod tests {
                 "too many volumes",
                 |s| {
                     s.volumes = (0..=limits::MAX_VOLUMES_PER_WORKLOAD)
-                        .map(|i| (format!("v{i}"), ephemeral()))
+                        .map(|i| (format!("v{i}"), ramdisk()))
                         .collect();
                 },
                 &[("volumes", "must hold at most 32 volumes")],
@@ -1915,206 +2031,111 @@ mod tests {
             (
                 "volume name that is no label",
                 |s| {
-                    s.volumes.insert("My.Data".into(), ephemeral());
+                    s.volumes.insert("My.Data".into(), ramdisk());
                 },
                 &[("volumes.My.Data", LABEL_CHARS)],
             ),
             (
                 "empty volume name",
                 |s| {
-                    s.volumes.insert(String::new(), ephemeral());
+                    s.volumes.insert(String::new(), ramdisk());
                 },
                 &[("volumes.", LABEL_LENGTH)],
             ),
             (
-                "named volume",
+                "smallest block volume",
+                |s| {
+                    s.volumes.insert("data".into(), block(MIN));
+                },
+                &[],
+            ),
+            (
+                "largest block volume",
+                |s| {
+                    s.volumes
+                        .insert("data".into(), block(limits::MAX_BLOCK_VOLUME_BYTES));
+                },
+                &[],
+            ),
+            (
+                "block volume below 1 MiB",
+                |s| {
+                    s.volumes.insert("data".into(), block(MIN - 1));
+                },
+                &[("volumes.data.size_bytes", "must be at least 1048576")],
+            ),
+            (
+                "block volume of size zero",
+                |s| {
+                    s.volumes.insert("data".into(), block(0));
+                },
+                &[("volumes.data.size_bytes", "must be at least 1048576")],
+            ),
+            (
+                "block volume above 1 TiB",
+                |s| {
+                    s.volumes
+                        .insert("data".into(), block(limits::MAX_BLOCK_VOLUME_BYTES + 1));
+                },
+                &[(
+                    "volumes.data.size_bytes",
+                    "must be at most 1099511627776 for a block volume",
+                )],
+            ),
+            (
+                "smallest ramdisk volume",
+                |s| {
+                    s.volumes
+                        .insert("tmp".into(), VolumeSource::Ramdisk { size_bytes: MIN });
+                },
+                &[],
+            ),
+            (
+                "largest ramdisk volume",
                 |s| {
                     s.volumes.insert(
-                        "data".into(),
-                        VolumeSource::Named {
-                            name: "pg-data".into(),
-                            per_replica: true,
+                        "tmp".into(),
+                        VolumeSource::Ramdisk {
+                            size_bytes: limits::MAX_RAMDISK_VOLUME_BYTES,
                         },
                     );
                 },
                 &[],
             ),
             (
-                "named volume whose name is no label",
-                |s| {
-                    s.volumes.insert(
-                        "data".into(),
-                        VolumeSource::Named {
-                            name: "pg_data".into(),
-                            per_replica: false,
-                        },
-                    );
-                },
-                &[("volumes.data.name", LABEL_CHARS)],
-            ),
-            (
-                "ephemeral volume with a size",
+                "ramdisk volume below 1 MiB",
                 |s| {
                     s.volumes.insert(
                         "tmp".into(),
-                        VolumeSource::Ephemeral {
-                            memory: true,
-                            size_bytes: Some(1),
+                        VolumeSource::Ramdisk {
+                            size_bytes: MIN - 1,
                         },
                     );
                 },
-                &[],
+                &[("volumes.tmp.size_bytes", "must be at least 1048576")],
             ),
             (
-                "largest ephemeral volume",
+                "ramdisk volume above 64 GiB",
                 |s| {
                     s.volumes.insert(
                         "tmp".into(),
-                        VolumeSource::Ephemeral {
-                            memory: false,
-                            size_bytes: Some(limits::MAX_MEMORY_BYTES),
-                        },
-                    );
-                },
-                &[],
-            ),
-            (
-                "ephemeral volume too large",
-                |s| {
-                    s.volumes.insert(
-                        "tmp".into(),
-                        VolumeSource::Ephemeral {
-                            memory: false,
-                            size_bytes: Some(limits::MAX_MEMORY_BYTES + 1),
+                        VolumeSource::Ramdisk {
+                            size_bytes: limits::MAX_RAMDISK_VOLUME_BYTES + 1,
                         },
                     );
                 },
                 &[(
                     "volumes.tmp.size_bytes",
-                    "must be at most 9223372036854775807",
+                    "must be at most 68719476736 for a ramdisk volume",
                 )],
             ),
             (
-                "ephemeral volume of size zero",
-                |s| {
-                    s.volumes.insert(
-                        "tmp".into(),
-                        VolumeSource::Ephemeral {
-                            memory: true,
-                            size_bytes: Some(0),
-                        },
-                    );
-                },
-                &[("volumes.tmp.size_bytes", "must be greater than 0")],
-            ),
-            (
-                "host path",
-                |s| {
-                    s.volumes
-                        .insert("host".into(), host_path("/srv/data.d/a b"));
-                },
-                &[],
-            ),
-            (
-                "host path of the root",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/"));
-                },
-                &[("volumes.host.path", "must not be /")],
-            ),
-            (
-                "relative host path",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("srv/data"));
-                },
-                &[("volumes.host.path", "must be an absolute path")],
-            ),
-            (
-                "empty host path",
-                |s| {
-                    s.volumes.insert("host".into(), host_path(""));
-                },
-                &[("volumes.host.path", "must be an absolute path")],
-            ),
-            (
-                "windows host path",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("C:\\data"));
-                },
-                &[("volumes.host.path", "must be an absolute path")],
-            ),
-            (
-                "host path with a parent component",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/../etc"));
-                },
-                &[("volumes.host.path", "must not contain . or .. components")],
-            ),
-            (
-                "host path with a dot component",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/./data"));
-                },
-                &[("volumes.host.path", "must not contain . or .. components")],
-            ),
-            (
-                "host path ending in a parent component",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/.."));
-                },
-                &[("volumes.host.path", "must not contain . or .. components")],
-            ),
-            (
-                "host path with dots inside a name",
-                |s| {
-                    s.volumes
-                        .insert("host".into(), host_path("/srv/..data/.cache/a..b"));
-                },
-                &[],
-            ),
-            (
-                "host path with an empty component",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv//data"));
-                },
-                &[("volumes.host.path", "must not contain //")],
-            ),
-            (
-                "host path with a trailing slash",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/data/"));
-                },
-                &[("volumes.host.path", "must not end with /")],
-            ),
-            (
-                "host path with a NUL",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/\0data"));
-                },
-                &[("volumes.host.path", "must not contain control characters")],
-            ),
-            (
-                "host path with a newline",
-                |s| {
-                    s.volumes.insert("host".into(), host_path("/srv/data\n"));
-                },
-                &[("volumes.host.path", "must not contain control characters")],
-            ),
-            (
-                "longest host path",
-                |s| {
-                    let path = format!("/{}", "a".repeat(limits::MAX_PATH_BYTES - 1));
-                    s.volumes.insert("host".into(), host_path(&path));
-                },
-                &[],
-            ),
-            (
-                "host path too long",
-                |s| {
-                    let path = format!("/{}", "a".repeat(limits::MAX_PATH_BYTES));
-                    s.volumes.insert("host".into(), host_path(&path));
-                },
-                &[("volumes.host.path", "must be at most 4096 bytes")],
+                "mount of a volume that is not declared",
+                |s| s.containers[0].mounts = vec![mount("data", "/data")],
+                &[(
+                    "containers[0].mounts[0].volume",
+                    "is not a volume of the workload",
+                )],
             ),
         ]);
     }
@@ -2335,7 +2356,7 @@ mod tests {
 
         // Control characters never reach a path either.
         let mut spec = base();
-        spec.volumes.insert("a\nb\u{1b}[0m".into(), ephemeral());
+        spec.volumes.insert("a\nb\u{1b}[0m".into(), ramdisk());
         let found = spec.validate().unwrap_err();
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, "volumes.a?b?[0m");
@@ -2570,7 +2591,7 @@ mod tests {
             (
                 "most mounts",
                 |s| {
-                    s.volumes.insert("data".into(), ephemeral());
+                    s.volumes.insert("data".into(), ramdisk());
                     s.containers[0].mounts = (0..limits::MAX_MOUNTS_PER_CONTAINER)
                         .map(|i| mount("data", &format!("/m{i}")))
                         .collect();
@@ -2580,7 +2601,7 @@ mod tests {
             (
                 "too many mounts",
                 |s| {
-                    s.volumes.insert("data".into(), ephemeral());
+                    s.volumes.insert("data".into(), ramdisk());
                     s.containers[0].mounts = (0..=limits::MAX_MOUNTS_PER_CONTAINER)
                         .map(|i| mount("data", &format!("/m{i}")))
                         .collect();
@@ -2590,7 +2611,7 @@ mod tests {
             (
                 "mount of an undeclared volume",
                 |s| {
-                    s.volumes.insert("data".into(), ephemeral());
+                    s.volumes.insert("data".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("data", "/a"), mount("cache", "/b")];
                 },
                 &[(
@@ -2601,8 +2622,8 @@ mod tests {
             (
                 "one mount path twice",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
-                    s.volumes.insert("b".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
+                    s.volumes.insert("b".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data"), mount("b", "/data")];
                 },
                 &[("containers[0].mounts[1].path", "duplicate mount path")],
@@ -2610,7 +2631,7 @@ mod tests {
             (
                 "mount paths beside the kernel's directories",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = [
                         "/dev/shm",
                         "/dev/shm/cache",
@@ -2628,7 +2649,7 @@ mod tests {
             (
                 "mount over the root",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/")];
                 },
                 &[("containers[0].mounts[0].path", "must not be /")],
@@ -2636,7 +2657,7 @@ mod tests {
             (
                 "mounts over the kernel's directories",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = [
                         "/proc",
                         "/proc/sys/kernel",
@@ -2662,7 +2683,7 @@ mod tests {
             (
                 "one mount path in two containers",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     let mut other = ContainerSpec::new("other", "nginx");
                     other.mounts = vec![mount("a", "/data")];
@@ -2673,7 +2694,7 @@ mod tests {
             (
                 "relative mount path",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "data")];
                 },
                 &[("containers[0].mounts[0].path", "must be an absolute path")],
@@ -2681,7 +2702,7 @@ mod tests {
             (
                 "mount path that is not normalised",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data/./x")];
                 },
                 &[(
@@ -2692,7 +2713,7 @@ mod tests {
             (
                 "sub path",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some("web/..cache/a".into());
                 },
@@ -2701,7 +2722,7 @@ mod tests {
             (
                 "absolute sub path",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some("/web".into());
                 },
@@ -2713,7 +2734,7 @@ mod tests {
             (
                 "sub path with a parent component",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some("web/../../etc".into());
                 },
@@ -2725,7 +2746,7 @@ mod tests {
             (
                 "sub path that is a parent component",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some("..".into());
                 },
@@ -2737,7 +2758,7 @@ mod tests {
             (
                 "empty sub path",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some(String::new());
                 },
@@ -2746,7 +2767,7 @@ mod tests {
             (
                 "sub path with a NUL",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path = Some("a\0".into());
                 },
@@ -2758,7 +2779,7 @@ mod tests {
             (
                 "sub path too long",
                 |s| {
-                    s.volumes.insert("a".into(), ephemeral());
+                    s.volumes.insert("a".into(), ramdisk());
                     s.containers[0].mounts = vec![mount("a", "/data")];
                     s.containers[0].mounts[0].sub_path =
                         Some("a".repeat(limits::MAX_PATH_BYTES + 1));
@@ -2774,136 +2795,61 @@ mod tests {
     #[test]
     fn resource_and_capability_rules() {
         check_rows(&[
+            ("default resources", |_| {}, &[]),
             (
-                "requests at their limits",
+                "smallest resources",
                 |s| {
                     s.containers[0].resources = Resources {
-                        limits: ResourceAmounts {
-                            cpu_millis: Some(1),
-                            memory_bytes: Some(1),
-                        },
-                        requests: ResourceAmounts {
-                            cpu_millis: Some(1),
-                            memory_bytes: Some(1),
-                        },
+                        cpu_millis: 1,
+                        memory_bytes: 1,
                     };
                 },
                 &[],
             ),
             (
-                "requests without limits",
+                "highest resources",
                 |s| {
-                    s.containers[0].resources.requests = ResourceAmounts {
-                        cpu_millis: Some(limits::MAX_CPU_MILLIS),
-                        memory_bytes: Some(limits::MAX_MEMORY_BYTES),
+                    s.containers[0].resources = Resources {
+                        cpu_millis: limits::MAX_CPU_MILLIS,
+                        memory_bytes: limits::MAX_MEMORY_BYTES,
                     };
                 },
                 &[],
             ),
             (
-                "highest limits",
+                "resources too high",
                 |s| {
-                    s.containers[0].resources.limits = ResourceAmounts {
-                        cpu_millis: Some(limits::MAX_CPU_MILLIS),
-                        memory_bytes: Some(limits::MAX_MEMORY_BYTES),
-                    };
-                },
-                &[],
-            ),
-            (
-                "limits too high",
-                |s| {
-                    s.containers[0].resources.limits = ResourceAmounts {
-                        cpu_millis: Some(limits::MAX_CPU_MILLIS + 1),
-                        memory_bytes: Some(limits::MAX_MEMORY_BYTES + 1),
+                    s.containers[0].resources = Resources {
+                        cpu_millis: limits::MAX_CPU_MILLIS + 1,
+                        memory_bytes: limits::MAX_MEMORY_BYTES + 1,
                     };
                 },
                 &[
                     (
-                        "containers[0].resources.limits.cpu_millis",
+                        "containers[0].resources.cpu_millis",
                         "must be at most 1000000",
                     ),
                     (
-                        "containers[0].resources.limits.memory_bytes",
+                        "containers[0].resources.memory_bytes",
                         "must be at most 9223372036854775807",
                     ),
                 ],
             ),
             (
-                "requests too high",
+                "resources of zero",
                 |s| {
-                    s.containers[0].resources.requests = ResourceAmounts {
-                        cpu_millis: Some(u64::MAX),
-                        memory_bytes: Some(u64::MAX),
+                    s.containers[0].resources = Resources {
+                        cpu_millis: 0,
+                        memory_bytes: 0,
                     };
                 },
                 &[
                     (
-                        "containers[0].resources.requests.cpu_millis",
-                        "must be at most 1000000",
-                    ),
-                    (
-                        "containers[0].resources.requests.memory_bytes",
-                        "must be at most 9223372036854775807",
-                    ),
-                ],
-            ),
-            (
-                "cpu request above its limit",
-                |s| {
-                    s.containers[0].resources.limits.cpu_millis = Some(500);
-                    s.containers[0].resources.requests.cpu_millis = Some(501);
-                },
-                &[(
-                    "containers[0].resources.requests.cpu_millis",
-                    "must not exceed the limit",
-                )],
-            ),
-            (
-                "memory request above its limit",
-                |s| {
-                    s.containers[0].resources.limits.memory_bytes = Some(1024);
-                    s.containers[0].resources.requests.memory_bytes = Some(1025);
-                },
-                &[(
-                    "containers[0].resources.requests.memory_bytes",
-                    "must not exceed the limit",
-                )],
-            ),
-            (
-                "limits of zero",
-                |s| {
-                    s.containers[0].resources.limits = ResourceAmounts {
-                        cpu_millis: Some(0),
-                        memory_bytes: Some(0),
-                    };
-                },
-                &[
-                    (
-                        "containers[0].resources.limits.cpu_millis",
+                        "containers[0].resources.cpu_millis",
                         "must be greater than 0",
                     ),
                     (
-                        "containers[0].resources.limits.memory_bytes",
-                        "must be greater than 0",
-                    ),
-                ],
-            ),
-            (
-                "requests of zero",
-                |s| {
-                    s.containers[0].resources.requests = ResourceAmounts {
-                        cpu_millis: Some(0),
-                        memory_bytes: Some(0),
-                    };
-                },
-                &[
-                    (
-                        "containers[0].resources.requests.cpu_millis",
-                        "must be greater than 0",
-                    ),
-                    (
-                        "containers[0].resources.requests.memory_bytes",
+                        "containers[0].resources.memory_bytes",
                         "must be greater than 0",
                     ),
                 ],
@@ -3071,17 +3017,20 @@ mod tests {
             "\u{202e}", "\u{2066}", "\u{200f}", "\u{200b}", "\u{feff}", "\u{430}",
         ] {
             let mut spec = base();
-            spec.volumes
-                .insert("host".into(), host_path(&format!("/srv/{hidden}a")));
-            spec.volumes.insert("data".into(), ephemeral());
+            spec.volumes.insert("data".into(), ramdisk());
             let c = &mut spec.containers[0];
             c.image = format!("nginx{hidden}");
             c.working_dir = Some(format!("/srv/{hidden}"));
             c.user = Some(format!("www{hidden}"));
             c.mounts = vec![mount("data", &format!("/data{hidden}"))];
             c.mounts[0].sub_path = Some(format!("a{hidden}"));
-            c.liveness = Some(Probe::new(http(&format!("/{hidden}"))));
-            c.readiness = Some(Probe::new(http_host(&format!("web{hidden}.local"))));
+            c.probe = Some(Probe::new(ProbeAction::Http {
+                port: 80,
+                path: format!("/{hidden}"),
+                scheme: HttpScheme::Http,
+                host: Some(format!("web{hidden}.local")),
+                headers: BTreeMap::new(),
+            }));
             // Commands and env values may hold any text.
             c.command = vec![format!("echo{hidden}")];
             c.args = vec![hidden.to_string()];
@@ -3089,7 +3038,6 @@ mod tests {
             assert_eq!(
                 violations(&spec),
                 [
-                    ("volumes.host.path", ASCII),
                     ("containers[0].image", ASCII),
                     ("containers[0].working_dir", ASCII),
                     (
@@ -3098,8 +3046,8 @@ mod tests {
                     ),
                     ("containers[0].mounts[0].path", ASCII),
                     ("containers[0].mounts[0].sub_path", ASCII),
-                    ("containers[0].liveness.action.path", ASCII),
-                    ("containers[0].readiness.action.host", ASCII),
+                    ("containers[0].probe.action.path", ASCII),
+                    ("containers[0].probe.action.host", ASCII),
                 ]
                 .map(|(path, message)| (path.to_string(), message.to_string())),
                 "{hidden:?}"
@@ -3125,9 +3073,7 @@ mod tests {
         };
         let mut container = ContainerSpec::new("web", "nginx");
         container.env = BTreeMap::from([("API_KEY".to_string(), "hunter2".to_string())]);
-        container.liveness = Some(Probe::new(action.clone()));
-        container.readiness = Some(Probe::new(action.clone()));
-        container.startup = Some(Probe::new(action.clone()));
+        container.probe = Some(Probe::new(action.clone()));
         let spec = WorkloadSpec {
             containers: vec![container.clone()],
             ..base()
@@ -3167,126 +3113,104 @@ mod tests {
             format!("{:?}", ProbeAction::Tcp { port: 80 }),
             "Tcp { port: 80 }"
         );
-        assert_eq!(
-            format!(
-                "{:?}",
-                ProbeAction::Exec {
-                    command: vec!["true".into()]
-                }
-            ),
-            "Exec { command: [\"true\"] }"
-        );
     }
 
     #[test]
     fn probe_rules() {
         check_rows(&[
             (
-                "lowest timings",
+                "lowest interval and timeout",
                 |s| {
-                    s.containers[0].liveness = Some(Probe {
-                        action: ProbeAction::Tcp { port: 1 },
-                        initial_delay_secs: 0,
-                        period_secs: 1,
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: 2,
                         timeout_secs: 1,
-                        success_threshold: 1,
-                        failure_threshold: 1,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
                     });
                 },
                 &[],
+            ),
+            (
+                "highest interval",
+                |s| {
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: limits::MAX_PROBE_INTERVAL_SECS,
+                        timeout_secs: 3_599,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
+                    });
+                },
+                &[],
+            ),
+            (
+                "interval too long",
+                |s| {
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: limits::MAX_PROBE_INTERVAL_SECS + 1,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
+                    });
+                },
+                &[("containers[0].probe.interval_secs", "must be at most 3600")],
             ),
             (
                 "timings of zero",
                 |s| {
-                    s.containers[0].liveness = Some(Probe {
-                        action: ProbeAction::Tcp { port: 1 },
-                        initial_delay_secs: 0,
-                        period_secs: 0,
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: 0,
                         timeout_secs: 0,
-                        success_threshold: 0,
-                        failure_threshold: 0,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
                     });
                 },
                 &[
-                    ("containers[0].liveness.period_secs", "must be at least 1"),
-                    ("containers[0].liveness.timeout_secs", "must be at least 1"),
-                    (
-                        "containers[0].liveness.success_threshold",
-                        "must be at least 1",
-                    ),
-                    (
-                        "containers[0].liveness.failure_threshold",
-                        "must be at least 1",
-                    ),
+                    ("containers[0].probe.interval_secs", "must be at least 1"),
+                    ("containers[0].probe.timeout_secs", "must be at least 1"),
                 ],
             ),
             (
-                "tcp probe of port zero",
-                |s| s.containers[0].readiness = Some(Probe::new(ProbeAction::Tcp { port: 0 })),
-                &[("containers[0].readiness.action.port", "must not be 0")],
+                "timeout equal to the interval",
+                |s| {
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: 3,
+                        timeout_secs: 3,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
+                    });
+                },
+                &[(
+                    "containers[0].probe.timeout_secs",
+                    "must be less than interval_secs",
+                )],
             ),
             (
-                "exec probe without a command",
+                "timeout above the interval",
                 |s| {
-                    s.containers[0].startup =
-                        Some(Probe::new(ProbeAction::Exec { command: vec![] }));
+                    s.containers[0].probe = Some(Probe {
+                        interval_secs: 3,
+                        timeout_secs: 4,
+                        ..Probe::new(ProbeAction::Tcp { port: 1 })
+                    });
                 },
-                &[("containers[0].startup.action.command", "must not be empty")],
+                &[(
+                    "containers[0].probe.timeout_secs",
+                    "must be less than interval_secs",
+                )],
             ),
             (
-                "exec probe with most entries",
-                |s| {
-                    s.containers[0].startup = Some(Probe::new(ProbeAction::Exec {
-                        command: vec!["a".into(); limits::MAX_COMMAND_ENTRIES],
-                    }));
-                },
+                "default timings",
+                |s| s.containers[0].probe = Some(Probe::new(ProbeAction::Tcp { port: 1 })),
                 &[],
             ),
             (
-                "exec probe with too many entries",
-                |s| {
-                    s.containers[0].startup = Some(Probe::new(ProbeAction::Exec {
-                        command: vec!["a".into(); limits::MAX_COMMAND_ENTRIES + 1],
-                    }));
-                },
-                &[(
-                    "containers[0].startup.action.command",
-                    "must hold at most 256 entries",
-                )],
-            ),
-            (
-                "exec probe with a NUL",
-                |s| {
-                    s.containers[0].startup = Some(Probe::new(ProbeAction::Exec {
-                        command: vec!["sh".into(), "\0".into()],
-                    }));
-                },
-                &[(
-                    "containers[0].startup.action.command[1]",
-                    "must not contain a NUL character",
-                )],
-            ),
-            (
-                "exec probe with an entry too long",
-                |s| {
-                    s.containers[0].startup = Some(Probe::new(ProbeAction::Exec {
-                        command: vec!["a".repeat(limits::MAX_COMMAND_ENTRY_BYTES + 1)],
-                    }));
-                },
-                &[(
-                    "containers[0].startup.action.command[0]",
-                    "must be at most 8192 bytes",
-                )],
+                "tcp probe of port zero",
+                |s| s.containers[0].probe = Some(Probe::new(ProbeAction::Tcp { port: 0 })),
+                &[("containers[0].probe.action.port", "must not be 0")],
             ),
             (
                 "http probe",
-                |s| s.containers[0].readiness = Some(Probe::new(http("/healthz?full=1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http("/healthz?full=1"))),
                 &[],
             ),
             (
                 "http probe of port zero",
                 |s| {
-                    s.containers[0].readiness = Some(Probe::new(ProbeAction::Http {
+                    s.containers[0].probe = Some(Probe::new(ProbeAction::Http {
                         port: 0,
                         path: "/".into(),
                         scheme: HttpScheme::Https,
@@ -3294,23 +3218,23 @@ mod tests {
                         headers: BTreeMap::new(),
                     }));
                 },
-                &[("containers[0].readiness.action.port", "must not be 0")],
+                &[("containers[0].probe.action.port", "must not be 0")],
             ),
             (
                 "http probe with a relative path",
-                |s| s.containers[0].readiness = Some(Probe::new(http("healthz"))),
-                &[("containers[0].readiness.action.path", "must start with /")],
+                |s| s.containers[0].probe = Some(Probe::new(http("healthz"))),
+                &[("containers[0].probe.action.path", "must start with /")],
             ),
             (
                 "http probe with an empty path",
-                |s| s.containers[0].readiness = Some(Probe::new(http(""))),
-                &[("containers[0].readiness.action.path", "must start with /")],
+                |s| s.containers[0].probe = Some(Probe::new(http(""))),
+                &[("containers[0].probe.action.path", "must start with /")],
             ),
             (
                 "http probe with a line break in the path",
-                |s| s.containers[0].readiness = Some(Probe::new(http("/a\r\nX-Evil: 1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http("/a\r\nX-Evil: 1"))),
                 &[(
-                    "containers[0].readiness.action.path",
+                    "containers[0].probe.action.path",
                     "must not contain whitespace or control characters",
                 )],
             ),
@@ -3318,7 +3242,7 @@ mod tests {
                 "http probe with the longest path",
                 |s| {
                     let path = format!("/{}", "a".repeat(limits::MAX_PATH_BYTES - 1));
-                    s.containers[0].readiness = Some(Probe::new(http(&path)));
+                    s.containers[0].probe = Some(Probe::new(http(&path)));
                 },
                 &[],
             ),
@@ -3326,89 +3250,88 @@ mod tests {
                 "http probe with a path too long",
                 |s| {
                     let path = format!("/{}", "a".repeat(limits::MAX_PATH_BYTES));
-                    s.containers[0].readiness = Some(Probe::new(http(&path)));
+                    s.containers[0].probe = Some(Probe::new(http(&path)));
                 },
                 &[(
-                    "containers[0].readiness.action.path",
+                    "containers[0].probe.action.path",
                     "must be at most 4096 bytes",
                 )],
             ),
             (
                 "http probe with a host",
-                |s| s.containers[0].readiness = Some(Probe::new(http_host("web.local:8080"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host("web.local:8080"))),
                 &[],
             ),
             (
                 "http probe with an empty host",
-                |s| s.containers[0].readiness = Some(Probe::new(http_host(""))),
-                &[("containers[0].readiness.action.host", "must not be empty")],
+                |s| s.containers[0].probe = Some(Probe::new(http_host(""))),
+                &[("containers[0].probe.action.host", "must not be empty")],
             ),
             (
                 "http probe with a line break in the host",
-                |s| s.containers[0].readiness = Some(Probe::new(http_host("a\r\nX-Evil: 1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host("a\r\nX-Evil: 1"))),
                 &[(
-                    "containers[0].readiness.action.host",
+                    "containers[0].probe.action.host",
                     "must not contain whitespace or control characters",
                 )],
             ),
             (
                 "http probe with the longest host",
-                |s| s.containers[0].readiness = Some(Probe::new(http_host(&"a".repeat(253)))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host(&"a".repeat(253)))),
                 &[],
             ),
             (
                 "http probe with a host too long",
-                |s| s.containers[0].readiness = Some(Probe::new(http_host(&"a".repeat(254)))),
+                |s| s.containers[0].probe = Some(Probe::new(http_host(&"a".repeat(254)))),
                 &[(
-                    "containers[0].readiness.action.host",
+                    "containers[0].probe.action.host",
                     "must be at most 253 bytes",
                 )],
             ),
             (
                 "http probe with headers",
                 |s| {
-                    s.containers[0].readiness =
-                        Some(Probe::new(http_header("X-Probe_1.a~", "a b\tc")));
+                    s.containers[0].probe = Some(Probe::new(http_header("X-Probe_1.a~", "a b\tc")));
                 },
                 &[],
             ),
             (
                 "http probe with an empty header name",
-                |s| s.containers[0].readiness = Some(Probe::new(http_header("", "1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_header("", "1"))),
                 &[(
-                    "containers[0].readiness.action.headers.",
+                    "containers[0].probe.action.headers.",
                     "name must be an HTTP token",
                 )],
             ),
             (
                 "http probe with a colon in a header name",
-                |s| s.containers[0].readiness = Some(Probe::new(http_header("X:Y", "1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_header("X:Y", "1"))),
                 &[(
-                    "containers[0].readiness.action.headers.X:Y",
+                    "containers[0].probe.action.headers.X:Y",
                     "name must be an HTTP token",
                 )],
             ),
             (
                 "http probe with a space in a header name",
-                |s| s.containers[0].readiness = Some(Probe::new(http_header("X Y", "1"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_header("X Y", "1"))),
                 &[(
-                    "containers[0].readiness.action.headers.X Y",
+                    "containers[0].probe.action.headers.X Y",
                     "name must be an HTTP token",
                 )],
             ),
             (
                 "http probe with a line feed in a header value",
-                |s| s.containers[0].readiness = Some(Probe::new(http_header("X-A", "1\nX-B: 2"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_header("X-A", "1\nX-B: 2"))),
                 &[(
-                    "containers[0].readiness.action.headers.X-A",
+                    "containers[0].probe.action.headers.X-A",
                     "value must not contain CR, LF or NUL",
                 )],
             ),
             (
                 "http probe with a carriage return in a header value",
-                |s| s.containers[0].readiness = Some(Probe::new(http_header("X-A", "1\r"))),
+                |s| s.containers[0].probe = Some(Probe::new(http_header("X-A", "1\r"))),
                 &[(
-                    "containers[0].readiness.action.headers.X-A",
+                    "containers[0].probe.action.headers.X-A",
                     "value must not contain CR, LF or NUL",
                 )],
             ),
@@ -3419,14 +3342,14 @@ mod tests {
     #[test]
     fn every_violation_is_collected_in_field_order() {
         let mut spec = base();
-        spec.scale = Scale::Replicas(5_000);
+        spec.scale = replicas(5_000, Strategy::Spread);
         spec.stop_grace_secs = Some(9_999);
-        spec.volumes.insert("Bad".into(), host_path("relative/"));
+        spec.volumes.insert("Bad".into(), block(1));
         spec.containers[0].image = String::new();
         spec.containers[0].user = Some("a:b".into());
         let mut second = ContainerSpec::new("web", "ok");
         second.capabilities = vec!["ALL".into()];
-        second.liveness = Some(Probe::new(ProbeAction::Tcp { port: 0 }));
+        second.probe = Some(Probe::new(ProbeAction::Tcp { port: 0 }));
         spec.containers.push(second);
         assert_eq!(
             violations(&spec)
@@ -3434,16 +3357,15 @@ mod tests {
                 .map(|(path, _)| path.as_str())
                 .collect::<Vec<_>>(),
             [
-                "scale.replicas",
+                "scale.replicas.count",
                 "stop_grace_secs",
                 "volumes.Bad",
-                "volumes.Bad.path",
-                "volumes.Bad.path",
+                "volumes.Bad.size_bytes",
                 "containers[0].image",
                 "containers[0].user",
                 "containers[1].name",
                 "containers[1].capabilities[0]",
-                "containers[1].liveness.action.port",
+                "containers[1].probe.action.port",
             ]
         );
     }
@@ -3596,7 +3518,7 @@ mod tests {
             environment: "staging".into(),
             name: "web".into(),
             fqdn: fqdn("web", "staging", "shop"),
-            scale: Scale::Replicas(3),
+            scale: replicas(3, Strategy::Spread),
             expose: Exposure::Cluster,
             revision: 7,
         };
@@ -3608,7 +3530,7 @@ mod tests {
             json!({"workloads": [{
                 "project": "shop", "environment": "staging", "name": "web",
                 "fqdn": "web.staging.shop.faber.internal",
-                "scale": {"replicas": 3}, "expose": "cluster", "revision": 7,
+                "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7,
             }]})
         );
         let one: WorkloadResponse = serde_json::from_value(json!({
