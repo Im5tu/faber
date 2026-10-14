@@ -35,6 +35,10 @@ pub enum VolumeKind {
 }
 
 /// What fabercp may ask of `faber-node`. Anything else is not a frame.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a request is built, sent and dropped; boxing the spec would only add noise"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
