@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
@@ -1402,6 +1403,34 @@ pub struct WorkloadResponse {
     /// The generation of the environment the workload was read from.
     pub generation: u64,
     pub spec: WorkloadSpec,
+    /// What the nodes last reported for each replica, sorted by replica
+    /// index. Empty until a node reports one. A replica whose node has not
+    /// reported for three report intervals reads `unavailable`.
+    #[serde(default)]
+    pub replicas: Vec<ReplicaStatus>,
+}
+
+/// State of one replica as its node reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaState {
+    Deploying,
+    Available,
+    Unavailable,
+}
+
+/// One replica in [`WorkloadResponse::replicas`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaStatus {
+    /// The node that runs the replica.
+    pub node: u64,
+    pub replica_index: u32,
+    /// The revision the replica runs.
+    pub revision: u64,
+    pub state: ReplicaState,
+    /// The replica's pod address, once it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_ip: Option<Ipv4Addr>,
 }
 
 #[cfg(test)]
@@ -3123,6 +3152,7 @@ mod tests {
             revision: 1,
             generation: 1,
             spec: spec.clone(),
+            replicas: Vec::new(),
         };
         for debug in [
             format!("{action:?}"),

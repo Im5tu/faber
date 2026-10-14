@@ -233,6 +233,20 @@ pub struct SetLeaseRequest {
     pub lease_secs: u64,
 }
 
+/// `GET /api/v1/mesh/status-interval`, and the 200 body of `PUT` on it
+/// (loopback listener only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusIntervalResponse {
+    /// Seconds between two status reports of a node.
+    pub interval_secs: u64,
+}
+
+/// `PUT /api/v1/mesh/status-interval` (loopback listener only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetStatusIntervalRequest {
+    pub interval_secs: u64,
+}
+
 /// JSON body of every non-2xx response. `leader_id`/`leader_addr` are set on
 /// `not_leader` errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -871,12 +871,49 @@ fn workload_route_shapes() {
             revision: 7,
             generation: 9,
             spec: minimal_spec(),
+            replicas: vec![
+                ReplicaStatus {
+                    node: 2,
+                    replica_index: 0,
+                    revision: 7,
+                    state: ReplicaState::Available,
+                    pod_ip: Some("10.200.2.5".parse().unwrap()),
+                },
+                ReplicaStatus {
+                    node: 3,
+                    replica_index: 1,
+                    revision: 7,
+                    state: ReplicaState::Unavailable,
+                    pod_ip: None,
+                },
+            ],
         },
         json!({
             "project": "shop", "environment": "staging", "name": "a",
             "fqdn": "a.staging.shop.faber.internal", "revision": 7, "generation": 9,
-            "spec": minimal_spec_json()
+            "spec": minimal_spec_json(),
+            "replicas": [
+                {"node": 2, "replica_index": 0, "revision": 7, "state": "available",
+                 "pod_ip": "10.200.2.5"},
+                {"node": 3, "replica_index": 1, "revision": 7, "state": "unavailable"}
+            ]
         }),
+    );
+    // A response from before replicas were reported still reads.
+    let old: WorkloadResponse = serde_json::from_value(json!({
+        "project": "shop", "environment": "staging", "name": "a",
+        "fqdn": "a.staging.shop.faber.internal", "revision": 7, "generation": 9,
+        "spec": minimal_spec_json()
+    }))
+    .unwrap();
+    assert!(old.replicas.is_empty());
+    assert_shape(
+        StatusIntervalResponse { interval_secs: 5 },
+        json!({"interval_secs": 5}),
+    );
+    assert_shape(
+        SetStatusIntervalRequest { interval_secs: 9 },
+        json!({"interval_secs": 9}),
     );
 }
 
@@ -905,6 +942,7 @@ fn container_spec_debug_shows_env_names_and_no_value() {
             containers: vec![container],
             ..minimal_spec()
         },
+        replicas: Vec::new(),
     };
     let dbg = format!("{response:?}");
     assert!(dbg.contains("API_KEY"), "{dbg}");
