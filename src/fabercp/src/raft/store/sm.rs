@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
+use super::status::NodeStatus;
 use super::{CF_SM_DATA, CF_SM_META, cf, keys, place, services, status, write_synced};
 use crate::apps::state::{ENV_PREFIX, KEY_PROJECTS, env_key, is_reserved_key};
 use crate::apps::{EnvironmentRecord, ProjectIndex};
@@ -88,7 +89,10 @@ impl Pending<'_> {
 
 /// Whether only typed commands may write `key`: `Request::Set` is refused.
 fn is_reserved(key: &str) -> bool {
-    RESERVED_KEYS.contains(&key) || is_reserved_key(key) || keys::is_reserved_key(key)
+    RESERVED_KEYS.contains(&key)
+        || is_reserved_key(key)
+        || keys::is_reserved_key(key)
+        || status::is_reserved_key(key)
 }
 
 fn reject(code: &str, message: impl Into<String>) -> Response {
@@ -208,9 +212,27 @@ impl StateMachineStore {
                 self.apply_set_cluster_key_id(pending, cmd)?
             }
             EntryPayload::Normal(Request::PlaceReplicas(cmd)) => place::apply_place_replicas(cmd),
-            EntryPayload::Normal(Request::ReportNode(cmd)) => status::apply_report_node(cmd),
+            // A report reads the mesh and writes only its own node's record:
+            // it never goes through `apply_mesh`, which writes `mesh` back.
+            EntryPayload::Normal(Request::ReportNode(cmd)) => {
+                let mesh = self.mesh(pending)?;
+                let key = status::node_key(cmd.node_id);
+                match status::apply_report_node(mesh.as_ref(), cmd) {
+                    Ok(record) => {
+                        pending.put(&key, &record)?;
+                        Response::None
+                    }
+                    Err(r) => r.into(),
+                }
+            }
             EntryPayload::Normal(Request::SetStatusInterval(cmd)) => {
-                status::apply_set_status_interval(cmd)
+                match status::apply_set_status_interval(&cmd) {
+                    Ok(secs) => {
+                        pending.put(status::KEY_INTERVAL, &secs)?;
+                        Response::None
+                    }
+                    Err(r) => r.into(),
+                }
             }
             EntryPayload::Normal(Request::AllocateServiceIp(cmd)) => {
                 services::apply_allocate_service_ip(cmd)
@@ -822,6 +844,35 @@ impl StateReader {
     /// The id of the cluster key, once a `SetClusterKeyId` was applied.
     pub fn cluster_key_id(&self) -> Result<Option<keys::ClusterKeyId>, ReadError> {
         self.typed(keys::KEY_CLUSTER_ID)
+    }
+
+    /// Every node's status record by node id. All are read from one view of
+    /// the database. A node that never reported has none.
+    pub fn statuses(&self) -> Result<BTreeMap<u64, NodeStatus>, ReadError> {
+        let storage = |e: &dyn std::fmt::Display| ReadError::Storage(e.to_string());
+        let db = self.db.upgrade().ok_or(ReadError::Closed)?;
+        let view = db.snapshot();
+        let from = IteratorMode::From(status::KEY_PREFIX.as_bytes(), Direction::Forward);
+        let mut found = BTreeMap::new();
+        for item in view.iterator_cf(cf(&db, CF_SM_DATA), from) {
+            let (key, value) = item.map_err(|e| storage(&e))?;
+            let Some(id) = key.strip_prefix(status::KEY_PREFIX.as_bytes()) else {
+                break;
+            };
+            let id = std::str::from_utf8(id)
+                .ok()
+                .and_then(|id| id.parse::<u64>().ok())
+                .ok_or_else(|| storage(&"a status key is not status/<node id>"))?;
+            found.insert(id, serde_json::from_slice(&value).map_err(|e| storage(&e))?);
+        }
+        Ok(found)
+    }
+
+    /// Seconds between two status reports of a node.
+    pub fn status_interval(&self) -> Result<u64, ReadError> {
+        Ok(self
+            .typed(status::KEY_INTERVAL)?
+            .unwrap_or(status::DEFAULT_INTERVAL_SECS))
     }
 
     fn typed<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, ReadError> {
@@ -2271,6 +2322,266 @@ mod tests {
         }
     }
 
+    // --- status ------------------------------------------------------------
+
+    use faber_api_types::workload::ReplicaState;
+
+    fn replica(workload: &str, index: u32, state: ReplicaState) -> status::ReplicaReport {
+        status::ReplicaReport {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workload: workload.into(),
+            revision: 3,
+            replica_index: index,
+            state,
+            pod_ip: Some("10.200.1.2".parse().unwrap()),
+            detail: None,
+        }
+    }
+
+    fn report(node_id: u64, instance_id: &str, replicas: Vec<status::ReplicaReport>) -> Request {
+        Request::ReportNode(status::ReportNode {
+            node_id,
+            instance_id: instance_id.into(),
+            capacity: status::Capacity {
+                cpu_millis: 4000,
+                memory_bytes: 1 << 30,
+                disk_bytes: 1 << 33,
+            },
+            replicas,
+        })
+    }
+
+    /// Two nodes: the founder (no instance id) and node 2 (`register(2)`).
+    fn two_nodes() -> Vec<Entry> {
+        vec![
+            normal(1, init_cluster()),
+            normal(2, create_invite(2)),
+            normal(3, register(2)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_report_replaces_the_record_and_stamps_the_lease_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let mut entries = two_nodes();
+        entries.push(normal(4, Request::AdvanceClock { elapsed_secs: 40 }));
+        entries.push(normal(
+            5,
+            report(
+                2,
+                &"cd".repeat(16),
+                vec![replica("web", 0, ReplicaState::Deploying)],
+            ),
+        ));
+        let replies = s.state_machine.apply(entries).await.unwrap();
+        assert!(matches!(replies[4], Response::None), "{replies:?}");
+        let got = s.reader.statuses().unwrap();
+        assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(got[&2].reported_at, 40);
+        assert_eq!(got[&2].capacity.cpu_millis, 4000);
+        assert_eq!(got[&2].replicas.len(), 1);
+
+        // The next report replaces the whole record, with a later stamp.
+        let replies = s
+            .state_machine
+            .apply([
+                normal(6, Request::AdvanceClock { elapsed_secs: 7 }),
+                normal(
+                    7,
+                    report(
+                        2,
+                        &"cd".repeat(16),
+                        vec![
+                            replica("api", 0, ReplicaState::Available),
+                            replica("api", 1, ReplicaState::Available),
+                        ],
+                    ),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(replies[1], Response::None), "{replies:?}");
+        let got = s.reader.statuses().unwrap();
+        assert_eq!(got[&2].reported_at, 47);
+        let names: Vec<&str> = got[&2]
+            .replicas
+            .iter()
+            .map(|r| r.workload.as_str())
+            .collect();
+        assert_eq!(names, vec!["api", "api"]);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_report_writes_only_its_status_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let mut entries = two_nodes();
+        entries.push(normal(4, create_project("shop")));
+        entries.push(normal(5, deploy("shop", &[("web", "nginx")], false)));
+        s.state_machine.apply(entries).await.unwrap();
+        let before = dump(&s);
+        let generation = |s: &Storage| {
+            s.reader
+                .environment("shop", "staging")
+                .unwrap()
+                .unwrap()
+                .generation
+        };
+        let gen_before = generation(&s);
+
+        s.state_machine
+            .apply([normal(
+                6,
+                report(
+                    2,
+                    &"cd".repeat(16),
+                    vec![replica("web", 0, ReplicaState::Available)],
+                ),
+            )])
+            .await
+            .unwrap();
+        let after = dump(&s);
+        let changed: Vec<&String> = after
+            .iter()
+            .filter(|(k, v)| before.get(*k) != Some(*v))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(changed, vec!["status/2"]);
+        assert_eq!(before.len() + 1, after.len());
+        assert_eq!(generation(&s), gen_before);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_report_from_an_unknown_node_or_machine_is_rejected_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        s.state_machine.apply(two_nodes()).await.unwrap();
+        let before = dump(&s);
+        let mut oversize = status::ReportNode {
+            node_id: 2,
+            instance_id: "cd".repeat(16),
+            capacity: status::Capacity::default(),
+            replicas: vec![replica("web", 0, ReplicaState::Available); 201],
+        };
+        let replies = s
+            .state_machine
+            .apply([
+                normal(4, report(9, &"cd".repeat(16), vec![])),
+                normal(5, report(2, &"ef".repeat(16), vec![])),
+                normal(6, Request::ReportNode(oversize.clone())),
+            ])
+            .await
+            .unwrap();
+        assert!(rejected(ec::MESH_NODE_REMOVED)(&replies[0]), "{replies:?}");
+        assert!(rejected(ec::FORBIDDEN)(&replies[1]), "{replies:?}");
+        assert!(rejected(ec::BAD_REQUEST)(&replies[2]), "{replies:?}");
+        assert_eq!(dump(&s), before);
+
+        // The founder has no instance id yet: it reports as any machine and
+        // keeps the record unclaimed.
+        oversize.node_id = 1;
+        oversize.replicas.clear();
+        let replies = s
+            .state_machine
+            .apply([normal(7, Request::ReportNode(oversize))])
+            .await
+            .unwrap();
+        assert!(matches!(replies[0], Response::None), "{replies:?}");
+        assert_eq!(
+            s.reader.mesh().unwrap().unwrap().nodes[&1].instance_id,
+            None
+        );
+
+        // No mesh at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bare = open(dir.path()).unwrap();
+        let replies = bare
+            .state_machine
+            .apply([normal(1, report(1, "", vec![]))])
+            .await
+            .unwrap();
+        assert!(
+            rejected(ec::MESH_NOT_CONFIGURED)(&replies[0]),
+            "{replies:?}"
+        );
+        assert!(dump(&bare).is_empty());
+        drop((s, bare));
+    }
+
+    #[tokio::test]
+    async fn the_status_interval_is_stored_within_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        assert_eq!(
+            s.reader.status_interval().unwrap(),
+            status::DEFAULT_INTERVAL_SECS
+        );
+        let set = |secs| Request::SetStatusInterval(status::SetStatusInterval { secs });
+        let replies = s
+            .state_machine
+            .apply([normal(1, set(30)), normal(2, set(0)), normal(3, set(301))])
+            .await
+            .unwrap();
+        assert!(matches!(replies[0], Response::None), "{replies:?}");
+        assert!(rejected(ec::BAD_REQUEST)(&replies[1]), "{replies:?}");
+        assert!(rejected(ec::BAD_REQUEST)(&replies[2]), "{replies:?}");
+        assert_eq!(s.reader.status_interval().unwrap(), 30);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn generic_set_cannot_write_status_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let replies = s
+            .state_machine
+            .apply([
+                set(1, 1, "status/1", json!({})),
+                set(1, 2, status::KEY_INTERVAL, json!(1)),
+            ])
+            .await
+            .unwrap();
+        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
+        assert!(dump(&s).is_empty());
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_status_records() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut a = open(dir_a.path()).unwrap();
+        let mut b = open(dir_b.path()).unwrap();
+        let mut entries = two_nodes();
+        entries.push(normal(
+            4,
+            report(
+                2,
+                &"cd".repeat(16),
+                vec![replica("web", 0, ReplicaState::Available)],
+            ),
+        ));
+        a.state_machine.apply(entries).await.unwrap();
+        let snap = a
+            .state_machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        b.state_machine
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(b.reader.statuses().unwrap(), a.reader.statuses().unwrap());
+        assert_eq!(b.reader.statuses().unwrap().len(), 1);
+        drop((a, b));
+    }
+
     /// Every `sm_data` entry as it is stored, to compare two states and to
     /// show that a command wrote nothing.
     fn dump(s: &Storage) -> BTreeMap<String, Vec<u8>> {
@@ -2694,12 +3005,6 @@ mod tests {
                 nodes: vec![1],
                 at: 1,
             }),
-            Request::ReportNode(status::ReportNode {
-                node_id: 1,
-                report: json!({}),
-                at: 1,
-            }),
-            Request::SetStatusInterval(status::SetStatusInterval { secs: 10 }),
             Request::AllocateServiceIp(services::AllocateServiceIp {
                 project: "shop".into(),
                 environment: "staging".into(),

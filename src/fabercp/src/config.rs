@@ -1088,6 +1088,24 @@ mod tests {
         assert_eq!(r.election_timeout_min, 150);
     }
 
+    /// Status reports add a raft entry per node and interval. A snapshot
+    /// every few thousand entries, with the log purged up to it (less the
+    /// entries kept for slow followers), keeps the log from growing without
+    /// bound.
+    #[test]
+    fn raft_snapshots_and_purges_the_log_by_default() {
+        let r = Config::new(1, "d").raft_config().unwrap();
+        assert!(
+            matches!(
+                r.snapshot_policy,
+                openraft::SnapshotPolicy::LogsSinceLast(5000)
+            ),
+            "{:?}",
+            r.snapshot_policy
+        );
+        assert_eq!(r.max_in_snapshot_log_to_keep, 1000);
+    }
+
     #[test]
     fn wg_interface_and_peer_listen_conflict() {
         let r = try_parse(&[

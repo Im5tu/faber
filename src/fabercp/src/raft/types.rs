@@ -284,6 +284,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::raft::store::status::{Capacity, ReplicaReport};
+    use faber_api_types::workload::ReplicaState;
+
     #[test]
     fn node_displays_its_address() {
         assert_eq!(Node::new("10.0.0.1:7400").to_string(), "10.0.0.1:7400");
@@ -377,8 +380,22 @@ mod tests {
             }),
             Request::ReportNode(ReportNode {
                 node_id: 2,
-                report: json!({"cpu": 1}),
-                at: 7,
+                instance_id: "cd".repeat(16),
+                capacity: Capacity {
+                    cpu_millis: 2000,
+                    memory_bytes: 1 << 30,
+                    disk_bytes: 1 << 34,
+                },
+                replicas: vec![ReplicaReport {
+                    project: project.clone(),
+                    environment: environment.clone(),
+                    workload: workload.clone(),
+                    revision: 3,
+                    replica_index: 0,
+                    state: ReplicaState::Available,
+                    pod_ip: Some(Ipv4Addr::new(10, 200, 1, 2)),
+                    detail: None,
+                }],
             }),
             Request::SetStatusInterval(SetStatusInterval { secs: 15 }),
             Request::AllocateServiceIp(AllocateServiceIp {
