@@ -1,7 +1,7 @@
 {
   "web": {
     "volumes": {
-      "data": { "type": "host_path", "path": "/srv/data" }
+      "data": { "type": "block", "size_bytes": 1073741824 }
     },
     "containers": [
       {

@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use faber_api_types::workload::{Exposure, VolumeSource, WorkloadSpec, validate_workloads};
+use faber_api_types::workload::{Exposure, WorkloadSpec, validate_workloads};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, Visitor};
 
 /// The largest input file, and the most that is read from stdin: 8 MiB. A
@@ -139,7 +139,7 @@ pub(crate) fn plan(
             ))
         })?
         .0;
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     let mut errors = Vec::new();
     if workloads.is_empty() && !prune {
@@ -183,7 +183,6 @@ pub(crate) fn plan(
         return Err(Failure { errors, warnings });
     }
 
-    warnings.extend(host_path_warnings(&workloads, &result_source));
     Ok(Plan {
         notes: notes(&workloads),
         workloads,
@@ -332,27 +331,6 @@ fn read_input(
         reader.file(path)
     };
     read.map_err(|e| Diagnostic::new(source, "", format!("cannot read: {e}")))
-}
-
-/// One warning per host-path volume: a node refuses it unless the node's
-/// own allow-list covers the path, which the CLI cannot know.
-fn host_path_warnings(workloads: &BTreeMap<String, WorkloadSpec>, source: &str) -> Vec<Diagnostic> {
-    let mut warnings = Vec::new();
-    for (workload, spec) in workloads {
-        for (volume, volume_source) in &spec.volumes {
-            if let VolumeSource::HostPath { path, .. } = volume_source {
-                warnings.push(Diagnostic::new(
-                    source,
-                    format!("{workload}.volumes.{volume}"),
-                    format!(
-                        "host path {path}: host paths are refused by nodes unless allowed in \
-                         the node's host-path allow-list"
-                    ),
-                ));
-            }
-        }
-    }
-    warnings
 }
 
 fn notes(workloads: &BTreeMap<String, WorkloadSpec>) -> Vec<String> {

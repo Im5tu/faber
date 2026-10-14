@@ -54,7 +54,10 @@ fn deploy_spec_dry_run_prints_the_spec_without_a_server() {
     let output = out.get_output();
     let spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(spec["db"]["containers"][0]["image"], "postgres:16");
-    assert_eq!(spec["web"]["scale"], serde_json::json!({"replicas": 2}));
+    assert_eq!(
+        spec["web"]["scale"],
+        serde_json::json!({"replicas": {"count": 2, "strategy": "spread"}})
+    );
     // Defaults are written out, so the output is the whole spec.
     assert_eq!(spec["web"]["restart"], "always");
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();

@@ -774,9 +774,6 @@ const NOTE_CAPABILITIES: &str = "note: containers get no Linux capabilities unle
 const NOTE_SECRETS: &str = "note: an env variable name looks like a secret; env values are \
     stored unencrypted in cluster state and are readable by local users on every node\n";
 
-const WARNING_HOST_PATH: &str = "warning: host-path.json: web.volumes.data: host path /srv/data: \
-    host paths are refused by nodes unless allowed in the node's host-path allow-list\n";
-
 // ---- project ----
 
 fn project_body() -> Value {
@@ -1103,9 +1100,9 @@ fn workload_list_body() -> Value {
         })
     };
     json!({"workloads": [
-        summary("db", json!({"replicas": 1}), "environment", 4),
-        summary("logs", json!("per_node"), "environment", 5),
-        summary("web", json!({"replicas": 3}), "cluster", 7),
+        summary("db", json!({"replicas": {"count": 1, "strategy": "spread"}}), "environment", 4),
+        summary("logs", json!("daemon"), "environment", 5),
+        summary("web", json!({"replicas": {"count": 3, "strategy": "pack"}}), "cluster", 7),
     ]})
 }
 
@@ -1125,10 +1122,10 @@ async fn app_ls_text_and_json() {
     assert_eq!(
         run_ok(&server, &args).await,
         "\
-NAME  PROJECT  ENVIRONMENT  SCALE     EXPOSE       FQDN
-db    shop     staging      1         environment  db.staging.shop.faber.internal
-logs  shop     staging      per-node  environment  logs.staging.shop.faber.internal
-web   shop     staging      3         cluster      web.staging.shop.faber.internal
+NAME  PROJECT  ENVIRONMENT  SCALE       EXPOSE       FQDN
+db    shop     staging      1 (spread)  environment  db.staging.shop.faber.internal
+logs  shop     staging      daemon      environment  logs.staging.shop.faber.internal
+web   shop     staging      3 (pack)    cluster      web.staging.shop.faber.internal
 "
     );
 
@@ -1171,27 +1168,20 @@ const WORKLOAD_ROUTE: &str = "/api/v1/projects/shop/environments/staging/workloa
 
 /// A workload that uses every part of the model.
 fn workload_body() -> Value {
-    let timing = |action: Value, delay: u32| {
-        json!({
-            "action": action, "initial_delay_secs": delay, "period_secs": 10,
-            "timeout_secs": 1, "success_threshold": 1, "failure_threshold": 3,
-        })
-    };
     json!({
         "project": "shop", "environment": "staging", "name": "web",
         "fqdn": "web.staging.shop.faber.internal", "revision": 7, "generation": 9,
         "spec": {
-            "scale": "per_node",
+            "scale": "daemon",
             "restart": "on_failure",
             "expose": "cluster",
-            "placement": {"node": "node-1"},
+            "placement": {"nodes": ["node-1", "node-2"]},
             "stop_grace_secs": 30,
             "volumes": {
-                "data": {"type": "named", "name": "data", "per_replica": true},
-                "host": {"type": "host_path", "path": "/srv/host", "create": false},
-                "tmp": {"type": "ephemeral", "memory": true, "size_bytes": 1024},
+                "data": {"type": "block", "size_bytes": 1_073_741_824},
+                "tmp": {"type": "ramdisk", "size_bytes": 1_048_576},
                 // Mounted by no container.
-                "spare": {"type": "ephemeral", "memory": false},
+                "spare": {"type": "block", "size_bytes": 2_097_152},
             },
             "containers": [
                 {
@@ -1209,21 +1199,18 @@ fn workload_body() -> Value {
                     "mounts": [
                         {"volume": "data", "path": "/data", "read_only": true,
                          "sub_path": "web"},
-                        {"volume": "host", "path": "/host", "read_only": false},
                         {"volume": "tmp", "path": "/tmp", "read_only": false},
                     ],
-                    "resources": {
-                        "limits": {"cpu_millis": 500, "memory_bytes": 268_435_456},
-                        "requests": {"cpu_millis": 100},
-                    },
+                    "resources": {"cpu_millis": 500, "memory_bytes": 268_435_456},
                     "capabilities": ["NET_BIND_SERVICE", "CHOWN"],
                     "read_only_root_fs": true,
-                    "liveness": timing(json!({"type": "tcp", "port": 8080}), 0),
-                    "readiness": timing(json!({
-                        "type": "http", "port": 8080, "path": "/ready", "scheme": "https",
-                        "host": "web.local", "headers": {"x-probe": "s3cret"},
-                    }), 5),
-                    "startup": timing(json!({"type": "exec", "command": ["true"]}), 0),
+                    "probe": {
+                        "action": {
+                            "type": "http", "port": 8080, "path": "/ready", "scheme": "https",
+                            "host": "web.local", "headers": {"x-probe": "s3cret"},
+                        },
+                        "interval_secs": 10, "timeout_secs": 2,
+                    },
                 },
                 {
                     "name": "sidecar",
@@ -1233,7 +1220,7 @@ fn workload_body() -> Value {
                     "env": {},
                     "ports": [],
                     "mounts": [],
-                    "resources": {"limits": {}, "requests": {}},
+                    "resources": {"cpu_millis": 1000, "memory_bytes": 1_073_741_824},
                     "capabilities": [],
                     "read_only_root_fs": false,
                 },
@@ -1249,16 +1236,15 @@ project:     shop
 environment: staging
 revision:    7
 generation:  9
-scale:       per-node
+scale:       daemon
 restart:     on-failure
 expose:      cluster
-node:        node-1
+nodes:       node-1, node-2
 stop_grace:  30s
 volumes:
-  data:  named data, per-replica
-  host:  host path /srv/host
-  spare: ephemeral
-  tmp:   ephemeral, memory, 1024 bytes
+  data:  block, 1073741824 bytes
+  spare: block, 2097152 bytes
+  tmp:   ramdisk, 1048576 bytes
 containers:
   web:
     image:             nginx:1.27
@@ -1270,17 +1256,13 @@ containers:
                        MODE=***
     ports:             http:8080/tcp
                        53/udp
-    mounts:            data:/data (named data, per-replica, read-only, sub-path web)
-                       host:/host (host path /srv/host)
-                       tmp:/tmp (ephemeral, memory, 1024 bytes)
-    resources:         limits: cpu 500m, memory 268435456 bytes
-                       requests: cpu 100m
+    mounts:            data:/data (block, 1073741824 bytes, read-only, sub-path web)
+                       tmp:/tmp (ramdisk, 1048576 bytes)
+    resources:         cpu 500m, memory 268435456 bytes
     capabilities:      NET_BIND_SERVICE, CHOWN
     read_only_root_fs: yes
-    liveness:          tcp :8080 (delay 0s, period 10s, timeout 1s, success 1, failure 3)
-    readiness:         https :8080/ready, host web.local, headers x-probe (delay 5s, period \
-10s, timeout 1s, success 1, failure 3)
-    startup:           exec true (delay 0s, period 10s, timeout 1s, success 1, failure 3)
+    probe:             https :8080/ready, host web.local, headers x-probe (interval 10s, \
+timeout 2s)
   sidecar:
     image:             busybox
     command:           -
@@ -1290,12 +1272,10 @@ containers:
     env:               -
     ports:             -
     mounts:            -
-    resources:         -
+    resources:         cpu 1000m, memory 1073741824 bytes
     capabilities:      -
     read_only_root_fs: no
-    liveness:          -
-    readiness:         -
-    startup:           -
+    probe:             -
 ";
 
 #[tokio::test]
@@ -1363,7 +1343,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
     let server = MockServer::start().await;
     let mut workload = workload_body();
     workload["fqdn"] = json!("web\u{1b}[2J.faber.internal");
-    workload["spec"]["placement"]["node"] = json!("node\r\n1");
+    workload["spec"]["placement"]["nodes"] = json!(["node\r\n1"]);
     let web = &mut workload["spec"]["containers"][0];
     web["image"] = json!("nginx\u{1b}]0;owned\u{7}");
     web["args"] = json!(["a\tb", "c\u{9b}d"]);
@@ -1371,7 +1351,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
     web["ports"][0]["name"] = json!("ht\u{7f}tp");
     web["mounts"][0]["path"] = json!("/da\u{1b}ta");
     web["capabilities"] = json!(["NET\u{1b}_ADMIN"]);
-    web["readiness"]["action"]["path"] = json!("/rea\u{1b}dy");
+    web["probe"]["action"]["path"] = json!("/rea\u{1b}dy");
     mount_json(&server, "GET", WORKLOAD_ROUTE, 200, workload).await;
 
     let mut list = workload_list_body();
@@ -1430,7 +1410,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
     let (out, _) = run_fx(&server, &show).await.ok();
     for want in [
         "fqdn:        web\\x1b[2J.faber.internal\n",
-        "node:        node\\x0d\\x0a1\n",
+        "nodes:       node\\x0d\\x0a1\n",
         "image:             nginx\\x1b]0;owned\\x07\n",
         "args:              a\\x09b c\\u{9b}d\n",
         "MODE=prod\\x0aname: fake\n",
@@ -1445,7 +1425,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
 
     let (out, _) = run_fx(&server, &["app", "ls"]).await.ok();
     assert!(
-        out.contains("d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1         environment  db\\x1bc\n"),
+        out.contains("d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1 (spread)  environment  db\\x1bc\n"),
         "{out}"
     );
 
@@ -1605,7 +1585,7 @@ async fn deploy_spec_text_puts_the_result_on_stdout_and_notes_on_stderr() {
 async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
     let server = MockServer::start().await;
     mount_deploy(&server, fixture_workloads("spec.json"), false, 1).await;
-    mount_deploy(&server, fixture_workloads("host-path.json"), false, 1).await;
+    mount_deploy(&server, fixture_workloads("volume.json"), false, 1).await;
 
     let args = with_target(&["-o", "json", "deploy", "spec", "spec.json"], &[]);
     let (out, err) = run_fx(&server, &args).await.ok();
@@ -1622,7 +1602,7 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         })
     );
 
-    let args = with_target(&["-o", "json", "deploy", "spec", "host-path.json"], &[]);
+    let args = with_target(&["-o", "json", "deploy", "spec", "volume.json"], &[]);
     let (out, err) = run_fx(&server, &args).await.ok();
     assert_eq!(err, "");
     let v: Value = serde_json::from_str(&out).unwrap();
@@ -1630,12 +1610,7 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         v,
         json!({
             "result": deploy_body(),
-            "warnings": [{
-                "source": "host-path.json",
-                "path": "web.volumes.data",
-                "message": "host path /srv/data: host paths are refused by nodes unless \
-                            allowed in the node's host-path allow-list",
-            }],
+            "warnings": [],
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
             "variables": [],
         })
@@ -1677,7 +1652,7 @@ async fn deploy_dry_run_prints_the_spec_and_sends_nothing() {
     assert_eq!(v, fixture_workloads("spec.json"));
 
     let args = with_target(
-        &["-o", "json", "deploy", "spec", "host-path.json"],
+        &["-o", "json", "deploy", "spec", "volume.json"],
         &["--dry-run"],
     );
     let (out, err) = run_fx(&server, &args).await.ok();
@@ -1688,16 +1663,11 @@ async fn deploy_dry_run_prints_the_spec_and_sends_nothing() {
         json!({
             "project": "shop",
             "environment": "staging",
-            "spec": fixture_workloads("host-path.json"),
-            "warnings": [{
-                "source": "host-path.json",
-                "path": "web.volumes.data",
-                "message": "host path /srv/data: host paths are refused by nodes unless \
-                            allowed in the node's host-path allow-list",
-            }],
+            "spec": fixture_workloads("volume.json"),
+            "warnings": [],
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
             "variables": [],
-            "files": ["host-path.json"],
+            "files": ["volume.json"],
         })
     );
 }
@@ -1708,23 +1678,20 @@ async fn deploy_dry_run_prints_the_spec_and_sends_nothing() {
 #[tokio::test]
 async fn deploy_spec_dry_run_lists_the_file_it_read() {
     let server = MockServer::start().await;
-    mount_deploy(&server, fixture_workloads("host-path.json"), false, 1).await;
+    mount_deploy(&server, fixture_workloads("volume.json"), false, 1).await;
 
-    let args = with_target(&["deploy", "spec", "host-path.json"], &["--dry-run"]);
+    let args = with_target(&["deploy", "spec", "volume.json"], &["--dry-run"]);
     let (_, err) = run_fx(&server, &args).await.ok();
-    assert_eq!(
-        err,
-        format!("{WARNING_HOST_PATH}read: host-path.json\n{NOTE_SECRETS}")
-    );
+    assert_eq!(err, format!("read: volume.json\n{NOTE_SECRETS}"));
 
     // An absolute path below the current directory is shown relative.
-    let absolute = fixtures().join("host-path.json");
+    let absolute = fixtures().join("volume.json");
     let args = with_target(
         &["deploy", "spec", absolute.to_str().unwrap()],
         &["--dry-run"],
     );
     let (_, err) = run_fx(&server, &args).await.ok();
-    assert!(err.contains("\nread: host-path.json\n"), "{err}");
+    assert!(err.starts_with("read: volume.json\n"), "{err}");
 
     // Stdin is `-`, and a path that is not below it stays as it is.
     let text = std::fs::read_to_string(&absolute).unwrap();
@@ -1742,9 +1709,9 @@ async fn deploy_spec_dry_run_lists_the_file_it_read() {
     assert_eq!(v["files"], json!([real(&absolute)]));
 
     // Without --dry-run: no list, in either format.
-    let args = with_target(&["deploy", "spec", "host-path.json"], &[]);
+    let args = with_target(&["deploy", "spec", "volume.json"], &[]);
     let (_, err) = run_fx(&server, &args).await.ok();
-    assert_eq!(err, format!("{WARNING_HOST_PATH}{NOTE_SECRETS}"));
+    assert_eq!(err, NOTE_SECRETS);
 }
 
 #[tokio::test]
@@ -1763,13 +1730,13 @@ async fn deploy_json_of_a_sent_deploy_has_no_file_list() {
 #[tokio::test]
 async fn deploy_spec_reads_back_what_dry_run_printed() {
     let dry = silent_server().await;
-    let args = with_target(&["deploy", "spec", "host-path.json"], &["--dry-run"]);
+    let args = with_target(&["deploy", "spec", "volume.json"], &["--dry-run"]);
     let (printed, _) = run_fx(&dry, &args).await.ok();
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("printed.json"), &printed).unwrap();
     let server = MockServer::start().await;
-    mount_deploy(&server, fixture_workloads("host-path.json"), false, 2).await;
+    mount_deploy(&server, fixture_workloads("volume.json"), false, 2).await;
 
     let args = with_target(&["deploy", "spec", "printed.json"], &[]);
     let (out, _) = run_in(&server, &args, dir.path(), "").await.ok();
@@ -1828,32 +1795,15 @@ async fn deploy_expose_of_a_workload_the_input_does_not_have_is_an_error() {
 }
 
 #[tokio::test]
-async fn deploy_warnings_go_to_stderr_and_do_not_stop_the_deploy() {
+async fn deploy_notes_go_to_stderr_and_do_not_stop_the_deploy() {
     let server = MockServer::start().await;
-    mount_deploy(&server, fixture_workloads("host-path.json"), false, 1).await;
+    mount_deploy(&server, fixture_workloads("volume.json"), false, 1).await;
 
-    let args = with_target(&["deploy", "spec", "host-path.json"], &[]);
+    let args = with_target(&["deploy", "spec", "volume.json"], &[]);
     let (out, err) = run_fx(&server, &args).await.ok();
     assert_eq!(out, DEPLOY_TEXT);
     // The container adds a capability, so that note is absent.
-    assert_eq!(err, format!("{WARNING_HOST_PATH}{NOTE_SECRETS}"));
-}
-
-#[tokio::test]
-async fn deploy_strict_fails_on_a_warning_and_sends_nothing() {
-    let server = silent_server().await;
-    for tail in [&["--strict"][..], &["--strict", "--dry-run"]] {
-        for format in ["text", "json"] {
-            let args = with_target(&["-o", format, "deploy", "spec", "host-path.json"], tail);
-            let outcome = run_fx(&server, &args).await;
-            assert_eq!(
-                outcome.failed(),
-                "nothing was deployed: --strict turns a warning into an error"
-            );
-            assert_eq!(outcome.out, "");
-            assert_eq!(outcome.err, WARNING_HOST_PATH);
-        }
-    }
+    assert_eq!(err, NOTE_SECRETS);
 }
 
 /// A note is not a warning: `--strict` lets it through.
@@ -1965,7 +1915,7 @@ async fn deploy_refused_by_the_api_is_readable() {
                 format,
                 "deploy",
                 "spec",
-                "host-path.json",
+                "volume.json",
                 "--project",
                 "shop",
                 "--env",
@@ -1978,7 +1928,7 @@ async fn deploy_refused_by_the_api_is_readable() {
             // they are there although it failed. JSON mode has no
             // document on stdout, so it writes one line of JSON here.
             if format == "text" {
-                assert_eq!(outcome.err, format!("{WARNING_HOST_PATH}{NOTE_SECRETS}"));
+                assert_eq!(outcome.err, NOTE_SECRETS);
                 continue;
             }
             assert_eq!(outcome.err.matches('\n').count(), 1, "{}", outcome.err);
@@ -1987,12 +1937,7 @@ async fn deploy_refused_by_the_api_is_readable() {
             assert_eq!(
                 v,
                 json!({
-                    "warnings": [{
-                        "source": "host-path.json",
-                        "path": "web.volumes.data",
-                        "message": "host path /srv/data: host paths are refused by nodes \
-                                    unless allowed in the node's host-path allow-list",
-                    }],
+                    "warnings": [],
                     "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
                     "variables": [],
                 })

@@ -9,7 +9,7 @@
     ]
   },
   "web": {
-    "scale": { "replicas": 2 },
+    "scale": { "replicas": { "count": 2 } },
     "containers": [
       {
         "name": "web",

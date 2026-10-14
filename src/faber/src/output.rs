@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use clap::ValueEnum;
 use faber_api_types::workload::{
     ContainerSpec, DeployResponse, Exposure, HttpScheme, MountSpec, PortSpec, Probe, ProbeAction,
-    ProjectListResponse, ProjectResponse, Protocol, ResourceAmounts, RestartPolicy, Scale,
+    ProjectListResponse, ProjectResponse, Protocol, Resources, RestartPolicy, Scale, Strategy,
     VolumeSource, WorkloadListResponse, WorkloadResponse, WorkloadSpec,
 };
 use faber_api_types::{ClusterStatus, HealthResponse, InviteResponse, LeaseResponse};
@@ -351,8 +351,14 @@ pub fn environment_removed(
 
 fn scale(scale: Scale) -> String {
     match scale {
-        Scale::Replicas(n) => n.to_string(),
-        Scale::PerNode => "per-node".to_string(),
+        Scale::Replicas { count, strategy } => {
+            let strategy = match strategy {
+                Strategy::Spread => "spread",
+                Strategy::Pack => "pack",
+            };
+            format!("{count} ({strategy})")
+        }
+        Scale::Daemon => "daemon".to_string(),
     }
 }
 
@@ -434,34 +440,13 @@ fn port(p: &PortSpec) -> String {
     }
 }
 
-/// What a volume is, in parts: `named data`, `per-replica`.
+/// What a volume is, in parts: `block`, `1073741824 bytes`.
 fn volume(source: &VolumeSource) -> Vec<String> {
-    match source {
-        VolumeSource::HostPath { path, create } => {
-            let mut d = vec![format!("host path {}", esc(path))];
-            if *create {
-                d.push("create".to_string());
-            }
-            d
-        }
-        VolumeSource::Named { name, per_replica } => {
-            let mut d = vec![format!("named {}", esc(name))];
-            if *per_replica {
-                d.push("per-replica".to_string());
-            }
-            d
-        }
-        VolumeSource::Ephemeral { memory, size_bytes } => {
-            let mut d = vec!["ephemeral".to_string()];
-            if *memory {
-                d.push("memory".to_string());
-            }
-            if let Some(size) = size_bytes {
-                d.push(format!("{size} bytes"));
-            }
-            d
-        }
-    }
+    let (kind, size_bytes) = match source {
+        VolumeSource::Block { size_bytes } => ("block", size_bytes),
+        VolumeSource::Ramdisk { size_bytes } => ("ramdisk", size_bytes),
+    };
+    vec![kind.to_string(), format!("{size_bytes} bytes")]
 }
 
 /// `data:/data (named data, read-only)`: the volume, where it is mounted,
@@ -485,17 +470,9 @@ fn mount(m: &MountSpec, volumes: &BTreeMap<String, VolumeSource>) -> String {
     )
 }
 
-/// `limits: cpu 500m, memory 268435456 bytes`, or nothing when no amount
-/// is set.
-fn amounts(label: &str, a: &ResourceAmounts) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(cpu) = a.cpu_millis {
-        parts.push(format!("cpu {cpu}m"));
-    }
-    if let Some(memory) = a.memory_bytes {
-        parts.push(format!("memory {memory} bytes"));
-    }
-    (!parts.is_empty()).then(|| format!("{label}: {}", parts.join(", ")))
+/// `cpu 500m, memory 268435456 bytes`: the most the container may use.
+fn resources(r: &Resources) -> String {
+    format!("cpu {}m, memory {} bytes", r.cpu_millis, r.memory_bytes)
 }
 
 /// What a probe does and how often. An HTTP probe shows the names of its
@@ -505,14 +482,6 @@ fn probe(p: Option<&Probe>) -> Vec<String> {
         return Vec::new();
     };
     let action = match &p.action {
-        ProbeAction::Exec { command } => {
-            let mut s = "exec".to_string();
-            for line in words(command) {
-                s.push(' ');
-                s.push_str(&line);
-            }
-            s
-        }
         ProbeAction::Http {
             port,
             path,
@@ -536,12 +505,8 @@ fn probe(p: Option<&Probe>) -> Vec<String> {
         ProbeAction::Tcp { port } => format!("tcp :{port}"),
     };
     vec![format!(
-        "{action} (delay {}s, period {}s, timeout {}s, success {}, failure {})",
-        p.initial_delay_secs,
-        p.period_secs,
-        p.timeout_secs,
-        p.success_threshold,
-        p.failure_threshold
+        "{action} (interval {}s, timeout {}s)",
+        p.interval_secs, p.timeout_secs
     )]
 }
 
@@ -567,10 +532,6 @@ fn container(c: &ContainerSpec, spec: &WorkloadSpec, show_env: bool) -> String {
             format!("{}={value}", esc(name))
         })
         .collect();
-    let resources = [
-        amounts("limits", &c.resources.limits),
-        amounts("requests", &c.resources.requests),
-    ];
     let mut s = format!("  {}:\n", esc(&c.name));
     s.push_str(&fields(
         "    ",
@@ -586,12 +547,10 @@ fn container(c: &ContainerSpec, spec: &WorkloadSpec, show_env: bool) -> String {
                 "mounts",
                 c.mounts.iter().map(|m| mount(m, &spec.volumes)).collect(),
             ),
-            ("resources", resources.into_iter().flatten().collect()),
+            ("resources", vec![resources(&c.resources)]),
             ("capabilities", vec![names(&c.capabilities)]),
             ("read_only_root_fs", vec![yes_no(c.read_only_root_fs)]),
-            ("liveness", probe(c.liveness.as_ref())),
-            ("readiness", probe(c.readiness.as_ref())),
-            ("startup", probe(c.startup.as_ref())),
+            ("probe", probe(c.probe.as_ref())),
         ],
     ));
     s
@@ -612,7 +571,6 @@ pub fn workload(format: OutputFormat, w: &WorkloadResponse, show_env: bool) -> R
         RestartPolicy::OnFailure => "on-failure",
         RestartPolicy::Never => "never",
     };
-    let node = spec.placement.node.as_deref();
     let mut s = aligned(&[
         ("name", esc(&w.name)),
         ("fqdn", esc(&w.fqdn)),
@@ -623,7 +581,7 @@ pub fn workload(format: OutputFormat, w: &WorkloadResponse, show_env: bool) -> R
         ("scale", scale(spec.scale)),
         ("restart", restart.to_string()),
         ("expose", exposure(spec.expose).to_string()),
-        ("node", node.map_or_else(none, esc)),
+        ("nodes", names(&spec.placement.nodes)),
         (
             "stop_grace",
             spec.stop_grace_secs
