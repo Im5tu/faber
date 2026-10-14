@@ -767,9 +767,11 @@ dependencies = [
 name = "faber-node-protocol"
 version = "0.1.0"
 dependencies = [
+ "faber-api-types",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
