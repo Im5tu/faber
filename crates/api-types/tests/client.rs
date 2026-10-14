@@ -866,7 +866,10 @@ async fn workload_list_sends_the_filters_that_are_set() {
         .await;
 
     let c = client(&server);
-    let got = c.workload_list(&WorkloadQuery::default()).await.unwrap();
+    let got = c
+        .workload_list(&WorkloadQuery::default(), false)
+        .await
+        .unwrap();
     assert_eq!(got.workloads.len(), 1);
     assert_eq!(got.workloads[0].fqdn, "web.staging.shop.faber.internal");
     assert_eq!(
@@ -888,7 +891,7 @@ async fn workload_list_sends_the_filters_that_are_set() {
             project: project.map(String::from),
             environment: environment.map(String::from),
         };
-        c.workload_list(&query).await.unwrap();
+        c.workload_list(&query, false).await.unwrap();
     }
 
     let received = server.received_requests().await.unwrap();
@@ -919,7 +922,10 @@ async fn workload_list_errors_are_decoded() {
         project: Some("shop".into()),
         environment: None,
     };
-    let err = client(&server).workload_list(&query).await.unwrap_err();
+    let err = client(&server)
+        .workload_list(&query, false)
+        .await
+        .unwrap_err();
     assert_api_error(err, 404, error_code::NOT_FOUND);
 }
 
@@ -934,7 +940,7 @@ async fn workload_get_returns_the_workload() {
         .await;
 
     let got = client(&server)
-        .workload_get("shop", "staging", "web")
+        .workload_get("shop", "staging", "web", false)
         .await
         .unwrap();
     assert_eq!(got.project, "shop");
@@ -945,6 +951,41 @@ async fn workload_get_returns_the_workload() {
     assert_eq!(got.generation, 9);
     assert_eq!(got.spec.containers[0].image, "nginx");
     assert_eq!(got.spec.containers[0].env["MODE"], "prod");
+}
+
+#[tokio::test]
+async fn reveal_is_sent_only_when_asked_for() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(WORKLOAD_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workload_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workloads"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"workloads": []})))
+        .mount(&server)
+        .await;
+
+    let c = client(&server);
+    c.workload_get("shop", "staging", "web", false)
+        .await
+        .unwrap();
+    c.workload_get("shop", "staging", "web", true)
+        .await
+        .unwrap();
+    let query = WorkloadQuery {
+        project: Some("shop".into()),
+        environment: None,
+    };
+    c.workload_list(&query, true).await.unwrap();
+
+    let received = server.received_requests().await.unwrap();
+    let queries: Vec<Option<&str>> = received.iter().map(|r| r.url.query()).collect();
+    assert_eq!(
+        queries,
+        [None, Some("reveal=true"), Some("project=shop&reveal=true")]
+    );
 }
 
 #[tokio::test]
@@ -959,7 +1000,7 @@ async fn workload_get_errors_are_decoded() {
         .await;
 
     let err = client(&server)
-        .workload_get("shop", "staging", "web")
+        .workload_get("shop", "staging", "web", false)
         .await
         .unwrap_err();
     let body = assert_api_error(err, 404, error_code::NOT_FOUND);
@@ -1049,11 +1090,17 @@ async fn names_are_checked_before_anything_is_sent() {
     let err = c.deploy("shop", bad, &req).await.unwrap_err();
     assert_refused(&server, err, &environment).await;
 
-    let err = c.workload_get(bad, "staging", "web").await.unwrap_err();
+    let err = c
+        .workload_get(bad, "staging", "web", false)
+        .await
+        .unwrap_err();
     assert_refused(&server, err, &project).await;
-    let err = c.workload_get("shop", bad, "web").await.unwrap_err();
+    let err = c.workload_get("shop", bad, "web", false).await.unwrap_err();
     assert_refused(&server, err, &environment).await;
-    let err = c.workload_get("shop", "staging", bad).await.unwrap_err();
+    let err = c
+        .workload_get("shop", "staging", bad, false)
+        .await
+        .unwrap_err();
     assert_refused(&server, err, &workload).await;
     let err = c.workload_delete(bad, "staging", "web").await.unwrap_err();
     assert_refused(&server, err, &project).await;
@@ -1066,13 +1113,13 @@ async fn names_are_checked_before_anything_is_sent() {
         project: Some("shop&environment=production".into()),
         environment: None,
     };
-    let err = c.workload_list(&query).await.unwrap_err();
+    let err = c.workload_list(&query, false).await.unwrap_err();
     assert_refused(&server, err, &project).await;
     let query = WorkloadQuery {
         project: None,
         environment: Some("a b".into()),
     };
-    let err = c.workload_list(&query).await.unwrap_err();
+    let err = c.workload_list(&query, false).await.unwrap_err();
     assert_refused(&server, err, &environment).await;
 }
 
@@ -1166,8 +1213,8 @@ async fn project_and_workload_calls_time_out_by_kind() {
     let c = FaberClient::with_timeouts(&server.uri(), timeouts).unwrap();
     assert_timeout(c.project_list().await);
     assert_timeout(c.project_get("shop").await);
-    assert_timeout(c.workload_list(&all).await);
-    assert_timeout(c.workload_get("shop", "staging", "web").await);
+    assert_timeout(c.workload_list(&all, false).await);
+    assert_timeout(c.workload_get("shop", "staging", "web", false).await);
     // The slower answers still fit the write timeout.
     c.project_create(&create).await.unwrap();
     c.project_delete("shop").await.unwrap();
@@ -1189,5 +1236,11 @@ async fn project_and_workload_calls_time_out_by_kind() {
     assert_timeout(c.deploy("shop", "staging", &deploy).await);
     assert_timeout(c.workload_delete("shop", "staging", "web").await);
     assert!(c.project_list().await.unwrap().projects.is_empty());
-    assert!(c.workload_list(&all).await.unwrap().workloads.is_empty());
+    assert!(
+        c.workload_list(&all, false)
+            .await
+            .unwrap()
+            .workloads
+            .is_empty()
+    );
 }

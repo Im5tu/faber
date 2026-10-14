@@ -72,6 +72,9 @@ pub mod error_code {
     /// A count or size limit of the workload model is reached: projects,
     /// environments, workloads, or stored bytes (409).
     pub const WORKLOADS_EXHAUSTED: &str = "workloads_exhausted";
+    /// The cluster key is missing or wrong on the node that has to seal or
+    /// open env values, or a stored data key cannot be opened with it (503).
+    pub const KEY_UNAVAILABLE: &str = "key_unavailable";
     /// The node is up but cannot work: its raft core has stopped or its
     /// storage is closed (503 from `GET /api/v1/health`).
     pub const UNAVAILABLE: &str = "unavailable";

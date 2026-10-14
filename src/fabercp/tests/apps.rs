@@ -189,7 +189,7 @@ async fn projects_and_workloads_replicate_through_followers() {
     assert!(g1 > g0, "{g1} > {g0}");
     assert_eq!(first.created, names(&["api", "web"]));
     assert!(first.updated.is_empty() && first.unchanged.is_empty() && first.removed.is_empty());
-    let read = f3.workload_get("shop", "staging", "web").await.unwrap();
+    let read = f3.workload_get("shop", "staging", "web", true).await.unwrap();
     assert_eq!(read.spec, web);
     assert_eq!((read.revision, read.generation), (g1, g1));
     assert_eq!(read.fqdn, "web.staging.shop.faber.internal");
@@ -244,7 +244,7 @@ async fn projects_and_workloads_replicate_through_followers() {
     assert!(g2 > g1);
     assert_eq!(second.updated, names(&["web"]));
     assert_eq!(second.unchanged, names(&["api"]));
-    let read = f3.workload_get("shop", "staging", "web").await.unwrap();
+    let read = f3.workload_get("shop", "staging", "web", true).await.unwrap();
     assert_eq!((read.revision, read.generation), (g1, g2));
     assert_eq!(read.spec, scaled);
 
@@ -259,14 +259,14 @@ async fn projects_and_workloads_replicate_through_followers() {
     assert!(g3 > g2);
     assert_eq!(third.updated, names(&["web"]));
     assert!(third.unchanged.is_empty() && third.removed.is_empty());
-    let read = f2.workload_get("shop", "staging", "web").await.unwrap();
+    let read = f2.workload_get("shop", "staging", "web", true).await.unwrap();
     assert_eq!((read.revision, read.generation), (g3, g3));
-    let read = f2.workload_get("shop", "staging", "api").await.unwrap();
+    let read = f2.workload_get("shop", "staging", "api", true).await.unwrap();
     assert_eq!((read.revision, read.generation), (g1, g3));
 
     assert_converged(&nodes).await;
     let all = WorkloadQuery::default();
-    let listed = leader.workload_list(&all).await.unwrap();
+    let listed = leader.workload_list(&all, false).await.unwrap();
     let rows: Vec<_> = listed
         .workloads
         .iter()
@@ -296,7 +296,7 @@ async fn projects_and_workloads_replicate_through_followers() {
         ]
     );
     for follower in [&f2, &f3] {
-        assert_eq!(follower.workload_list(&all).await.unwrap(), listed);
+        assert_eq!(follower.workload_list(&all, false).await.unwrap(), listed);
     }
 
     // What the leader refuses, a follower refuses with the same status,
@@ -360,9 +360,9 @@ async fn projects_and_workloads_replicate_through_followers() {
     assert_eq!(pruned.unchanged, names(&["api"]));
     assert_converged(&nodes).await;
     for c in [&leader, &f2, &f3] {
-        let (status, code, _) = refused(c.workload_get("shop", "staging", "web").await);
+        let (status, code, _) = refused(c.workload_get("shop", "staging", "web", true).await);
         assert_eq!((status, code.as_str()), (404, error_code::NOT_FOUND));
-        let api = c.workload_get("shop", "staging", "api").await.unwrap();
+        let api = c.workload_get("shop", "staging", "api", true).await.unwrap();
         assert_eq!((api.revision, api.generation), (g1, g4));
     }
 
@@ -400,7 +400,7 @@ async fn projects_and_workloads_replicate_through_followers() {
     // ports, so the leader no longer reaches it.
     let projects = nodes[2].handle().state().projects().unwrap();
     let environments = nodes[2].handle().state().environments().unwrap();
-    let workload = f3.workload_get("blog", "dev", "site").await.unwrap();
+    let workload = f3.workload_get("blog", "dev", "site", true).await.unwrap();
     assert_eq!(workload.spec, site);
     nodes[2].restart().await;
     assert_eq!(nodes[2].handle().state().projects().unwrap(), projects);
@@ -410,7 +410,7 @@ async fn projects_and_workloads_replicate_through_followers() {
     );
     let restarted = client(&nodes[2]);
     assert_eq!(
-        restarted.workload_get("blog", "dev", "site").await.unwrap(),
+        restarted.workload_get("blog", "dev", "site", true).await.unwrap(),
         workload
     );
     let (status, code, _) = refused(restarted.project_get("shop").await);
@@ -436,7 +436,7 @@ async fn state_survives_a_restart_and_generations_go_on() {
             .unwrap();
         let shop_after = c.project_get("shop").await.unwrap();
         assert_ne!(shop_after, shop);
-        let read = c.workload_get("shop", "staging", "web").await.unwrap();
+        let read = c.workload_get("shop", "staging", "web", true).await.unwrap();
         (shop_after, deployed, read)
     };
 
@@ -445,7 +445,7 @@ async fn state_survives_a_restart_and_generations_go_on() {
     // Readable before any election.
     assert_eq!(c.project_get("shop").await.unwrap(), shop);
     assert_eq!(
-        c.workload_get("shop", "staging", "web").await.unwrap(),
+        c.workload_get("shop", "staging", "web", true).await.unwrap(),
         read
     );
 
@@ -547,16 +547,16 @@ async fn a_late_joiner_gets_projects_and_workloads_from_a_snapshot() {
         c2.project_list().await.unwrap(),
         c1.project_list().await.unwrap()
     );
-    let web = c2.workload_get("shop", "staging", "web").await.unwrap();
+    let web = c2.workload_get("shop", "staging", "web", true).await.unwrap();
     assert_eq!(web.spec, spec("nginx:1.29"));
     assert_eq!((web.revision, web.generation), (last, last));
     assert_eq!(
         web,
-        c1.workload_get("shop", "staging", "web").await.unwrap()
+        c1.workload_get("shop", "staging", "web", true).await.unwrap()
     );
     // `api` never changed after the first deploy, so its revision is older
     // than anything left in the log.
-    let api_read = c2.workload_get("shop", "staging", "api").await.unwrap();
+    let api_read = c2.workload_get("shop", "staging", "api", true).await.unwrap();
     assert!(api_read.revision < 20, "{}", api_read.revision);
     let blog = c2.project_get("blog").await.unwrap();
     let environments: Vec<(&str, u32)> = blog
@@ -573,7 +573,7 @@ async fn a_late_joiner_gets_projects_and_workloads_from_a_snapshot() {
         .unwrap();
     assert_eq!(done.created, names(&["api"]));
     assert!(done.generation > end);
-    let read = c2.workload_get("shop", "production", "api").await.unwrap();
+    let read = c2.workload_get("shop", "production", "api", true).await.unwrap();
     assert_eq!(
         (read.revision, read.generation),
         (done.generation, done.generation)

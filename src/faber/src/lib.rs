@@ -423,7 +423,10 @@ pub async fn run_with_inputs(
                 project,
                 environment,
             };
-            output::workloads(format, &client.workload_list(&query).await.map_err(api)?)?
+            output::workloads(
+                format,
+                &client.workload_list(&query, true).await.map_err(api)?,
+            )?
         }
         Command::App(AppCommand::Show {
             workload,
@@ -431,7 +434,7 @@ pub async fn run_with_inputs(
             show_env,
         }) => {
             let found = client
-                .workload_get(&target.project, &target.environment, &workload)
+                .workload_get(&target.project, &target.environment, &workload, true)
                 .await;
             output::workload(format, &found.map_err(api)?, show_env)?
         }

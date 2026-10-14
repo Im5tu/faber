@@ -218,10 +218,12 @@ impl FaberClient {
     }
 
     /// `GET /api/v1/workloads`, filtered by `query.project` and
-    /// `query.environment` when they are set.
+    /// `query.environment` when they are set. With `reveal` the request
+    /// carries `reveal=true`; a summary holds no env value either way.
     pub async fn workload_list(
         &self,
         query: &WorkloadQuery,
+        reveal: bool,
     ) -> Result<WorkloadListResponse, ClientError> {
         // A DNS label needs no escaping in a query either.
         let mut filters = Vec::new();
@@ -233,6 +235,9 @@ impl FaberClient {
             check_name("environment", environment)?;
             filters.push(format!("environment={environment}"));
         }
+        if reveal {
+            filters.push("reveal=true".to_string());
+        }
         let path = if filters.is_empty() {
             "/api/v1/workloads".to_string()
         } else {
@@ -242,14 +247,19 @@ impl FaberClient {
     }
 
     /// `GET /api/v1/projects/{project}/environments/{environment}/workloads/{workload}`.
-    /// The answer carries env values in clear.
+    /// Env values come back as `***` unless `reveal` is set; then the
+    /// answer carries them in clear.
     pub async fn workload_get(
         &self,
         project: &str,
         environment: &str,
         workload: &str,
+        reveal: bool,
     ) -> Result<WorkloadResponse, ClientError> {
-        let path = workload_path(project, environment, workload)?;
+        let mut path = workload_path(project, environment, workload)?;
+        if reveal {
+            path.push_str("?reveal=true");
+        }
         send_json(self.request(Method::GET, &path)).await
     }
 
