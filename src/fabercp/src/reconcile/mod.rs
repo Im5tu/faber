@@ -22,6 +22,9 @@
 //! then `runtime.reconcile`. A failing step does not skip the other; any
 //! failure is logged and the loop backs off.
 
+pub mod containers;
+pub mod services;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::Ipv4Addr;

@@ -19,6 +19,7 @@ pub mod api;
 pub mod apps;
 pub mod bind;
 pub mod config;
+pub mod dns;
 pub mod dto;
 pub mod error;
 pub mod guard;
@@ -26,9 +27,13 @@ pub mod lease;
 pub mod mcp;
 pub mod mesh;
 pub mod peer;
+pub mod placement;
 pub mod raft;
 pub mod reconcile;
+pub mod runner;
+pub mod secrets;
 pub mod service;
+pub mod status;
 
 #[cfg(test)]
 pub(crate) mod testing;
