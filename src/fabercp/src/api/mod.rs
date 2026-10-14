@@ -36,6 +36,8 @@ pub fn router(service: FaberService) -> Router {
 ///   reachable over the mesh.
 /// - `GET` and `PUT /api/v1/mesh/lease` read and set how long a node's lease
 ///   lasts. Setting it is an admin action on the whole cluster.
+/// - `GET` and `PUT /api/v1/mesh/status-interval` read and set how often
+///   nodes report their status, for the whole cluster.
 /// - The project and workload routes ([`apps::routes`]): a spec carries env
 ///   values, and the peer listener also admits machines that only hold an
 ///   invite.
@@ -46,6 +48,10 @@ pub fn local_router(service: FaberService) -> Router {
     let api = base_routes()
         .route("/mesh/invites", post(mesh::create_invite))
         .route("/mesh/lease", get(mesh::lease).put(mesh::set_lease))
+        .route(
+            "/mesh/status-interval",
+            get(mesh::status_interval).put(mesh::set_status_interval),
+        )
         .merge(apps::routes())
         .with_state(service);
     Router::new().nest("/api/v1", api)
@@ -228,6 +234,127 @@ mod tests {
         // The loopback listener has no internal routes.
         let resp = local(&node).oneshot(post_lease(600)).await.unwrap();
         assert_ne!(resp.status().as_u16(), 200);
+        node.shutdown().await;
+    }
+
+    fn json_request(method: Method, uri: &str, host: &str, body: Option<&str>) -> Request<Body> {
+        let rb = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, host);
+        match body {
+            Some(json) => rb
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json.to_string())),
+            None => rb.body(Body::empty()),
+        }
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_status_interval_routes_read_and_set_the_interval() {
+        use faber_api_types::StatusIntervalResponse;
+
+        let node = TestNode::start_initialized().await;
+        let uri = "/api/v1/mesh/status-interval";
+        let get = || json_request(Method::GET, uri, "127.0.0.1:7400", None);
+        let put = |body: &str| json_request(Method::PUT, uri, "localhost:7400", Some(body));
+
+        let (status, body): (_, StatusIntervalResponse) = send(local(&node), get()).await;
+        assert_eq!((status, body.interval_secs), (200, 5));
+        let (status, body): (_, StatusIntervalResponse) =
+            send(local(&node), put(r#"{"interval_secs": 30}"#)).await;
+        assert_eq!((status, body.interval_secs), (200, 30));
+        let (_, body): (_, StatusIntervalResponse) = send(local(&node), get()).await;
+        assert_eq!(body.interval_secs, 30);
+
+        for bad in [
+            r#"{"interval_secs": 0}"#,
+            r#"{"interval_secs": 301}"#,
+            r#"{"interval_secs": "soon"}"#,
+        ] {
+            let (status, body): (_, ErrorBody) = send(local(&node), put(bad)).await;
+            assert_eq!(
+                (status, body.error.as_str()),
+                (400, error_code::BAD_REQUEST),
+                "{bad}"
+            );
+        }
+        let (_, body): (_, StatusIntervalResponse) = send(local(&node), get()).await;
+        assert_eq!(body.interval_secs, 30);
+
+        // Loopback listener only.
+        let host = node.peer_addr.to_string();
+        let req = json_request(Method::GET, uri, &host, None);
+        let (status, _): (_, ErrorBody) = send(peer(&node), req).await;
+        assert_eq!(status, 404);
+        node.shutdown().await;
+    }
+
+    /// The internal routes on the peer listener are what a follower forwards
+    /// to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_peer_status_routes_set_the_interval_and_take_a_report() {
+        use faber_api_types::StatusIntervalResponse;
+
+        let node = TestNode::start_initialized().await;
+        seed_mesh(&node).await;
+        let host = node.peer_addr.to_string();
+        let post = |uri: &str, body: String| json_request(Method::POST, uri, &host, Some(&body));
+
+        let (status, body): (_, StatusIntervalResponse) = send(
+            peer(&node),
+            post(
+                "/raft/cluster/status-interval",
+                r#"{"interval_secs": 10}"#.into(),
+            ),
+        )
+        .await;
+        assert_eq!((status, body.interval_secs), (200, 10));
+        let (status, err): (_, ErrorBody) = send(
+            peer(&node),
+            post(
+                "/raft/cluster/status-interval",
+                r#"{"interval_secs": 0}"#.into(),
+            ),
+        )
+        .await;
+        assert_eq!((status, err.error.as_str()), (400, error_code::BAD_REQUEST));
+
+        let report = |node_id: u64, instance_id: &str| {
+            format!(
+                r#"{{"node_id": {node_id}, "instance_id": "{instance_id}",
+                    "capacity": {{"cpu_millis": 1000, "memory_bytes": 1, "disk_bytes": 2}},
+                    "replicas": []}}"#
+            )
+        };
+        let machine = "ab".repeat(16);
+        let resp = peer(&node)
+            .oneshot(post("/raft/cluster/status", report(1, &machine)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
+        let statuses = node.state().statuses().unwrap();
+        assert_eq!(statuses.keys().copied().collect::<Vec<_>>(), vec![1]);
+
+        // Unknown node, and an instance id that is no id.
+        let (status, err): (_, ErrorBody) = send(
+            peer(&node),
+            post("/raft/cluster/status", report(9, &machine)),
+        )
+        .await;
+        assert_eq!(
+            (status, err.error.as_str()),
+            (409, error_code::MESH_NODE_REMOVED)
+        );
+        let (status, err): (_, ErrorBody) =
+            send(peer(&node), post("/raft/cluster/status", report(1, "nope"))).await;
+        assert_eq!((status, err.error.as_str()), (400, error_code::BAD_REQUEST));
+
+        // The replication status stays a GET on the same path.
+        let req = json_request(Method::GET, "/raft/cluster/status", &host, None);
+        let resp = peer(&node).oneshot(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
         node.shutdown().await;
     }
 }

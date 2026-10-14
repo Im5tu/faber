@@ -10,6 +10,8 @@
 //! | `POST /raft/cluster/renew` | restarts a node's lease | forwards once | the node itself, or a registered node forwarding |
 //! | `POST /raft/cluster/lease` | sets the lease duration | forwards once | a registered node |
 //! | `POST /raft/cluster/workloads` | one of the six project and workload writes | forwards once | a registered node |
+//! | `POST /raft/cluster/status` | replaces a node's status report | forwards once | the node itself, or a registered node forwarding |
+//! | `POST /raft/cluster/status-interval` | sets the status report interval | forwards once | a registered node |
 //! | `GET /raft/cluster/status` | replication progress | 503 elsewhere | anyone the firewall admits |
 //!
 //! TODO(security): no authentication; access control relies on the peer
@@ -33,14 +35,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use faber_api_types::workload::limits;
-use faber_api_types::{FORWARDED_HEADER, LeaseResponse};
+use faber_api_types::{FORWARDED_HEADER, LeaseResponse, StatusIntervalResponse};
 
 use crate::dto::{
     PeerEndpointRequest, PeerInviteRequest, PeerInviteResponse, PeerJoinRequest, PeerLeaseRequest,
-    PeerRegisterRequest, PeerRenewRequest, PeerWorkloadRequest, PeerWorkloadResponse,
-    ReplicationStatus,
+    PeerRegisterRequest, PeerRenewRequest, PeerStatusIntervalRequest, PeerWorkloadRequest,
+    PeerWorkloadResponse, ReplicationStatus,
 };
 use crate::error::ApiJson;
+use crate::raft::store::status::ReportNode;
 use crate::service::{FaberService, ServiceResult};
 
 pub fn router(service: FaberService) -> Router {
@@ -53,7 +56,13 @@ pub fn router(service: FaberService) -> Router {
         .route("/raft/cluster/renew", post(renew))
         .route("/raft/cluster/lease", post(lease))
         .route("/raft/cluster/workloads", post(workloads).layer(limit))
-        .route("/raft/cluster/status", get(status))
+        .route(
+            "/raft/cluster/status",
+            get(status)
+                .post(report)
+                .layer(DefaultBodyLimit::max(limits::MAX_DEPLOY_REQUEST_BYTES)),
+        )
+        .route("/raft/cluster/status-interval", post(status_interval))
         .with_state(service)
 }
 
@@ -151,6 +160,36 @@ async fn workloads(
     ApiJson(req): ApiJson<PeerWorkloadRequest>,
 ) -> ServiceResult<Json<PeerWorkloadResponse>> {
     let resp = svc.peer_workloads(req, forwarded(&headers), source).await?;
+    Ok(Json(resp))
+}
+
+/// 204 once the report is replicated. Leader only; forwards once. 403 unless
+/// the request comes from the node it names, or was forwarded by a registered
+/// node. 409 `mesh_node_removed` when the mesh no longer has the node, 403
+/// `forbidden` for another machine than the one the node is registered to.
+/// 400 `bad_request` for a report over its size limits and for a body over
+/// 128 KiB.
+async fn report(
+    State(svc): State<FaberService>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<ReportNode>,
+) -> ServiceResult<StatusCode> {
+    svc.peer_report(req, forwarded(&headers), source).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 200 with the new status interval once it is replicated. Leader only;
+/// forwards once. 403 unless the request comes from a registered node.
+async fn status_interval(
+    State(svc): State<FaberService>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<PeerStatusIntervalRequest>,
+) -> ServiceResult<Json<StatusIntervalResponse>> {
+    let resp = svc
+        .peer_set_status_interval(req, forwarded(&headers), source)
+        .await?;
     Ok(Json(resp))
 }
 

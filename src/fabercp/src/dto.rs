@@ -101,6 +101,14 @@ pub struct PeerLeaseRequest {
     pub lease_secs: u64,
 }
 
+/// `POST /raft/cluster/status-interval` (internal, leader only; a follower
+/// forwards it once, and only a registered node may send it): set how often
+/// nodes report their status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStatusIntervalRequest {
+    pub interval_secs: u64,
+}
+
 /// `POST /raft/cluster/workloads` (internal, leader only; a follower forwards
 /// it once, and only a registered node may send it): one of the six project
 /// and workload writes, named by `op`. Each variant is its raft command

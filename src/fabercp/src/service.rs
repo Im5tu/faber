@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use faber_api_types::{
     ClusterStatus, CreateInviteRequest, ErrorBody, FORWARDED_HEADER, HealthResponse,
-    InviteResponse, JoinRequest, LeaseResponse, MemberStatus, Role, error_code,
+    InviteResponse, JoinRequest, LeaseResponse, MemberStatus, Role, StatusIntervalResponse,
+    error_code,
 };
 use faber_container_runtime::ContainerRuntimeSpec;
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
@@ -26,7 +27,7 @@ use serde::Serialize;
 
 use crate::dto::{
     PeerEndpointRequest, PeerInviteRequest, PeerInviteResponse, PeerJoinRequest, PeerLeaseRequest,
-    PeerRegisterRequest, PeerRenewRequest, ReplicationStatus,
+    PeerRegisterRequest, PeerRenewRequest, PeerStatusIntervalRequest, ReplicationStatus,
 };
 use crate::lease;
 use crate::mesh::identity::FOUNDER_NODE_ID;
@@ -37,6 +38,7 @@ use crate::mesh::{
     parse_endpoint, parse_full_endpoint, validate_public_key,
 };
 use crate::raft::store::StateReader;
+use crate::raft::store::status::{ReportNode, SetStatusInterval};
 use crate::raft::types::{Node, NodeId, Raft, Request, Response};
 use crate::secrets::{ClusterKeyProvider, NoClusterKey};
 
@@ -712,6 +714,130 @@ impl FaberService {
                 .await
                 .map(drop),
         }
+    }
+
+    /// `GET /api/v1/mesh/status-interval`: seconds between two status
+    /// reports of a node, in this node's copy of the replicated state.
+    pub async fn status_interval(&self) -> ServiceResult<StatusIntervalResponse> {
+        let interval_secs = self
+            .inner
+            .state
+            .status_interval()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        Ok(StatusIntervalResponse { interval_secs })
+    }
+
+    /// `PUT /api/v1/mesh/status-interval` and `POST
+    /// /raft/cluster/status-interval`: the leader proposes
+    /// `SetStatusInterval`; a follower forwards once. Apply checks the
+    /// bounds, so a value outside them is a `bad_request` from whichever
+    /// node proposed it.
+    pub async fn set_status_interval(
+        &self,
+        secs: u64,
+        forwarded: bool,
+    ) -> ServiceResult<StatusIntervalResponse> {
+        match self.forward_target(forwarded)? {
+            None => {
+                let cmd = SetStatusInterval { secs };
+                self.propose(Request::SetStatusInterval(cmd)).await?;
+                Ok(StatusIntervalResponse {
+                    interval_secs: secs,
+                })
+            }
+            Some(leader_addr) => {
+                let req = PeerStatusIntervalRequest {
+                    interval_secs: secs,
+                };
+                let bytes = self
+                    .post_peer(&leader_addr, "/raft/cluster/status-interval", &req, true)
+                    .await?;
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ServiceError::Internal(format!(
+                        "bad status interval response from {leader_addr}: {e}"
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Handles `POST /raft/cluster/status-interval`:
+    /// [`Self::set_status_interval`] for a request from another node. As for
+    /// [`Self::peer_set_lease`], the source must be the mesh IP of a
+    /// registered node, forwarded or not.
+    pub async fn peer_set_status_interval(
+        &self,
+        req: PeerStatusIntervalRequest,
+        forwarded: bool,
+        source: SocketAddr,
+    ) -> ServiceResult<StatusIntervalResponse> {
+        if self.inner.strict_peer_source {
+            let mesh = self.read_mesh()?;
+            if !source_is_registered(mesh.as_ref(), source.ip()) {
+                tracing::warn!(
+                    source = %source.ip(),
+                    forwarded,
+                    "refused a status interval change from an address that is no registered node"
+                );
+                return Err(ServiceError::Forbidden(format!(
+                    "{} may not change the status interval",
+                    source.ip()
+                )));
+            }
+        }
+        self.set_status_interval(req.interval_secs, forwarded).await
+    }
+
+    /// Proposes `ReportNode` on the leader, or forwards the report to it
+    /// once. Apply refuses a node the mesh does not have (`mesh_node_removed`)
+    /// and another machine than the one the node is registered to
+    /// (`forbidden`).
+    pub async fn report_node(&self, report: ReportNode, forwarded: bool) -> ServiceResult<()> {
+        match self.forward_target(forwarded)? {
+            None => self.propose(Request::ReportNode(report)).await.map(drop),
+            Some(leader_addr) => self
+                .post_peer(&leader_addr, "/raft/cluster/status", &report, true)
+                .await
+                .map(drop),
+        }
+    }
+
+    /// Handles `POST /raft/cluster/status`. `source` is checked as for
+    /// [`Self::peer_renew`]: a node may only report for itself, so the report
+    /// must come from the mesh IP of `report.node_id`, or be a forward from
+    /// the mesh IP of a registered node. Anything else is `Forbidden`. Apply
+    /// holds the size limits.
+    pub async fn peer_report(
+        &self,
+        report: ReportNode,
+        forwarded: bool,
+        source: SocketAddr,
+    ) -> ServiceResult<()> {
+        check_hex_id("instance_id", &report.instance_id)?;
+        if self.inner.strict_peer_source {
+            let mesh = self.read_mesh()?;
+            if !source_may_act_for(mesh.as_ref(), report.node_id, source.ip(), forwarded) {
+                tracing::warn!(
+                    node_id = report.node_id,
+                    source = %source.ip(),
+                    forwarded,
+                    "refused a status report from an address that may not make it"
+                );
+                return Err(ServiceError::Forbidden(format!(
+                    "{} may not report for node {}",
+                    source.ip(),
+                    report.node_id
+                )));
+            }
+        }
+        self.report_node(report, forwarded).await
+    }
+
+    /// The id and instance id this node reports with, or `None` when it has
+    /// no mesh identity.
+    pub(crate) fn report_identity(&self) -> Option<(NodeId, String)> {
+        let instance_id = self.inner.mesh.as_ref()?.record.instance_id.clone()?;
+        Some((self.inner.node_id, instance_id))
     }
 
     /// Whether a raft RPC (`/raft/append`, `/raft/vote`, `/raft/snapshot`)
@@ -2554,6 +2680,127 @@ mod tests {
                 Err(ServiceError::NoLeader)
             );
         }
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_status_interval_is_set_through_raft_within_bounds() {
+        let node = TestNode::start_initialized().await;
+        let svc = &node.service;
+        assert_eq!(svc.status_interval().await.unwrap().interval_secs, 5);
+        assert_eq!(
+            svc.set_status_interval(30, false)
+                .await
+                .unwrap()
+                .interval_secs,
+            30
+        );
+        // The leader handles a forwarded request the same way.
+        assert_eq!(
+            svc.set_status_interval(60, true)
+                .await
+                .unwrap()
+                .interval_secs,
+            60
+        );
+        for bad in [0, 301] {
+            let err = svc.set_status_interval(bad, false).await.unwrap_err();
+            assert!(matches!(err, ServiceError::BadRequest(_)), "{bad}: {err:?}");
+        }
+        assert_eq!(svc.status_interval().await.unwrap().interval_secs, 60);
+        node.shutdown().await;
+    }
+
+    /// A follower forwards once; a request that was forwarded already is not
+    /// forwarded again. With no leader there is nowhere to send either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_writes_without_a_leader_are_no_leader() {
+        let node = TestNode::start().await;
+        let report = || ReportNode {
+            node_id: 1,
+            instance_id: "ab".repeat(16),
+            capacity: Default::default(),
+            replicas: Vec::new(),
+        };
+        for forwarded in [false, true] {
+            assert_eq!(
+                node.service.set_status_interval(10, forwarded).await,
+                Err(ServiceError::NoLeader)
+            );
+            assert_eq!(
+                node.service.report_node(report(), forwarded).await,
+                Err(ServiceError::NoLeader)
+            );
+        }
+        node.shutdown().await;
+    }
+
+    /// Node 1 is registered; node 2 only holds an invite, so its mesh IP
+    /// passes the peer firewall without being a node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_may_only_report_for_itself_and_only_a_node_sets_the_interval() {
+        let node = TestNode::start_initialized().await;
+        invited(&node).await;
+        let mesh = node.service.read_mesh().unwrap().unwrap();
+        let invitee = mesh.invites.values().next().unwrap().mesh_ip;
+        let strict = strict_service(&node);
+        let report = |node_id| ReportNode {
+            node_id,
+            instance_id: "ab".repeat(16),
+            capacity: Default::default(),
+            replicas: Vec::new(),
+        };
+        let interval = |secs| PeerStatusIntervalRequest {
+            interval_secs: secs,
+        };
+
+        let holder = format!("{invitee}:40000");
+        for source in [holder.as_str(), "198.51.100.7:40000", "127.0.0.1:40000"] {
+            for forwarded in [false, true] {
+                let source = source.parse().unwrap();
+                let err = strict
+                    .peer_report(report(1), forwarded, source)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ServiceError::Forbidden(_)), "{err:?}");
+                let err = strict
+                    .peer_set_status_interval(interval(10), forwarded, source)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ServiceError::Forbidden(_)), "{err:?}");
+            }
+        }
+        // Node 1 for itself, and a registered node forwarding for another.
+        let registered = "10.99.0.1:40000".parse().unwrap();
+        strict
+            .peer_report(report(1), false, registered)
+            .await
+            .unwrap();
+        strict
+            .peer_report(report(1), true, registered)
+            .await
+            .unwrap();
+        strict
+            .peer_set_status_interval(interval(10), false, registered)
+            .await
+            .unwrap();
+        assert_eq!(strict.status_interval().await.unwrap().interval_secs, 10);
+        // Not for another node when it is not forwarded.
+        let err = strict
+            .peer_report(report(2), false, registered)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Forbidden(_)), "{err:?}");
+        // The instance id has the shape of one.
+        let mut bad = report(1);
+        bad.instance_id = "nope".into();
+        let err = strict
+            .peer_report(bad, false, registered)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::BadRequest(_)), "{err:?}");
+
+        drop(strict);
         node.shutdown().await;
     }
 
