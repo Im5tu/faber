@@ -1795,7 +1795,7 @@ mod tests {
     #[test]
     fn a_deploy_stops_at_the_request_size_limit() {
         let limit = limits::MAX_DEPLOY_REQUEST_BYTES as u64;
-        let request = |pad: usize| BTreeMap::from([("big".to_string(), padded(pad))]);
+        let request = |pad: usize| BTreeMap::from([("big".to_string(), sealed(&padded(pad)))]);
         let pad = (limit - json_len(&request(0))) as usize;
         assert_eq!(json_len(&request(pad)), limit);
 
