@@ -1,1 +1,0 @@
-input.yaml#4: Secret `web-secrets` is skipped and its data was not read: faber has no secret store yet

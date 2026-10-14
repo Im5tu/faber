@@ -1,4 +1,0 @@
-/srv/app/compose.yaml: services.db.healthcheck.start_period: approximated: no check runs for this long after the start, where Docker checks and does not count the failures
-/srv/app/compose.yaml: services.db.volumes[1]: the relative path resolves to `/srv/app/initdb`, which is read on the node that runs the service, not on this machine
-/srv/app/compose.yaml: services.web.depends_on: skipped: faber starts the workloads of a deploy in no particular order
-/srv/app/compose.yaml: services.web.ports[0]: the port is not published on the host: faber has no ingress yet; use `--expose web` to make the service reachable cluster-wide
