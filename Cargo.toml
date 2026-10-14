@@ -5,6 +5,11 @@ members = [
     "crates/api-types",
     "crates/network-management",
     "crates/container-runtime",
+    "crates/crypto",
+    "crates/cri",
+    "crates/image",
+    "crates/node-protocol",
+    "src/faber-node",
 ]
 resolver = "3"
 
@@ -18,6 +23,10 @@ license = "MIT OR Apache-2.0"
 faber-api-types = { path = "crates/api-types" }
 faber-network-management = { path = "crates/network-management" }
 faber-container-runtime = { path = "crates/container-runtime" }
+faber-crypto = { path = "crates/crypto" }
+faber-cri = { path = "crates/cri" }
+faber-image = { path = "crates/image" }
+faber-node-protocol = { path = "crates/node-protocol" }
 
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 rocksdb = { version = "0.25", default-features = false, features = ["bindgen-runtime", "lz4"] }
@@ -43,6 +52,19 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 ipnet = { version = "2", features = ["serde"] }
 getrandom = "0.4"
+tonic = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+hyper-util = { version = "0.1", features = ["tokio"] }
+hickory-server = "0.26"
+hickory-proto = "0.26"
+hickory-resolver = "0.26"
+chacha20poly1305 = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
+zeroize = "1"
+socket2 = "0.6"
+nix = { version = "0.31", features = ["fs", "mount", "process", "user"] }
 
 # dev
 tempfile = "3"

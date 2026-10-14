@@ -1,0 +1,11 @@
+[package]
+name = "faber-image"
+description = "Image pulls through the CRI, with a registry auth hook later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+faber-cri = { workspace = true }
+thiserror = { workspace = true }

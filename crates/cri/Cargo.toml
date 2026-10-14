@@ -1,0 +1,16 @@
+[package]
+name = "faber-cri"
+description = "CRI v1 gRPC client trait, fake and real client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "faber-node"
+description = "Root helper that performs privileged node operations for fabercp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "faber-node"
+path = "src/main.rs"
+
+[dependencies]
+faber-node-protocol = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
