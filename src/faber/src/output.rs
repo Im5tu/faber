@@ -11,8 +11,9 @@ use faber_api_types::workload::{
     VolumeSource, WorkloadListResponse, WorkloadResponse, WorkloadSpec,
 };
 use faber_api_types::{ClusterStatus, HealthResponse, InviteResponse, LeaseResponse};
-use faber_workload_import::Diagnostic;
 use serde::Serialize;
+
+use crate::deploy::Diagnostic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -923,7 +924,7 @@ mod tests {
         assert_eq!(table("", &wide), "é   1\nab  2\n");
     }
 
-    /// A compose file or a manifest can put anything in a key or a value
+    /// An input file can put anything in a key or a value
     /// that ends up in a finding.
     #[test]
     fn findings_escape_what_came_from_the_input() {

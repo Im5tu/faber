@@ -150,45 +150,6 @@ pub struct DeployOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum DeployCommand {
-    /// Deploy the services of a compose file, one workload per service.
-    Compose {
-        /// The compose file. Without it: compose.yaml, compose.yml,
-        /// docker-compose.yaml or docker-compose.yml in the current
-        /// directory, in that order. An override file beside it is not
-        /// merged.
-        #[arg(value_name = "FILE")]
-        file: Option<PathBuf>,
-        #[command(flatten)]
-        target: Target,
-        /// Read the defaults of ${VAR} from this file instead of .env beside
-        /// the compose file. The environment of this process wins over
-        /// either.
-        #[arg(long, value_name = "FILE")]
-        env_file: Option<PathBuf>,
-        /// Read env files that are outside the directory of the compose
-        /// file: --env-file, .env and the env_file of a service, also when
-        /// a symlink leads there. Without it such a file is an error,
-        /// because its content would go from this machine into the cluster.
-        #[arg(long)]
-        allow_external_env_file: bool,
-        /// Also deploy the services of this profile. May be repeated.
-        #[arg(long = "profile", value_name = "PROFILE")]
-        profiles: Vec<String>,
-        #[command(flatten)]
-        options: DeployOptions,
-    },
-    /// Deploy the workloads of Kubernetes manifests.
-    K8s {
-        /// A manifest file, a directory, or - for stdin. A directory gives
-        /// its *.yaml, *.yml and *.json files in name order, without its
-        /// subdirectories.
-        #[arg(value_name = "FILE|DIR|-", required = true)]
-        inputs: Vec<PathBuf>,
-        #[command(flatten)]
-        target: Target,
-        #[command(flatten)]
-        options: DeployOptions,
-    },
     /// Deploy workloads written in faber's own format.
     Spec {
         /// A JSON object of workload specs by name, as --dry-run prints it,
@@ -404,35 +365,12 @@ pub async fn run_with_inputs(
             }
         },
         Command::Deploy(cmd) => {
-            let (source, target, options) = match &cmd {
-                DeployCommand::Compose {
-                    file,
-                    target,
-                    env_file,
-                    allow_external_env_file,
-                    profiles,
-                    options,
-                } => {
-                    let source = deploy::Source::Compose {
-                        file: file.as_deref(),
-                        env_file: env_file.as_deref(),
-                        profiles,
-                        allow_external_env_files: *allow_external_env_file,
-                    };
-                    (source, target, options)
-                }
-                DeployCommand::K8s {
-                    inputs,
-                    target,
-                    options,
-                } => (deploy::Source::K8s { inputs }, target, options),
-                DeployCommand::Spec {
-                    file,
-                    target,
-                    options,
-                } => (deploy::Source::Spec { file }, target, options),
-            };
-            let plan = match deploy::plan(source, &options.expose, options.prune, &mut inputs) {
+            let DeployCommand::Spec {
+                file,
+                target,
+                options,
+            } = &cmd;
+            let plan = match deploy::plan(file, &options.expose, options.prune, &mut inputs) {
                 Ok(plan) => plan,
                 Err(failure) => {
                     let lines = output::failure_text(&failure.errors, &failure.warnings);
@@ -448,7 +386,7 @@ pub async fn run_with_inputs(
             }
             let details = output::DeployDetails {
                 warnings: &plan.warnings,
-                variables: &plan.variables,
+                variables: &[],
                 files: options.dry_run.then_some(&plan.files[..]),
                 notes: &plan.notes,
             };

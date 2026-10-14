@@ -714,7 +714,6 @@ async fn run_inputs(server: &MockServer, args: &[&str], inputs: Inputs) -> Outco
 async fn run_in(server: &MockServer, args: &[&str], cwd: &Path, stdin: &str) -> Outcome {
     let inputs = Inputs {
         cwd: cwd.to_path_buf(),
-        variables: BTreeMap::new(),
         stdin: Box::new(Cursor::new(stdin.as_bytes().to_vec())),
     };
     run_inputs(server, args, inputs).await
@@ -723,11 +722,6 @@ async fn run_in(server: &MockServer, args: &[&str], cwd: &Path, stdin: &str) -> 
 /// Runs in the fixtures directory.
 async fn run_fx(server: &MockServer, args: &[&str]) -> Outcome {
     run_in(server, args, &fixtures(), "").await
-}
-
-/// A path as the compose converter names it: with `/` on every platform.
-fn slashes(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 /// The real path of `path` as the list of files read shows it: symlinks
@@ -765,13 +759,6 @@ async fn mount_json(server: &MockServer, verb: &str, route: &str, status: u16, b
         .respond_with(ResponseTemplate::new(status).set_body_json(body))
         .mount(server)
         .await;
-}
-
-/// The body of the only request the server got.
-async fn only_request_body(server: &MockServer) -> Value {
-    let requests = server.received_requests().await.expect("recording");
-    assert_eq!(requests.len(), 1, "{requests:?}");
-    requests[0].body_json().expect("json body")
 }
 
 const TARGET: [&str; 4] = ["--project", "shop", "--env", "staging"];
@@ -1771,102 +1758,6 @@ async fn deploy_json_of_a_sent_deploy_has_no_file_list() {
     assert_eq!(v.get("files"), None, "{out}");
 }
 
-/// The compose file, the `.env` beside it and the `env_file` of a service,
-/// in the order they were read and each once, also when two services name
-/// the same `env_file`.
-#[tokio::test]
-async fn deploy_compose_dry_run_lists_the_env_files_it_read() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("env")).unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:${TAG}\n    env_file: env/web.env\n  api:\n    \
-         image: nginx:${TAG}\n    env_file:\n      - env/web.env\n",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join(".env"), "TAG=1.27\n").unwrap();
-    std::fs::write(dir.path().join("env").join("web.env"), "MODE=prod\n").unwrap();
-
-    // The real path, as this platform writes it.
-    let web_env = Path::new("env").join("web.env").display().to_string();
-    let args = with_target(&["deploy", "compose"], &["--dry-run"]);
-    let (out, err) = run_in(&server, &args, dir.path(), "").await.ok();
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["web"]["containers"][0]["env"]["MODE"], "prod");
-    assert_eq!(
-        err,
-        format!(
-            "uses variable: TAG\nread: compose.yaml\nread: .env\nread: {web_env}\n\
-             {NOTE_CAPABILITIES}"
-        )
-    );
-
-    let args = with_target(&["-o", "json", "deploy", "compose"], &["--dry-run"]);
-    let (out, err) = run_in(&server, &args, dir.path(), "").await.ok();
-    assert_eq!(err, "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["files"], json!(["compose.yaml", ".env", web_env]));
-    assert_eq!(v["variables"], json!(["TAG"]));
-
-    // `--env-file` is read instead of `.env`, which is then not listed.
-    std::fs::write(dir.path().join("prod.env"), "TAG=1.28\n").unwrap();
-    let args = with_target(
-        &["-o", "json", "deploy", "compose"],
-        &["--dry-run", "--env-file", "prod.env"],
-    );
-    let (out, _) = run_in(&server, &args, dir.path(), "").await.ok();
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["files"], json!(["compose.yaml", "prod.env", web_env]));
-}
-
-/// A directory is listed file by file, in the order read, with stdin as
-/// `-` where it came among the inputs.
-#[tokio::test]
-async fn deploy_k8s_dry_run_lists_the_files_of_a_directory() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let manifests = dir.path().join("manifests");
-    std::fs::create_dir(&manifests).unwrap();
-    std::fs::write(manifests.join("b.yml"), deployment("b", "img:b")).unwrap();
-    std::fs::write(manifests.join("a.yaml"), deployment("a", "img:a")).unwrap();
-    std::fs::write(manifests.join("notes.txt"), "not read").unwrap();
-    std::fs::write(
-        dir.path().join("single.yaml"),
-        deployment("single", "img:s"),
-    )
-    .unwrap();
-
-    let in_dir = |name: &str| Path::new("manifests").join(name).display().to_string();
-    let head = ["deploy", "k8s", "single.yaml", "-", "manifests"];
-    let stdin = deployment("piped", "img:p");
-    let (_, err) = run_in(
-        &server,
-        &with_target(&head, &["--dry-run"]),
-        dir.path(),
-        &stdin,
-    )
-    .await
-    .ok();
-    assert_eq!(
-        err,
-        format!(
-            "read: single.yaml\nread: -\nread: {}\nread: {}\n{NOTE_CAPABILITIES}",
-            in_dir("a.yaml"),
-            in_dir("b.yml")
-        )
-    );
-
-    let args = with_target(&[&["-o", "json"][..], &head].concat(), &["--dry-run"]);
-    let (out, err) = run_in(&server, &args, dir.path(), &stdin).await.ok();
-    assert_eq!(err, "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(
-        v["files"],
-        json!(["single.yaml", "-", in_dir("a.yaml"), in_dir("b.yml")])
-    );
-}
-
 /// What `--dry-run` prints is what `deploy spec` reads: the same workloads
 /// go out, from a file and from stdin.
 #[tokio::test]
@@ -2110,360 +2001,6 @@ async fn deploy_refused_by_the_api_is_readable() {
     }
 }
 
-// ---- deploy compose ----
-
-const COMPOSE: &str = "services:\n  web:\n    image: nginx:1.27\n";
-
-fn compose_with_image(image: &str) -> String {
-    format!("services:\n  web:\n    image: {image}\n")
-}
-
-/// The image of the first container of `web` in a `--dry-run` document.
-fn web_image(dry_run_out: &str) -> String {
-    let v: Value = serde_json::from_str(dry_run_out).unwrap();
-    v["web"]["containers"][0]["image"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no web image in {dry_run_out}"))
-        .to_string()
-}
-
-#[tokio::test]
-async fn deploy_compose_sends_the_converted_services() {
-    let server = MockServer::start().await;
-    mount_json(&server, "POST", DEPLOY_ROUTE, 200, deploy_body()).await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("stack.yml"), COMPOSE).unwrap();
-
-    let args = with_target(&["deploy", "compose", "stack.yml"], &["--expose", "web"]);
-    let (out, err) = run_in(&server, &args, dir.path(), "").await.ok();
-    assert_eq!(out, DEPLOY_TEXT);
-    assert_eq!(err, NOTE_CAPABILITIES);
-
-    let body = only_request_body(&server).await;
-    assert_eq!(body["prune"], false);
-    let workloads = body["workloads"].as_object().unwrap();
-    assert_eq!(workloads.keys().collect::<Vec<_>>(), ["web"]);
-    assert_eq!(workloads["web"]["containers"][0]["image"], "nginx:1.27");
-    assert_eq!(workloads["web"]["expose"], "cluster");
-}
-
-/// Without FILE: `compose.yaml`, `compose.yml`, `docker-compose.yaml`,
-/// `docker-compose.yml`, the first that exists.
-#[tokio::test]
-async fn deploy_compose_without_a_file_looks_in_the_current_directory() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let args = with_target(&["deploy", "compose"], &["--dry-run"]);
-
-    let names = [
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "compose.yml",
-        "compose.yaml",
-    ];
-    for name in names {
-        // Each file names itself in the image tag, and each one added
-        // comes earlier in the order than the ones already there.
-        let tag = name.replace('.', "-");
-        std::fs::write(
-            dir.path().join(name),
-            compose_with_image(&format!("nginx:{tag}")),
-        )
-        .unwrap();
-        let (out, _) = run_in(&server, &args, dir.path(), "").await.ok();
-        assert_eq!(
-            web_image(&out),
-            format!("nginx:{tag}"),
-            "after adding {name}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn deploy_compose_without_any_compose_file_lists_the_names() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("stack.yml"), COMPOSE).unwrap();
-
-    let args = with_target(&["deploy", "compose"], &[]);
-    let outcome = run_in(&server, &args, dir.path(), "").await;
-    assert_eq!(outcome.failed(), "nothing was deployed");
-    assert_eq!(outcome.out, "");
-    assert_eq!(
-        outcome.err,
-        format!(
-            "error: {}: no compose file here; looked for compose.yaml, compose.yml, \
-             docker-compose.yaml, docker-compose.yml\n",
-            slashes(dir.path())
-        )
-    );
-}
-
-#[tokio::test]
-async fn deploy_compose_warns_about_an_override_file_it_does_not_merge() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("compose.yaml"), COMPOSE).unwrap();
-    std::fs::write(
-        dir.path().join("compose.override.yaml"),
-        compose_with_image("nginx:override"),
-    )
-    .unwrap();
-
-    let warning = "warning: compose.override.yaml: not merged: only compose.yaml is read; \
-                   `docker compose config` writes the merged file\n";
-    let args = with_target(&["deploy", "compose"], &["--dry-run"]);
-    let (out, err) = run_in(&server, &args, dir.path(), "").await.ok();
-    assert_eq!(web_image(&out), "nginx:1.27");
-    assert_eq!(
-        err,
-        format!("{warning}read: compose.yaml\n{NOTE_CAPABILITIES}")
-    );
-
-    // It is a warning like any other.
-    let args = with_target(&["deploy", "compose"], &["--dry-run", "--strict"]);
-    let outcome = run_in(&server, &args, dir.path(), "").await;
-    assert_eq!(
-        outcome.failed(),
-        "nothing was deployed: --strict turns a warning into an error"
-    );
-    assert_eq!(outcome.err, warning);
-    assert_eq!(outcome.out, "");
-}
-
-/// Variables come from the caller's environment and win over the env file;
-/// `--env-file` replaces `.env`; `--profile` turns a profile on.
-#[tokio::test]
-async fn deploy_compose_passes_variables_env_file_and_profiles() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:${TAG}\n  debug:\n    image: busybox:${BOX}\n    \
-         profiles: [debug]\n",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join(".env"), "TAG=from-dot-env\nBOX=dot\n").unwrap();
-    std::fs::write(dir.path().join("prod.env"), "TAG=from-prod-env\nBOX=prod\n").unwrap();
-
-    let run = |tail: &'static [&'static str], variables: &[(&str, &str)]| {
-        let inputs = Inputs {
-            cwd: dir.path().to_path_buf(),
-            variables: variables
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            stdin: Box::new(Cursor::new(Vec::new())),
-        };
-        let args = with_target(&["deploy", "compose"], tail);
-        let server = &server;
-        async move {
-            let (out, _) = run_inputs(server, &args, inputs).await.ok();
-            serde_json::from_str::<Value>(&out).unwrap()
-        }
-    };
-
-    let v = run(&["--dry-run"], &[]).await;
-    assert_eq!(v["web"]["containers"][0]["image"], "nginx:from-dot-env");
-    assert_eq!(v.get("debug"), None, "{v}");
-
-    let v = run(&["--dry-run", "--env-file", "prod.env"], &[]).await;
-    assert_eq!(v["web"]["containers"][0]["image"], "nginx:from-prod-env");
-
-    let v = run(&["--dry-run"], &[("TAG", "from-environment")]).await;
-    assert_eq!(v["web"]["containers"][0]["image"], "nginx:from-environment");
-
-    let v = run(&["--dry-run", "--profile", "debug"], &[]).await;
-    assert_eq!(v["debug"]["containers"][0]["image"], "busybox:dot");
-}
-
-#[tokio::test]
-async fn deploy_compose_with_an_error_prints_every_error_and_sends_nothing() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        "services:\n  web:\n    build: .\n  db:\n    image: postgres:16\n    privileged: true\n",
-    )
-    .unwrap();
-
-    for format in ["text", "json"] {
-        let args = with_target(&["-o", format, "deploy", "compose"], &[]);
-        let outcome = run_in(&server, &args, dir.path(), "").await;
-        assert_eq!(outcome.failed(), "nothing was deployed");
-        assert_eq!(outcome.out, "");
-        let errors: Vec<&str> = outcome
-            .err
-            .lines()
-            .filter(|line| line.starts_with("error: "))
-            .collect();
-        assert!(errors.len() >= 2, "{}", outcome.err);
-        // The file is named the way the caller would name it.
-        for key in ["services.web.build: ", "services.db.privileged: "] {
-            let line = format!("error: compose.yaml: {key}");
-            assert!(
-                errors.iter().any(|error| error.starts_with(&line)),
-                "{key}: {}",
-                outcome.err
-            );
-        }
-    }
-}
-
-// ---- deploy k8s ----
-
-fn deployment(name: &str, image: &str) -> String {
-    format!(
-        "apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {name}
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: {name}
-  template:
-    metadata:
-      labels:
-        app: {name}
-    spec:
-      containers:
-        - name: main
-          image: {image}
-"
-    )
-}
-
-/// Files, a directory and stdin in one deploy: each becomes a document
-/// named after where it came from.
-#[tokio::test]
-async fn deploy_k8s_reads_files_directories_and_stdin() {
-    let server = MockServer::start().await;
-    mount_json(&server, "POST", DEPLOY_ROUTE, 200, deploy_body()).await;
-    let dir = tempfile::tempdir().unwrap();
-    let manifests = dir.path().join("manifests");
-    std::fs::create_dir(&manifests).unwrap();
-    std::fs::write(manifests.join("b.yml"), deployment("b", "img:b")).unwrap();
-    std::fs::write(manifests.join("a.yaml"), deployment("a", "img:a")).unwrap();
-    std::fs::write(manifests.join("ignored.txt"), "not yaml: [").unwrap();
-    std::fs::create_dir(manifests.join("nested")).unwrap();
-    std::fs::write(
-        manifests.join("nested").join("n.yaml"),
-        deployment("nested", "img:n"),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("single.yaml"),
-        deployment("single", "img:s"),
-    )
-    .unwrap();
-
-    let args = with_target(&["deploy", "k8s", "single.yaml", "manifests", "-"], &[]);
-    let stdin = deployment("piped", "img:p");
-    let (out, _) = run_in(&server, &args, dir.path(), &stdin).await.ok();
-    assert_eq!(out, DEPLOY_TEXT);
-
-    let body = only_request_body(&server).await;
-    let workloads = body["workloads"].as_object().unwrap();
-    assert_eq!(
-        workloads.keys().collect::<Vec<_>>(),
-        ["a", "b", "piped", "single"]
-    );
-    assert_eq!(workloads["a"]["containers"][0]["image"], "img:a");
-    assert_eq!(workloads["piped"]["containers"][0]["image"], "img:p");
-    assert_eq!(workloads["single"]["scale"], json!({"replicas": 2}));
-}
-
-/// Each input is refused under the name it was given, in the order of the
-/// arguments and, within a directory, of the file names.
-#[tokio::test]
-async fn deploy_k8s_names_its_sources_in_directory_order() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let manifests = dir.path().join("manifests");
-    std::fs::create_dir(&manifests).unwrap();
-    let job = |name: &str| format!("apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: {name}\n");
-    // Written in the reverse of their name order.
-    std::fs::write(manifests.join("2-job.yaml"), job("two")).unwrap();
-    std::fs::write(manifests.join("1-job.yaml"), job("one")).unwrap();
-
-    let args = with_target(&["deploy", "k8s", "-", "manifests"], &[]);
-    let outcome = run_in(&server, &args, dir.path(), &job("piped")).await;
-    assert_eq!(outcome.failed(), "nothing was deployed");
-    assert_eq!(outcome.out, "");
-    let in_dir = |name: &str| Path::new("manifests").join(name).display().to_string();
-    let known = ["-".to_string(), in_dir("1-job.yaml"), in_dir("2-job.yaml")];
-    // The sources in the order each first has an error.
-    let mut first_seen: Vec<&String> = Vec::new();
-    for line in outcome.err.lines() {
-        let line = line.strip_prefix("error: ").expect(line);
-        let source = known
-            .iter()
-            .find(|source| line.starts_with(&format!("{source}: ")));
-        if let Some(source) = source.filter(|s| !first_seen.contains(s)) {
-            first_seen.push(source);
-        }
-    }
-    assert_eq!(
-        first_seen,
-        known.iter().collect::<Vec<_>>(),
-        "{}",
-        outcome.err
-    );
-}
-
-#[tokio::test]
-async fn deploy_k8s_dry_run_json_carries_the_warnings() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let service =
-        "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  ports:\n    - port: 80\n";
-    std::fs::write(
-        dir.path().join("app.yaml"),
-        format!("{}---\n{service}", deployment("web", "nginx:1.27")),
-    )
-    .unwrap();
-
-    let args = with_target(&["-o", "json", "deploy", "k8s", "app.yaml"], &["--dry-run"]);
-    let (out, err) = run_in(&server, &args, dir.path(), "").await.ok();
-    assert_eq!(err, "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["project"], "shop");
-    assert_eq!(v["environment"], "staging");
-    assert_eq!(v["spec"]["web"]["containers"][0]["image"], "nginx:1.27");
-    let warnings = v["warnings"].as_array().unwrap();
-    assert!(!warnings.is_empty(), "{out}");
-    for warning in warnings {
-        let mut keys: Vec<&String> = warning.as_object().unwrap().keys().collect();
-        keys.sort();
-        assert_eq!(keys, ["message", "path", "source"], "{warning}");
-    }
-    // The Service is the second document of the file.
-    assert!(
-        warnings.iter().any(|w| w["source"] == "app.yaml#2"),
-        "{out}"
-    );
-
-    // Text mode: the same findings as lines, and they count for --strict.
-    let args = with_target(&["deploy", "k8s", "app.yaml"], &["--dry-run", "--strict"]);
-    let outcome = run_in(&server, &args, dir.path(), "").await;
-    assert_eq!(
-        outcome.failed(),
-        "nothing was deployed: --strict turns a warning into an error"
-    );
-    assert_eq!(outcome.out, "");
-    assert_eq!(
-        outcome.err.lines().count(),
-        warnings.len(),
-        "{}",
-        outcome.err
-    );
-    for line in outcome.err.lines() {
-        assert!(line.starts_with("warning: app.yaml#"), "{line}");
-    }
-}
-
 // ---- review cycle 1: prune, variables, external files, escaping ----
 
 /// `--prune` with nothing to deploy would empty the environment, so it is
@@ -2490,45 +2027,6 @@ async fn deploy_of_no_workloads_is_refused_with_or_without_prune() {
         assert!(outcome.err.starts_with(want), "{tail:?}: {}", outcome.err);
         assert_eq!(outcome.err.lines().count(), 1, "{}", outcome.err);
     }
-}
-
-/// A service left out by its profile is not in the request, so `--prune`
-/// would remove it. The error names it.
-#[tokio::test]
-async fn deploy_prune_is_refused_when_a_profile_skipped_a_service() {
-    let server = MockServer::start().await;
-    mount_json(&server, "POST", DEPLOY_ROUTE, 200, deploy_body()).await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:1.27\n  debug:\n    image: busybox\n    \
-         profiles: [debug]\n",
-    )
-    .unwrap();
-
-    for tail in [&["--prune"][..], &["--prune", "--dry-run"]] {
-        let args = with_target(&["deploy", "compose"], tail);
-        let outcome = run_in(&server, &args, dir.path(), "").await;
-        assert_eq!(outcome.failed(), "nothing was deployed");
-        assert_eq!(outcome.out, "");
-        let line = outcome
-            .err
-            .lines()
-            .find(|line| line.starts_with("error: --prune: "))
-            .unwrap_or_else(|| panic!("no --prune error in {}", outcome.err));
-        for want in ["debug", "--profile", "drop --prune"] {
-            assert!(line.contains(want), "{want}: {line}");
-        }
-    }
-    assert!(server.received_requests().await.unwrap().is_empty());
-
-    // With the profile on, nothing was skipped and the deploy goes out.
-    let args = with_target(&["deploy", "compose"], &["--prune", "--profile", "debug"]);
-    run_in(&server, &args, dir.path(), "").await.ok();
-    let body = only_request_body(&server).await;
-    assert_eq!(body["prune"], true);
-    let workloads = body["workloads"].as_object().unwrap();
-    assert_eq!(workloads.keys().collect::<Vec<_>>(), ["debug", "web"]);
 }
 
 #[tokio::test]
@@ -2564,137 +2062,6 @@ async fn deploy_spec_with_a_workload_defined_twice_is_refused() {
     );
 }
 
-/// The caller's variables that went into the workloads are named before
-/// anything is sent. Their values are never printed.
-#[tokio::test]
-async fn deploy_compose_names_the_variables_it_used() {
-    let server = MockServer::start().await;
-    mount_json(&server, "POST", DEPLOY_ROUTE, 200, deploy_body()).await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:${TAG}\n    environment:\n      MODE: ${MODE}\n",
-    )
-    .unwrap();
-
-    let run = |head: &'static [&'static str], tail: &'static [&'static str]| {
-        let inputs = Inputs {
-            cwd: dir.path().to_path_buf(),
-            variables: [
-                ("TAG", "s3cr3t-tag"),
-                ("MODE", "s3cr3t-mode"),
-                ("UNUSED", "x"),
-            ]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-            stdin: Box::new(Cursor::new(Vec::new())),
-        };
-        let args = with_target(head, tail);
-        let server = &server;
-        async move { run_inputs(server, &args, inputs).await.ok() }
-    };
-
-    let (out, err) = run(&["deploy", "compose"], &["--dry-run"]).await;
-    assert_eq!(web_image(&out), "nginx:s3cr3t-tag");
-    assert_eq!(
-        err,
-        format!("uses variable: MODE\nuses variable: TAG\nread: compose.yaml\n{NOTE_CAPABILITIES}")
-    );
-
-    let (out, err) = run(&["-o", "json", "deploy", "compose"], &["--dry-run"]).await;
-    assert_eq!(err, "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["variables"], json!(["MODE", "TAG"]));
-
-    // A real deploy says the same on stderr, and in its JSON document.
-    let (out, err) = run(&["deploy", "compose"], &[]).await;
-    assert_eq!(out, DEPLOY_TEXT);
-    assert_eq!(
-        err,
-        format!("uses variable: MODE\nuses variable: TAG\n{NOTE_CAPABILITIES}")
-    );
-    assert!(!err.contains("s3cr3t"), "{err}");
-
-    let (out, err) = run(&["-o", "json", "deploy", "compose"], &[]).await;
-    assert_eq!(err, "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["variables"], json!(["MODE", "TAG"]));
-    assert_eq!(v.get("files"), None);
-}
-
-/// An `env_file` outside the directory of the compose file is read only
-/// with `--allow-external-env-file`.
-#[tokio::test]
-async fn deploy_compose_reads_an_outside_env_file_only_when_allowed() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let app = dir.path().join("app");
-    std::fs::create_dir(&app).unwrap();
-    std::fs::write(
-        app.join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:1.27\n    env_file: ../outside.env\n",
-    )
-    .unwrap();
-    let outside = dir.path().join("outside.env");
-    std::fs::write(&outside, "MODE=outside\n").unwrap();
-
-    let args = with_target(&["-o", "json", "deploy", "compose"], &["--dry-run"]);
-    let outcome = run_in(&server, &args, &app, "").await;
-    assert_eq!(outcome.failed(), "nothing was deployed");
-    assert_eq!(outcome.out, "");
-    for want in [
-        "error: compose.yaml: ",
-        "outside.env",
-        "--allow-external-env-file",
-    ] {
-        assert!(outcome.err.contains(want), "{want}: {}", outcome.err);
-    }
-    assert!(!outcome.err.contains("MODE"), "{}", outcome.err);
-
-    let args = with_target(
-        &["-o", "json", "deploy", "compose"],
-        &["--dry-run", "--allow-external-env-file"],
-    );
-    let (out, _) = run_in(&server, &args, &app, "").await.ok();
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["spec"]["web"]["containers"][0]["env"]["MODE"], "outside");
-    // Outside the current directory, so the whole real path.
-    assert_eq!(v["files"], json!(["compose.yaml", real(&outside)]));
-}
-
-/// A link inside the directory that leads out of it is outside.
-#[cfg(unix)]
-#[tokio::test]
-async fn deploy_compose_follows_a_link_before_deciding_where_a_file_is() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let app = dir.path().join("app");
-    std::fs::create_dir(&app).unwrap();
-    std::fs::write(app.join("compose.yaml"), compose_with_image("nginx:${TAG}")).unwrap();
-    let outside = dir.path().join("outside.env");
-    std::fs::write(&outside, "TAG=outside\n").unwrap();
-    std::os::unix::fs::symlink(&outside, app.join(".env")).unwrap();
-
-    let args = with_target(&["deploy", "compose"], &["--dry-run"]);
-    let outcome = run_in(&server, &args, &app, "").await;
-    assert_eq!(outcome.failed(), "nothing was deployed");
-    assert_eq!(outcome.out, "");
-    for want in ["outside.env", "--allow-external-env-file"] {
-        assert!(outcome.err.contains(want), "{want}: {}", outcome.err);
-    }
-
-    let args = with_target(
-        &["-o", "json", "deploy", "compose"],
-        &["--dry-run", "--allow-external-env-file"],
-    );
-    let (out, _) = run_in(&server, &args, &app, "").await.ok();
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["spec"]["web"]["containers"][0]["image"], "nginx:outside");
-    // The list has the file that was read, not the link.
-    assert_eq!(v["files"], json!(["compose.yaml", real(&outside)]));
-}
-
 /// Every input has to be a regular file of at most 8 MiB. Stdin has the
 /// same limit.
 #[tokio::test]
@@ -2713,25 +2080,7 @@ async fn deploy_refuses_an_input_that_is_not_a_regular_file_or_is_too_large() {
             "not a regular file",
         ),
         (
-            &["deploy", "compose", "folder"],
-            "",
-            "folder",
-            "not a regular file",
-        ),
-        (
             &["deploy", "spec", "large.yaml"],
-            "",
-            "large.yaml",
-            "larger than 8 MiB",
-        ),
-        (
-            &["deploy", "k8s", "large.yaml"],
-            "",
-            "large.yaml",
-            "larger than 8 MiB",
-        ),
-        (
-            &["deploy", "compose", "large.yaml"],
             "",
             "large.yaml",
             "larger than 8 MiB",
@@ -2742,18 +2091,11 @@ async fn deploy_refuses_an_input_that_is_not_a_regular_file_or_is_too_large() {
             "-",
             "larger than 8 MiB",
         ),
-        (
-            &["deploy", "k8s", "-"],
-            large.as_str(),
-            "-",
-            "larger than 8 MiB",
-        ),
     ] {
         let args = with_target(head, &["--dry-run"]);
         let outcome = run_in(&server, &args, dir.path(), stdin).await;
         assert_eq!(outcome.failed(), "nothing was deployed", "{head:?}");
         assert_eq!(outcome.out, "", "{head:?}");
-        // The compose converter words its own reading error.
         let start = format!("error: {source}: cannot read");
         assert!(outcome.err.starts_with(&start), "{head:?}: {}", outcome.err);
         assert!(outcome.err.contains(reason), "{head:?}: {}", outcome.err);
@@ -2856,18 +2198,13 @@ async fn a_response_that_does_not_decode_is_escaped_in_the_error() {
 }
 
 /// A deploy that never reaches the API fails like a refused one: JSON mode
-/// writes its one line of details to stderr, with the variable names.
+/// writes its one line of details to stderr.
 #[tokio::test]
 async fn deploy_json_that_cannot_connect_keeps_its_details_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("compose.yaml"),
-        compose_with_image("nginx:${TAG}"),
-    )
-    .unwrap();
+    std::fs::copy(fixtures().join("spec.json"), dir.path().join("spec.json")).unwrap();
     let inputs = || Inputs {
         cwd: dir.path().to_path_buf(),
-        variables: BTreeMap::from([("TAG".to_string(), "s3cr3t".to_string())]),
         stdin: Box::new(Cursor::new(Vec::new())),
     };
     // Nothing listens on port 1.
@@ -2879,7 +2216,8 @@ async fn deploy_json_that_cannot_connect_keeps_its_details_on_stderr() {
             "-o",
             format,
             "deploy",
-            "compose",
+            "spec",
+            "spec.json",
         ];
         let cli = Cli::try_parse_from(args.into_iter().chain(TARGET)).expect("parse");
         let inputs = inputs();
@@ -2895,59 +2233,13 @@ async fn deploy_json_that_cannot_connect_keeps_its_details_on_stderr() {
     let err = run("json").await;
     assert_eq!(err.matches('\n').count(), 1, "{err}");
     let v: Value = serde_json::from_str(&err).unwrap();
-    assert_eq!(v["variables"], json!(["TAG"]));
+    assert_eq!(v["variables"], json!([]));
     assert_eq!(v["warnings"], json!([]));
     assert_eq!(
         v["notes"],
         json!([NOTE_CAPABILITIES.trim_start_matches("note: ").trim_end()])
     );
-    assert!(!err.contains("s3cr3t"), "{err}");
 
     // Text mode said it before sending, and says it once.
-    assert_eq!(
-        run("text").await,
-        format!("uses variable: TAG\n{NOTE_CAPABILITIES}")
-    );
-}
-
-/// A compose file that is a link: the files beside the link are beside the
-/// compose file, and the ones elsewhere still are not.
-#[cfg(unix)]
-#[tokio::test]
-async fn deploy_compose_through_a_link_reads_the_env_files_beside_the_link() {
-    let server = silent_server().await;
-    let dir = tempfile::tempdir().unwrap();
-    let (app, shared) = (dir.path().join("app"), dir.path().join("shared"));
-    std::fs::create_dir(&app).unwrap();
-    std::fs::create_dir(&shared).unwrap();
-    std::fs::write(
-        shared.join("compose.yaml"),
-        "services:\n  web:\n    image: nginx:${TAG}\n    env_file: web.env\n",
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(shared.join("compose.yaml"), app.join("compose.yaml")).unwrap();
-    std::fs::write(app.join(".env"), "TAG=beside-the-link\n").unwrap();
-    std::fs::write(app.join("web.env"), "MODE=app\n").unwrap();
-
-    let args = with_target(&["-o", "json", "deploy", "compose"], &["--dry-run"]);
-    let (out, _) = run_in(&server, &args, &app, "").await.ok();
-    let v: Value = serde_json::from_str(&out).unwrap();
-    let web = &v["spec"]["web"]["containers"][0];
-    assert_eq!(web["image"], "nginx:beside-the-link");
-    assert_eq!(web["env"]["MODE"], "app");
-    assert_eq!(
-        v["files"],
-        json!([real(&shared.join("compose.yaml")), ".env", "web.env"])
-    );
-
-    // A link beside the link that leads elsewhere is still outside.
-    let outside = dir.path().join("outside.env");
-    std::fs::write(&outside, "MODE=outside\n").unwrap();
-    std::fs::remove_file(app.join("web.env")).unwrap();
-    std::os::unix::fs::symlink(&outside, app.join("web.env")).unwrap();
-    let outcome = run_in(&server, &args, &app, "").await;
-    assert_eq!(outcome.failed(), "nothing was deployed");
-    for want in ["outside.env", "--allow-external-env-file"] {
-        assert!(outcome.err.contains(want), "{want}: {}", outcome.err);
-    }
+    assert_eq!(run("text").await, NOTE_CAPABILITIES);
 }

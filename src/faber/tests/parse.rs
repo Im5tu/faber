@@ -124,6 +124,14 @@ fn removed_commands_are_rejected() {
 }
 
 #[test]
+fn deploy_compose_and_k8s_are_rejected() {
+    for kind in ["compose", "k8s"] {
+        let message = parse_err(&["deploy", kind, "--project", "shop", "--env", "staging"]);
+        assert!(message.contains("unrecognized subcommand"), "{message}");
+    }
+}
+
+#[test]
 fn missing_subcommand_is_rejected() {
     parse_err(&[]);
     parse_err(&["cluster"]);
@@ -360,113 +368,6 @@ fn project_subcommands_require_their_names() {
 }
 
 #[test]
-fn deploy_compose_parses_with_and_without_a_file() {
-    assert_eq!(
-        parse(&["deploy", "compose", "--project", "shop", "--env", "staging"]).command,
-        Command::Deploy(DeployCommand::Compose {
-            file: None,
-            target: target("shop", "staging"),
-            env_file: None,
-            allow_external_env_file: false,
-            profiles: vec![],
-            options: no_options(),
-        })
-    );
-    assert_eq!(
-        parse(&[
-            "deploy",
-            "compose",
-            "stack/compose.yaml",
-            "--project",
-            "shop",
-            "--env",
-            "staging",
-            "--env-file",
-            "prod.env",
-            "--allow-external-env-file",
-            "--profile",
-            "debug",
-            "--profile",
-            "tools",
-            "--expose",
-            "web",
-            "--expose",
-            "api",
-            "--prune",
-            "--dry-run",
-            "--strict",
-        ])
-        .command,
-        Command::Deploy(DeployCommand::Compose {
-            file: Some(PathBuf::from("stack/compose.yaml")),
-            target: target("shop", "staging"),
-            env_file: Some(PathBuf::from("prod.env")),
-            allow_external_env_file: true,
-            profiles: vec!["debug".into(), "tools".into()],
-            options: DeployOptions {
-                expose: vec!["web".into(), "api".into()],
-                prune: true,
-                dry_run: true,
-                strict: true,
-            },
-        })
-    );
-}
-
-#[test]
-fn deploy_k8s_takes_files_directories_and_stdin() {
-    assert_eq!(
-        parse(&[
-            "deploy",
-            "k8s",
-            "app.yaml",
-            "manifests",
-            "-",
-            "--project",
-            "shop",
-            "--env",
-            "staging",
-            "--prune",
-        ])
-        .command,
-        Command::Deploy(DeployCommand::K8s {
-            inputs: vec!["app.yaml".into(), "manifests".into(), "-".into()],
-            target: target("shop", "staging"),
-            options: DeployOptions {
-                prune: true,
-                ..no_options()
-            },
-        })
-    );
-    // At least one input.
-    parse_err(&["deploy", "k8s", "--project", "shop", "--env", "staging"]);
-    // The compose-only flags belong to compose.
-    parse_err(&[
-        "deploy",
-        "k8s",
-        "app.yaml",
-        "--project",
-        "shop",
-        "--env",
-        "staging",
-        "--allow-external-env-file",
-    ]);
-    for flag in ["--env-file", "--profile"] {
-        parse_err(&[
-            "deploy",
-            "k8s",
-            "app.yaml",
-            "--project",
-            "shop",
-            "--env",
-            "staging",
-            flag,
-            "x",
-        ]);
-    }
-}
-
-#[test]
 fn deploy_spec_takes_one_file_or_stdin() {
     for file in ["spec.json", "-"] {
         assert_eq!(
@@ -510,9 +411,10 @@ fn deploy_spec_takes_one_file_or_stdin() {
 /// No deploy has a default project or environment.
 #[test]
 fn every_deploy_requires_project_and_env() {
-    for kind in [&["compose"][..], &["k8s", "app.yaml"], &["spec", "s.json"]] {
+    for file in ["s.json", "-"] {
+        let kind = ["spec", file];
         let mut args = vec!["deploy"];
-        args.extend_from_slice(kind);
+        args.extend_from_slice(&kind);
 
         let mut without_env = args.clone();
         without_env.extend_from_slice(&["--project", "shop"]);
@@ -646,9 +548,9 @@ fn project_and_env_read_no_variable_and_have_no_short_flag() {
     }
     let mut seen = (0, 0);
     check(&Cli::command(), "faber", &mut seen);
-    // deploy compose, k8s and spec, and app ls, show and rm. `--env` is
+    // deploy spec, and app ls, show and rm. `--env` is
     // also on project create.
-    assert_eq!(seen, (6, 7));
+    assert_eq!(seen, (4, 5));
 }
 
 /// A `FABER_PROJECT` in the environment is not a project.
