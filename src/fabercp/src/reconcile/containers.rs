@@ -19,8 +19,10 @@
 //! - a pod of an older revision of a workload that still has replicas here
 //!   is left to the supervisor, which asks for its stop once the newer
 //!   revision is available. If the workload has a block volume the two
-//!   revisions would share it, so the older one is asked to stop at once,
-//!   and the newer one starts when it is gone;
+//!   revisions would share it, so the older one is asked to stop first, and
+//!   the newer one starts when it is gone. These workloads roll one replica
+//!   index at a time: the stop waits until the lower indices are available
+//!   on the newest revision (see [`roll`]);
 //! - ramdisks of replicas that are not on this node are removed, found
 //!   through `ListVolumes`. Block volumes are kept: they live as long as the
 //!   workload.
@@ -28,6 +30,8 @@
 //! A workload whose env cannot be opened (no cluster key, the wrong key) is
 //! *held*: its pods are neither started nor stopped. A missing key must not
 //! look like "nothing is wanted".
+
+mod roll;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -39,6 +43,7 @@ use faber_node_protocol::{DnsConfig, ReplicaInfo, ReplicaRef, VolumeKind};
 use ipnet::Ipv4Net;
 
 use super::step::{Planned, ReconcileStep, ReplicatedStateView, StepFuture};
+use crate::lease::LeaseTiming;
 use crate::raft::store::place::ReplicaPlacement;
 use crate::runner::desired::{parse_revision, revision_string};
 use crate::runner::env::data_key_for;
@@ -49,6 +54,7 @@ use crate::runner::{
     DEFAULT_STOP_GRACE_SECS, DesiredContainer, DesiredReplica, DesiredVolume, EnvSource,
 };
 use crate::secrets::{ClusterKeyProvider, env_scope};
+use crate::status::StatusView;
 
 /// What the host needs to run containers.
 #[derive(Clone)]
@@ -70,6 +76,10 @@ pub struct ContainersDesired {
     /// Workloads placed here whose env could not be opened. Their pods are
     /// left as they are.
     pub held: BTreeSet<WorkloadKey>,
+    /// Replicas of block-volume workloads whose turn in the roll has not come:
+    /// they do not replace their older replica yet (see [`roll`]). A status
+    /// report that moves no gate leaves this value as it was.
+    pub waiting: HashSet<ReplicaRef>,
     /// This node's container subnet, the only pod addresses probed.
     pub subnet: Option<Ipv4Net>,
 }
@@ -81,6 +91,7 @@ pub struct ContainersStep<C> {
     node_id: u64,
     cluster_key: Arc<dyn ClusterKeyProvider>,
     env: Arc<dyn EnvSource>,
+    lease_timing: LeaseTiming,
 }
 
 impl<C: NodeClient> ContainersStep<C> {
@@ -97,7 +108,17 @@ impl<C: NodeClient> ContainersStep<C> {
             node_id,
             cluster_key,
             env,
+            lease_timing: LeaseTiming::default(),
         }
+    }
+
+    /// The clocks of the leader task, which decide how far the lease clock
+    /// can run ahead of a status report that is on time. The default is
+    /// what production runs.
+    #[must_use]
+    pub fn with_lease_timing(mut self, lease_timing: LeaseTiming) -> Self {
+        self.lease_timing = lease_timing;
+        self
     }
 
     async fn reconcile(&self, desired: &ContainersDesired) -> anyhow::Result<()> {
@@ -119,6 +140,12 @@ impl<C: NodeClient> ContainersStep<C> {
             }
         }
 
+        let waiting_slots: HashSet<(WorkloadKey, u32)> = desired
+            .waiting
+            .iter()
+            .map(|r| (workload_of(r), r.replica_index))
+            .collect();
+
         let mut known: Vec<ReplicaRef> = listed.iter().map(|p| p.replica.clone()).collect();
         known.extend(self.state.entries().into_iter().map(|(k, _)| k));
         known.sort_by(|a, b| order(a).cmp(&order(b)));
@@ -133,8 +160,20 @@ impl<C: NodeClient> ContainersStep<C> {
                 (Some(newest), Some(this)) if this < *newest
             );
             match (older, with_block.contains(&workload)) {
-                // The newer revision needs the volume the older one has.
-                (true, true) => self.state.request_stop(key, StopReason::Replaced),
+                // The newer revision needs the volume the older one has. It
+                // is this replica's turn only when the lower indices are
+                // available; until then the older one keeps serving.
+                (true, true) if !waiting_slots.contains(&(workload.clone(), key.replica_index)) => {
+                    self.state.request_stop(key, StopReason::Replaced);
+                }
+                // Not its turn. One that never started has nothing to keep.
+                (true, true) => {
+                    let running =
+                        pods.contains_key(key) || self.state.entry(key).is_some_and(|e| e.launched);
+                    if !running {
+                        self.state.request_stop(key, StopReason::Replaced);
+                    }
+                }
                 // The supervisor asks for the stop once the newer revision
                 // is available.
                 (true, false) => self.state.mark_superseded(key),
@@ -151,15 +190,33 @@ impl<C: NodeClient> ContainersStep<C> {
             if self.state.entry(&d.replica).is_some_and(|e| e.launched) {
                 continue;
             }
-            if d.has_block_volume() && self.slot_is_taken(d, &listed) {
-                for other in self.others_in_slot(d, &listed) {
-                    self.state.request_stop(&other, StopReason::Replaced);
+            if d.has_block_volume() {
+                let others = self.others_in_slot(d, &listed);
+                if !others.is_empty() {
+                    let still_serving = others
+                        .iter()
+                        .any(|o| self.state.entry(o).is_none_or(|e| e.stop.is_none()));
+                    if desired.waiting.contains(&d.replica) && still_serving {
+                        self.state.set_deferred(
+                            &d.replica,
+                            Some(
+                                "waiting for the lower replicas to be available before replacing the older revision"
+                                    .to_owned(),
+                            ),
+                        );
+                        continue;
+                    }
+                    for other in &others {
+                        self.state.request_stop(other, StopReason::Replaced);
+                    }
+                    self.state.set_deferred(
+                        &d.replica,
+                        Some(
+                            "waiting for the older revision to release its block volume".to_owned(),
+                        ),
+                    );
+                    continue;
                 }
-                self.state.set_deferred(
-                    &d.replica,
-                    Some("waiting for the older revision to release its block volume".to_owned()),
-                );
-                continue;
             }
             let existing = pods.get(&d.replica).copied();
             if let Err(e) = launch(&self.client, &self.state, self.env.as_ref(), d, existing).await
@@ -194,10 +251,6 @@ impl<C: NodeClient> ContainersStep<C> {
         others.sort_by(|a, b| order(a).cmp(&order(b)));
         others.dedup();
         others
-    }
-
-    fn slot_is_taken(&self, d: &DesiredReplica, listed: &[ReplicaInfo]) -> bool {
-        !self.others_in_slot(d, listed).is_empty()
     }
 
     /// Whether the env of `workload` can be opened, or why not. Opens
@@ -321,6 +374,20 @@ impl<C: NodeClient> ReconcileStep for ContainersStep<C> {
         let Some(placed) = view.placement.as_ref() else {
             return Planned { desired, warnings };
         };
+        let tick = placed
+            .mesh
+            .as_ref()
+            .map_or(0, |m| self.lease_timing.tick_clock_secs(m.lease_secs));
+        let mut statuses = placed.statuses.clone();
+        if let Some(mesh) = placed.mesh.as_ref() {
+            statuses.retain(|id, _| mesh.nodes.contains_key(id));
+        }
+        let status = StatusView::new(
+            statuses,
+            view.status_interval_secs,
+            placed.mesh.as_ref().map_or(0, |m| m.clock),
+            tick,
+        );
         for (project, environment, record) in &placed.environments {
             let Some(plan) = placed.records.get(&(project.clone(), environment.clone())) else {
                 continue;
@@ -336,14 +403,32 @@ impl<C: NodeClient> ReconcileStep for ContainersStep<C> {
                 };
                 let key = (project.clone(), environment.clone(), name.clone());
                 match self.check_env(view, project, environment, workload) {
-                    Ok(()) => desired.replicas.extend(Self::desired_replicas(
-                        subnet,
-                        &key,
-                        workload.revision,
-                        placement.uid_base,
-                        &workload.spec,
-                        &mine,
-                    )),
+                    Ok(()) => {
+                        let built = Self::desired_replicas(
+                            subnet,
+                            &key,
+                            workload.revision,
+                            placement.uid_base,
+                            &workload.spec,
+                            &mine,
+                        );
+                        if built.iter().any(DesiredReplica::has_block_volume) {
+                            let closed = roll::closed_gates(&status.workload(
+                                project,
+                                environment,
+                                name,
+                                workload.revision,
+                                &placement.replicas,
+                            ));
+                            desired.waiting.extend(
+                                built
+                                    .iter()
+                                    .filter(|d| closed.contains(&d.replica.replica_index))
+                                    .map(|d| d.replica.clone()),
+                            );
+                        }
+                        desired.replicas.extend(built);
+                    }
                     Err(why) => {
                         warnings.push(format!(
                             "{project}/{environment}/{name}: {why}; its containers are left as they are"

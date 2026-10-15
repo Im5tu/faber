@@ -476,3 +476,302 @@ async fn a_failed_start_is_reported_and_the_other_replicas_still_start() {
     step.apply(&planned.desired).await.unwrap();
     assert!(state.entry(&web(7, 0)).unwrap().launched);
 }
+
+// The roll of a block-volume workload, one replica index at a time.
+
+fn mesh_node(id: u64) -> crate::mesh::state::NodeRecord {
+    crate::mesh::state::NodeRecord {
+        node_id: id,
+        public_key: "k".into(),
+        mesh_ip: format!("10.99.0.{id}").parse().unwrap(),
+        endpoint: None,
+        invite_id: None,
+        instance_id: None,
+        container_subnet: None,
+        name: format!("n{id}"),
+        lease_renewed_at: 0,
+    }
+}
+
+fn report(
+    revision: u64,
+    index: u32,
+    state: ReplicaState,
+) -> crate::raft::store::status::ReplicaReport {
+    crate::raft::store::status::ReplicaReport {
+        project: "shop".into(),
+        environment: "prod".into(),
+        workload: "web".into(),
+        revision,
+        replica_index: index,
+        state,
+        pod_ip: None,
+        detail: None,
+    }
+}
+
+type Reports = Option<(u64, Vec<crate::raft::store::status::ReplicaReport>)>;
+
+/// `web` at `revision` with `placed[i]` the node of replica `i` (`None`:
+/// unplaced), the lease clock at `clock`, and what node 2 reported at the
+/// given time.
+fn rolling(
+    c: &Cluster,
+    revision: u64,
+    placed: &[Option<u64>],
+    clock: u64,
+    node_two: Reports,
+) -> ReplicatedStateView {
+    let mut view = c.view(revision, &[]);
+    let mut mesh =
+        crate::mesh::MeshState::init(crate::mesh::state::MeshConfig::default(), mesh_node(1))
+            .unwrap();
+    mesh.nodes = (1..=3).map(|id| (id, mesh_node(id))).collect();
+    mesh.clock = clock;
+    let placement = view.placement.as_mut().unwrap();
+    placement.mesh = Some(mesh);
+    let record = placement
+        .records
+        .get_mut(&("shop".to_owned(), "prod".to_owned()))
+        .unwrap();
+    record.workloads.get_mut("web").unwrap().replicas = placed
+        .iter()
+        .enumerate()
+        .map(|(i, n)| match n {
+            Some(n) => ReplicaPlacement::on(i as u32, *n),
+            None => ReplicaPlacement::unplaced(i as u32, "volume_lost"),
+        })
+        .collect();
+    if let Some((reported_at, replicas)) = node_two {
+        placement.statuses.insert(
+            2,
+            crate::raft::store::status::NodeStatus {
+                reported_at,
+                capacity: Default::default(),
+                replicas,
+            },
+        );
+    }
+    view
+}
+
+/// Replica 1 of `web` runs at revision 7 on this node and is available.
+/// Replica 0 is on node 2.
+async fn serving_old_replica(
+    c: &Cluster,
+    node: &FakeNode,
+    state: &Arc<RunnerState>,
+) -> (ContainersStep<FakeNode>, Super) {
+    let step = c.step(node, state);
+    run(&step, &rolling(c, 7, &[Some(2), Some(NODE)], 100, None)).await;
+    let mut sup = Super::new(node, state);
+    sup.step(Duration::ZERO).await;
+    assert_eq!(state.replicas()[0].state, ReplicaState::Available);
+    node.take_log();
+    (step, sup)
+}
+
+#[tokio::test]
+async fn a_replica_waits_for_the_lower_index_and_the_old_one_keeps_serving() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, mut sup) = serving_old_replica(&c, &node, &state).await;
+
+    // Replica 0 of revision 9 is still deploying on node 2.
+    let stuck = rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Deploying)])),
+    );
+    let planned = step.plan(&stuck);
+    assert_eq!(planned.desired.waiting, HashSet::from([web(9, 1)]));
+    step.apply(&planned.desired).await.unwrap();
+    sup.step(DRAIN_PERIOD * 2).await;
+    // The old replica is untouched and still available: the roll stopped
+    // at index 0 and the service keeps a backend.
+    assert_eq!(state.entry(&web(7, 1)).unwrap().stop, None);
+    assert_eq!(state.replicas()[0].state, ReplicaState::Available);
+    assert!(node.log().is_empty(), "{:?}", node.log());
+    assert!(!state.entry(&web(9, 1)).unwrap().launched);
+
+    // Replica 0 is available: this one's turn. The old one stops first.
+    let open = rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Available)])),
+    );
+    let planned = step.plan(&open);
+    assert!(planned.desired.waiting.is_empty());
+    step.apply(&planned.desired).await.unwrap();
+    assert_eq!(
+        state.entry(&web(7, 1)).unwrap().stop,
+        Some(StopReason::Replaced)
+    );
+    sup.step(Duration::ZERO).await;
+    sup.step(DRAIN_PERIOD).await;
+    sup.step(Duration::ZERO).await;
+    assert!(state.entry(&web(9, 1)).unwrap().launched);
+    let log = node.log();
+    let removed = log
+        .iter()
+        .position(|l| l.starts_with("remove_sandbox"))
+        .unwrap();
+    let created = log
+        .iter()
+        .position(|l| l.starts_with("create_container"))
+        .unwrap();
+    assert!(removed < created, "{log:?}");
+}
+
+#[test]
+fn a_status_report_that_moves_no_gate_leaves_the_plan_as_it_was() {
+    let c = Cluster::new();
+    let step = c.step(&FakeNode::default(), &Arc::default());
+    let before = step.plan(&rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Deploying)])),
+    ));
+    // A later report: newer time and a detail. Still deploying.
+    let mut again = report(9, 0, ReplicaState::Deploying);
+    again.detail = Some("pulling".into());
+    let after = step.plan(&rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        105,
+        Some((105, vec![again])),
+    ));
+    assert_eq!(before.desired, after.desired);
+    // Available does move the gate.
+    let moved = step.plan(&rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        105,
+        Some((105, vec![report(9, 0, ReplicaState::Available)])),
+    ));
+    assert_ne!(before.desired, moved.desired);
+}
+
+#[test]
+fn the_gate_is_judged_from_placement_and_staleness() {
+    let c = Cluster::new();
+    let step = c.step(&FakeNode::default(), &Arc::default());
+    let waiting = |view: &ReplicatedStateView| step.plan(view).desired.waiting;
+    let mine = HashSet::from([web(9, 1)]);
+    let available = vec![report(9, 0, ReplicaState::Available)];
+
+    // Available and fresh: open.
+    let fresh = rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        100,
+        Some((100, available.clone())),
+    );
+    assert!(waiting(&fresh).is_empty());
+    // The node of replica 0 has not reported for a long time: wait.
+    let stale = rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        10_000,
+        Some((100, available)),
+    );
+    assert_eq!(waiting(&stale), mine);
+    // Its node never reported: wait.
+    let silent = rolling(&c, 9, &[Some(2), Some(NODE)], 100, None);
+    assert_eq!(waiting(&silent), mine);
+    // Its volume is lost and it is unplaced: the roll does not deadlock.
+    let lost = rolling(&c, 9, &[None, Some(NODE)], 100, None);
+    assert!(waiting(&lost).is_empty());
+    // Index 0 is never gated, whatever the others do.
+    let first = rolling(&c, 9, &[Some(NODE), Some(2)], 100, None);
+    assert!(waiting(&first).is_empty());
+}
+
+#[test]
+fn a_stateless_workload_is_never_gated() {
+    let c = Cluster::stateless();
+    let step = c.step(&FakeNode::default(), &Arc::default());
+    let view = rolling(
+        &c,
+        9,
+        &[Some(2), Some(NODE)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Deploying)])),
+    );
+    assert!(step.plan(&view).desired.waiting.is_empty());
+}
+
+#[tokio::test]
+async fn a_newer_revision_mid_roll_takes_the_roll_over() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, mut sup) = serving_old_replica(&c, &node, &state).await;
+    let deploying = |rev| {
+        rolling(
+            &c,
+            rev,
+            &[Some(2), Some(NODE)],
+            100,
+            Some((100, vec![report(rev, 0, ReplicaState::Deploying)])),
+        )
+    };
+    run(&step, &deploying(9)).await;
+    assert!(state.entry(&web(9, 1)).unwrap().deferred);
+
+    // Revision 11 arrives before revision 9 got its turn. Revision 9 never
+    // started, so it is dropped; revision 7 still serves.
+    run(&step, &deploying(11)).await;
+    sup.step(Duration::ZERO).await;
+    assert_eq!(
+        state.entry(&web(9, 1)).and_then(|e| e.stop),
+        Some(StopReason::Replaced)
+    );
+    assert_eq!(state.entry(&web(7, 1)).unwrap().stop, None);
+    assert!(state.entry(&web(11, 1)).unwrap().deferred);
+    assert_eq!(node.sandbox_count(), 1);
+    assert!(node.log().is_empty(), "{:?}", node.log());
+}
+
+#[tokio::test]
+async fn a_gate_that_closes_after_the_old_replica_was_stopped_does_not_hold_the_new_one() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, mut sup) = serving_old_replica(&c, &node, &state).await;
+    let ok = vec![report(9, 0, ReplicaState::Available)];
+    let open = rolling(&c, 9, &[Some(2), Some(NODE)], 100, Some((100, ok.clone())));
+    run(&step, &open).await;
+    assert_eq!(
+        state.entry(&web(7, 1)).unwrap().stop,
+        Some(StopReason::Replaced)
+    );
+    // Node 2 goes quiet before the old replica is gone: the gate closes.
+    let quiet = rolling(&c, 9, &[Some(2), Some(NODE)], 10_000, Some((100, ok)));
+    assert_eq!(
+        step.plan(&quiet).desired.waiting,
+        HashSet::from([web(9, 1)])
+    );
+    run(&step, &quiet).await;
+    sup.step(Duration::ZERO).await;
+    sup.step(DRAIN_PERIOD).await;
+    sup.step(Duration::ZERO).await;
+    assert!(state.entry(&web(9, 1)).unwrap().launched);
+}
