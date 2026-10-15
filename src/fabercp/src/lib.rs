@@ -883,13 +883,16 @@ pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
                 host.backends.network.clone(),
                 host.lease_timing,
             ))
-            .with(ContainersStep::new(
-                runner::SocketNodeClient::new(host.containers.socket.clone()),
-                host.containers.state.clone(),
-                host.identity.node_id,
-                host.containers.cluster_key.clone(),
-                host.containers.env.clone(),
-            )),
+            .with(
+                ContainersStep::new(
+                    runner::SocketNodeClient::new(host.containers.socket.clone()),
+                    host.containers.state.clone(),
+                    host.identity.node_id,
+                    host.containers.cluster_key.clone(),
+                    host.containers.env.clone(),
+                )
+                .with_lease_timing(host.lease_timing),
+            ),
     )
 }
 
