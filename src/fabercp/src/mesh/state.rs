@@ -41,6 +41,13 @@ pub const DEFAULT_CONTAINER_CIDR: Ipv4Net = match Ipv4Net::new(Ipv4Addr::new(10,
     Ok(n) => n,
     Err(_) => panic!("valid default container cidr"),
 };
+/// Service (virtual IP) range used when no other is given for a new mesh.
+pub const DEFAULT_SERVICE_CIDR: Ipv4Net = match Ipv4Net::new(Ipv4Addr::new(10, 201, 0, 0), 16) {
+    Ok(n) => n,
+    Err(_) => panic!("valid default service cidr"),
+};
+/// Longest prefix a service range may have: two host addresses.
+pub const MAX_SERVICE_CIDR_PREFIX: u8 = 30;
 /// Prefix length of the container subnet each node gets.
 pub const DEFAULT_CONTAINER_SUBNET_PREFIX: u8 = 24;
 /// WireGuard UDP listen port used when `--wg-port` is not given.
@@ -78,6 +85,11 @@ pub struct MeshConfig {
     /// from a constant, so replaying the log always allocates the same way.
     #[serde(default = "default_container_subnet_prefix")]
     pub container_subnet_prefix: u8,
+    /// Every service's virtual IP is a host address in this network. `None`
+    /// for a mesh created without one: then no service gets an address.
+    /// Fixed once the mesh exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_cidr: Option<Ipv4Net>,
 }
 
 fn default_container_subnet_prefix() -> u8 {
@@ -92,6 +104,7 @@ impl Default for MeshConfig {
             wg_port: DEFAULT_WG_PORT,
             container_cidr: None,
             container_subnet_prefix: DEFAULT_CONTAINER_SUBNET_PREFIX,
+            service_cidr: None,
         }
     }
 }
@@ -223,6 +236,11 @@ impl MeshState {
     /// range's own prefix, when the range has host bits set, or when it
     /// overlaps `config.cidr`.
     ///
+    /// When `config.service_cidr` is set, also rejects with `bad_request`
+    /// when the range has host bits set, is longer than
+    /// [`MAX_SERVICE_CIDR_PREFIX`], or overlaps `config.cidr` or
+    /// `config.container_cidr`.
+    ///
     /// The founder's container subnet is allocated here: the first subnet of
     /// the range, or `None` when there is no range. Whatever
     /// `founder.container_subnet` the proposer sent is overwritten.
@@ -253,6 +271,9 @@ impl MeshState {
             Some(range) => Some(first_container_subnet(&config, range)?),
             None => None,
         };
+        if let Some(range) = config.service_cidr {
+            check_service_range(&config, range)?;
+        }
         founder.lease_renewed_at = 0;
         Ok(Self {
             config,
@@ -830,6 +851,40 @@ fn first_container_subnet(config: &MeshConfig, range: Ipv4Net) -> Result<Ipv4Net
         .ok()
         .and_then(|mut subnets| subnets.next())
         .ok_or_else(|| bad(format!("container range {range} has no /{prefix} subnet")))
+}
+
+/// Whether two networks share an address.
+fn overlap(a: Ipv4Net, b: Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
+/// Why `range` cannot be the service range of a mesh with `config`, if it
+/// cannot.
+fn check_service_range(config: &MeshConfig, range: Ipv4Net) -> Result<(), Rejection> {
+    let bad = |msg: String| Rejection::new(error_code::BAD_REQUEST, msg);
+    if range.prefix_len() > MAX_SERVICE_CIDR_PREFIX {
+        return Err(bad(format!(
+            "service range {range} is longer than /{MAX_SERVICE_CIDR_PREFIX}"
+        )));
+    }
+    if range != range.trunc() {
+        return Err(bad(format!(
+            "service range {range} has host bits set; did you mean {}?",
+            range.trunc()
+        )));
+    }
+    if overlap(range, config.cidr) {
+        return Err(bad(format!(
+            "service range {range} overlaps the mesh CIDR {}",
+            config.cidr
+        )));
+    }
+    if let Some(containers) = config.container_cidr.filter(|c| overlap(range, *c)) {
+        return Err(bad(format!(
+            "service range {range} overlaps the container range {containers}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1513,6 +1568,59 @@ mod tests {
         // Next to the mesh, not overlapping it.
         let s = founded_with_range("10.100.0.0/16", 24);
         assert_eq!(s.nodes[&1].container_subnet, Some(net("10.100.0.0/24")));
+    }
+
+    fn cfg_with_service_range(service: &str) -> MeshConfig {
+        MeshConfig {
+            service_cidr: Some(net(service)),
+            ..cfg_with_range("10.200.0.0/16", 24)
+        }
+    }
+
+    #[test]
+    fn init_rejects_bad_service_ranges() {
+        for (range, why) in [
+            ("10.201.0.0/31", "fewer than two hosts"),
+            ("10.201.0.1/16", "host bits set"),
+            ("10.99.0.0/16", "same as the mesh"),
+            ("10.99.8.0/24", "inside the mesh"),
+            ("10.0.0.0/8", "contains the mesh and the containers"),
+            ("10.200.0.0/16", "same as the containers"),
+            ("10.200.5.0/24", "inside the containers"),
+            ("10.192.0.0/10", "contains the containers"),
+        ] {
+            let err =
+                MeshState::init(cfg_with_service_range(range), node(1, "10.99.0.1")).unwrap_err();
+            assert_eq!(err.code, ec::BAD_REQUEST, "{range}: {why}");
+        }
+        // Without a container range only the mesh counts.
+        let config = MeshConfig {
+            service_cidr: Some(net("10.200.0.0/16")),
+            ..MeshConfig::default()
+        };
+        assert!(MeshState::init(config, node(1, "10.99.0.1")).is_ok());
+    }
+
+    #[test]
+    fn init_accepts_a_service_range_apart_from_the_others() {
+        for range in ["10.201.0.0/16", "10.201.0.0/30", "192.168.0.0/16"] {
+            let s = MeshState::init(cfg_with_service_range(range), node(1, "10.99.0.1")).unwrap();
+            assert_eq!(s.config.service_cidr, Some(net(range)));
+        }
+        assert_eq!(DEFAULT_SERVICE_CIDR.to_string(), "10.201.0.0/16");
+        MeshState::init(
+            cfg_with_service_range(&DEFAULT_SERVICE_CIDR.to_string()),
+            node(1, "10.99.0.1"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_mesh_config_with_a_service_range_round_trips() {
+        let config = cfg_with_service_range("10.201.0.0/16");
+        let v = serde_json::to_value(config).unwrap();
+        assert_eq!(v["service_cidr"], "10.201.0.0/16");
+        assert_eq!(serde_json::from_value::<MeshConfig>(v).unwrap(), config);
     }
 
     #[test]

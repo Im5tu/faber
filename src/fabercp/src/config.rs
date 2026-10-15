@@ -11,11 +11,13 @@ use ipnet::Ipv4Net;
 
 use crate::lease::LeaseTiming;
 use crate::mesh::identity::{BootstrapInput, Identity};
-use crate::mesh::state::DEFAULT_CONTAINER_SUBNET_PREFIX;
+use crate::mesh::state::{DEFAULT_CONTAINER_SUBNET_PREFIX, MAX_SERVICE_CIDR_PREFIX};
 use crate::mesh::{MeshState, parse_endpoint};
 use crate::raft::types::NodeId;
 
-pub use crate::mesh::state::{DEFAULT_CONTAINER_CIDR, DEFAULT_MESH_CIDR, DEFAULT_WG_PORT};
+pub use crate::mesh::state::{
+    DEFAULT_CONTAINER_CIDR, DEFAULT_MESH_CIDR, DEFAULT_SERVICE_CIDR, DEFAULT_WG_PORT,
+};
 pub use faber_api_types::DEFAULT_PEER_PORT;
 
 /// Hosts the MCP endpoint always accepts in the `Host` header. Guards against
@@ -144,6 +146,13 @@ pub struct Config {
     #[arg(long, env = "FABER_CONTAINER_CIDR", default_value_t = DEFAULT_CONTAINER_CIDR)]
     pub container_cidr: Ipv4Net,
 
+    /// Service address range for --new-mesh: every service gets one virtual
+    /// IP from it. Must have two hosts or more, no host bits set, and must
+    /// not overlap --mesh-cidr or --container-cidr (see [`Config::validate`]).
+    /// Fixed once the mesh exists.
+    #[arg(long, env = "FABER_SERVICE_CIDR", default_value_t = DEFAULT_SERVICE_CIDR)]
+    pub service_cidr: Ipv4Net,
+
     /// Name of this node for --new-mesh: a DNS label (a-z, 0-9 and
     /// hyphens, at most 63 characters, no hyphen at either end). Defaults to
     /// node-1. Read when the cluster is created (`cluster init`), not when
@@ -227,6 +236,7 @@ impl Config {
             new_mesh: false,
             mesh_cidr: DEFAULT_MESH_CIDR,
             container_cidr: DEFAULT_CONTAINER_CIDR,
+            service_cidr: DEFAULT_SERVICE_CIDR,
             node_name: None,
             join_token_file: None,
             wg_endpoint: None,
@@ -253,6 +263,7 @@ impl Config {
         }
         if self.new_mesh {
             self.check_container_cidr()?;
+            self.check_service_cidr()?;
             self.check_node_name()?;
         }
         if self.reconcile_interval_secs < 1 {
@@ -294,6 +305,42 @@ impl Config {
         }
         if range.contains(&mesh.network()) || mesh.contains(&range.network()) {
             anyhow::bail!("--container-cidr {range} overlaps --mesh-cidr {mesh}");
+        }
+        Ok(())
+    }
+
+    /// `--service-cidr` as a new mesh needs it: at least two hosts, without
+    /// host bits, and apart from `--mesh-cidr` and `--container-cidr`. The
+    /// founder's `InitCluster` is rejected for the same reasons, so the check
+    /// is made before anything starts, as for `--container-cidr`. The default
+    /// is checked too: a mesh or container range that contains it needs
+    /// `--service-cidr` as well.
+    fn check_service_cidr(&self) -> anyhow::Result<()> {
+        let range = self.service_cidr;
+        if range.prefix_len() > MAX_SERVICE_CIDR_PREFIX {
+            anyhow::bail!(
+                "--service-cidr {range} is too small: it must be a /{MAX_SERVICE_CIDR_PREFIX} or larger"
+            );
+        }
+        if range != range.trunc() {
+            anyhow::bail!(
+                "--service-cidr {range} has host bits set; did you mean {}?",
+                range.trunc()
+            );
+        }
+        let overlaps =
+            |other: Ipv4Net| range.contains(&other.network()) || other.contains(&range.network());
+        if overlaps(self.mesh_cidr) {
+            anyhow::bail!(
+                "--service-cidr {range} overlaps --mesh-cidr {}",
+                self.mesh_cidr
+            );
+        }
+        if overlaps(self.container_cidr) {
+            anyhow::bail!(
+                "--service-cidr {range} overlaps --container-cidr {}",
+                self.container_cidr
+            );
         }
         Ok(())
     }
@@ -812,6 +859,54 @@ mod tests {
         joiner.new_mesh = false;
         joiner.validate().unwrap();
         joiner.join_token_file = Some(PathBuf::from("/t"));
+        joiner.validate().unwrap();
+    }
+
+    /// Like the container range: `InitCluster` refuses a bad service range
+    /// only after raft is initialised, so the founder checks it first. That
+    /// includes the default against the other ranges.
+    #[test]
+    fn a_new_mesh_needs_a_usable_service_range() {
+        assert_eq!(parse(&[]).service_cidr.to_string(), "10.201.0.0/16");
+        let founder = |args: &[&str]| {
+            let mut all = vec!["--new-mesh"];
+            all.extend_from_slice(args);
+            parse(&all)
+        };
+        founder(&[]).validate().unwrap();
+        founder(&["--service-cidr", "10.201.0.0/30"])
+            .validate()
+            .unwrap();
+        let from_env = with_env(&[("FABER_SERVICE_CIDR", "192.168.0.0/24")], || {
+            Config::parse_from(["fabercp", "--new-mesh"])
+        });
+        assert_eq!(from_env.service_cidr.to_string(), "192.168.0.0/24");
+
+        for (args, expected) in [
+            (vec!["--service-cidr", "10.201.0.0/31"], "too small"),
+            (vec!["--service-cidr", "10.201.1.0/16"], "host bits"),
+            (
+                vec!["--service-cidr", "10.99.0.0/24"],
+                "overlaps --mesh-cidr 10.99.0.0/16",
+            ),
+            (
+                vec!["--service-cidr", "10.200.4.0/24"],
+                "overlaps --container-cidr 10.200.0.0/16",
+            ),
+            // The default service range inside a bigger container range.
+            (
+                vec!["--container-cidr", "10.128.0.0/9"],
+                "overlaps --container-cidr 10.128.0.0/9",
+            ),
+        ] {
+            let err = founder(&args).validate().unwrap_err().to_string();
+            assert!(err.contains("--service-cidr"), "{args:?}: {err}");
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+
+        // Only a new mesh takes the range from here.
+        let mut joiner = founder(&["--service-cidr", "10.99.0.0/24"]);
+        joiner.new_mesh = false;
         joiner.validate().unwrap();
     }
 
