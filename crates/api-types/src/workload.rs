@@ -1388,6 +1388,12 @@ pub struct WorkloadSummary {
     /// Moves when the pod template changes: everything in the spec except
     /// `scale`, `placement` and `expose`.
     pub revision: u64,
+    /// Replicas whose state is `available`.
+    pub available: u32,
+    /// Replicas wanted: the replica count, or for a daemon the replicas the
+    /// leader has placed. A replica without a node counts here and not in
+    /// `available`.
+    pub desired: u32,
 }
 
 /// `GET /api/v1/projects/{project}/environments/{environment}/workloads/{workload}`
@@ -3593,6 +3599,8 @@ mod tests {
             scale: replicas(3, Strategy::Spread),
             expose: Exposure::Cluster,
             revision: 7,
+            available: 2,
+            desired: 3,
         };
         assert_eq!(
             serde_json::to_value(WorkloadListResponse {
@@ -3603,6 +3611,7 @@ mod tests {
                 "project": "shop", "environment": "staging", "name": "web",
                 "fqdn": "web.staging.shop.faber.internal",
                 "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7,
+                "available": 2, "desired": 3,
             }]})
         );
         let one: WorkloadResponse = serde_json::from_value(json!({

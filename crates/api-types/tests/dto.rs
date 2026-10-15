@@ -848,12 +848,14 @@ fn workload_route_shapes() {
         },
         expose: Exposure::Cluster,
         revision: 7,
+        available: 2,
+        desired: 3,
     };
     let summary_json = json!({
         "project": "shop", "environment": "staging", "name": "web",
         "fqdn": "web.staging.shop.faber.internal",
         "scale": {"replicas": {"count": 3, "strategy": "spread"}},
-        "expose": "cluster", "revision": 7
+        "expose": "cluster", "revision": 7, "available": 2, "desired": 3
     });
     assert_shape(summary.clone(), summary_json.clone());
     assert_shape(

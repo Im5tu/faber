@@ -20,8 +20,8 @@ use faber_api_types::error_code;
 use faber_api_types::name::validate_dns_label;
 use faber_api_types::workload::{
     CreateProjectRequest, DEFAULT_ENVIRONMENTS, DeployRequest, DeployResponse, EnvironmentSummary,
-    ProjectListResponse, ProjectResponse, Violation, WorkloadListResponse, WorkloadQuery,
-    WorkloadResponse, WorkloadSummary, fqdn, limits, validate_workloads,
+    ProjectListResponse, ProjectResponse, ReplicaState, Scale, Violation, WorkloadListResponse,
+    WorkloadQuery, WorkloadResponse, WorkloadSummary, fqdn, limits, validate_workloads,
 };
 
 use faber_crypto::{ClusterKey, DataKey, key_id, unwrap, wrap};
@@ -181,13 +181,30 @@ impl FaberService {
         // One read of every record, and no look at the index: the two
         // could be of different apply batches.
         let mut workloads = Vec::new();
+        let status = self.status_view()?;
         let records = self.state().environments();
         for (project, environment, record) in records.map_err(|e| read_error("env/*", e))? {
             if !wanted(&query.project, &project) || !wanted(&query.environment, &environment) {
                 continue;
             }
+            let placement = self
+                .state()
+                .placement(&project, &environment)
+                .map_err(|e| ServiceError::Internal(format!("placement: {e}")))?;
             for (name, workload) in record.workloads {
+                let placed = placement.as_ref().map_or(&[][..], |p| p.replicas(&name));
+                let available = status
+                    .workload(&project, &environment, &name, workload.revision, placed)
+                    .iter()
+                    .filter(|r| r.state == ReplicaState::Available)
+                    .count();
+                let desired = match workload.spec.scale {
+                    Scale::Replicas { count, .. } => count as usize,
+                    Scale::Daemon => placed.len(),
+                };
                 workloads.push(WorkloadSummary {
+                    available: u32::try_from(available).unwrap_or(u32::MAX),
+                    desired: u32::try_from(desired).unwrap_or(u32::MAX),
                     fqdn: fqdn(&name, &environment, &project),
                     project: project.clone(),
                     environment: environment.clone(),
@@ -1759,7 +1776,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_workload_shows_what_its_nodes_reported() {
         use crate::raft::store::status::{Capacity, ReplicaReport, ReportNode};
-        use faber_api_types::workload::{ReplicaState, ReplicaStatus};
+        use faber_api_types::workload::ReplicaStatus;
 
         let node = shop().await;
         let svc = &node.service;
@@ -1990,6 +2007,86 @@ mod tests {
         assert_eq!(svc.place_once().await.unwrap(), 1);
         assert!(svc.state().placement("shop", "staging").unwrap().is_none());
         assert_eq!(svc.place_once().await.unwrap(), 0);
+        node.shutdown().await;
+    }
+
+    /// The list summary counts available replicas against the replicas the
+    /// placement holds, unplaced ones included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_list_counts_available_against_desired_replicas() {
+        use crate::raft::store::status::{Capacity, ReplicaReport, ReportNode};
+
+        let node = shop().await;
+        let svc = &node.service;
+        let daemon: WorkloadSpec = serde_json::from_value(json!({
+            "scale": "daemon",
+            "containers": [{"name": "main", "image": "agent"}],
+        }))
+        .unwrap();
+        svc.deploy(
+            "shop",
+            "staging",
+            deploy_req(&[("logs", daemon), ("web", two_replicas("nginx"))], false),
+        )
+        .await
+        .unwrap();
+        let counts = || async {
+            let list = svc.list_workloads(WorkloadQuery::default()).await.unwrap();
+            list.workloads
+                .iter()
+                .map(|w| (w.name.clone(), w.available, w.desired))
+                .collect::<Vec<_>>()
+        };
+        // Nothing is placed: a replica count is still wanted, a daemon has
+        // no replica to want yet.
+        assert_eq!(
+            counts().await,
+            [("logs".to_string(), 0, 0), ("web".to_string(), 0, 2)]
+        );
+
+        // No node has reported: the replicas are unplaced and still wanted.
+        seed_mesh(&node).await;
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        let unplaced = counts().await;
+        assert_eq!(unplaced[1], ("web".to_string(), 0, 2));
+
+        // The node reports: both are placed, and one of web is available.
+        let revision = |name: &'static str| async move {
+            svc.workload("shop", "staging", name, false)
+                .await
+                .unwrap()
+                .revision
+        };
+        let report = |workload: &str, revision, state| ReplicaReport {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workload: workload.into(),
+            revision,
+            replica_index: 0,
+            state,
+            pod_ip: None,
+            detail: None,
+        };
+        svc.propose(Request::ReportNode(ReportNode {
+            node_id: 1,
+            instance_id: "ab".repeat(16),
+            capacity: Capacity {
+                cpu_millis: 4_000,
+                memory_bytes: 1 << 33,
+                disk_bytes: 0,
+            },
+            replicas: vec![
+                report("web", revision("web").await, ReplicaState::Available),
+                report("logs", revision("logs").await, ReplicaState::Deploying),
+            ],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert_eq!(
+            counts().await,
+            [("logs".to_string(), 0, 1), ("web".to_string(), 1, 2)]
+        );
         node.shutdown().await;
     }
 

@@ -887,7 +887,8 @@ async fn workload_list_sends_the_filters_that_are_set() {
             ResponseTemplate::new(200).set_body_json(json!({"workloads": [{
                 "project": "shop", "environment": "staging", "name": "web",
                 "fqdn": "web.staging.shop.faber.internal",
-                "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7
+                "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7,
+                "available": 2, "desired": 3
             }]})),
         )
         .expect(4)
@@ -901,6 +902,10 @@ async fn workload_list_sends_the_filters_that_are_set() {
         .unwrap();
     assert_eq!(got.workloads.len(), 1);
     assert_eq!(got.workloads[0].fqdn, "web.staging.shop.faber.internal");
+    assert_eq!(
+        (got.workloads[0].available, got.workloads[0].desired),
+        (2, 3)
+    );
     assert_eq!(
         got.workloads[0].scale,
         Scale::Replicas {
