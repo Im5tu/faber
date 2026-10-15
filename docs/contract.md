@@ -77,8 +77,11 @@ Each variable maps to a fabercp flag.
 | `FABER_WG_ENDPOINT` | `--wg-endpoint` | this node's public `ip:port`. A bare IP gets `FABER_WG_PORT`. A hostname or anything else that is not an IP makes startup fail |
 | `FABER_WG_PORT` | `--wg-port` | `51820` |
 | `FABER_MANAGE_HOST` | `--manage-host` | `1` |
-| `FABER_CONTAINERD_CONF_DIR` | `--containerd-conf-dir` | `/etc/containerd/conf.d` |
-| `FABER_CNI_CONF_DIR` | `--cni-conf-dir` | `/etc/cni/net.d` (also the default). Where this node writes `10-faber.conflist`. install.sh always writes it |
+| `FABER_NODE_SOCKET` | `--node-socket` | `/run/faber/node.sock` (also the default): the socket of faber-node. install.sh writes it only for another path |
+| `FABER_CLUSTER_KEY_FILE` | `--cluster-key-file` | default `cluster.key` in `FABER_STATE_DIR`. Not written by install.sh |
+| `FABER_SNAPSHOT_LOGS` | `--snapshot-logs` | log entries between raft snapshots, default `5000`. Not written by install.sh |
+| `FABER_KEEP_LOGS` | `--keep-logs` | log entries kept after a snapshot, default `1000`. Not written by install.sh |
+| `FABER_SERVICE_CIDR` | `--service-cidr` | default `10.201.0.0/16`; with `FABER_NEW_MESH` only. install.sh always writes it for a new mesh |
 | `FABER_NEW_MESH` | `--new-mesh` | `1`; unconfigured founder only |
 | `FABER_MESH_CIDR` | `--mesh-cidr` | default `10.99.0.0/16`; with `FABER_NEW_MESH` only |
 | `FABER_CONTAINER_CIDR` | `--container-cidr` | default `10.200.0.0/16`; with `FABER_NEW_MESH` only. install.sh writes it only when `--container-cidr` is given |
@@ -90,7 +93,8 @@ Each variable maps to a fabercp flag.
 
 `FABER_CONTAINER_CIDR` and `FABER_NODE_NAME` are bootstrap settings, like `FABER_MESH_CIDR`. fabercp checks them at startup only when `FABER_NEW_MESH` is set, and a value that fails stops startup:
 
-- `FABER_CONTAINER_CIDR` must be an IPv4 CIDR with a prefix length of at most 24 (every node gets a /24 of it), with no host bits set, and it must not overlap `FABER_MESH_CIDR`. `InitCluster` rejects the same ranges, but by then raft is initialised and the cluster could not be seeded, so the check runs before anything starts. The range is fixed once the mesh exists. A joiner and a configured node take it from the replicated state and ignore the variable.
+- `FABER_CONTAINER_CIDR` must be an IPv4 CIDR with a prefix length of at most 24 (every node gets a /24 of it), with no host bits set, it must not overlap `FABER_MESH_CIDR`, and it follows the rule faber-node applies to a pod subnet (`check_container_subnet`): no overlap with `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4` or `240.0.0.0/4`. `InitCluster` rejects the same ranges, but by then raft is initialised and the cluster could not be seeded, so the check runs before anything starts. The range is fixed once the mesh exists. A joiner and a configured node take it from the replicated state and ignore the variable.
+- `FABER_SERVICE_CIDR` must be an IPv4 CIDR with a prefix of /30 or shorter, no host bits set, and no overlap with `FABER_MESH_CIDR` or `FABER_CONTAINER_CIDR`. The range is fixed once the mesh exists.
 - `FABER_NODE_NAME` must be a DNS label: 1 to 63 characters of `a-z`, `0-9` and `-`, with no hyphen at either end. fabercp does not store it in `identity.json`. It reads it when `faber cluster init` runs, so the variable must still be set then. Every other node gets its name from its invite.
 
 install.sh makes the same checks on `--container-cidr` and `--name` before it changes anything, and removes both lines with the other bootstrap lines once the cluster is created.
@@ -875,8 +879,8 @@ faber-node writes the containerd drop-in and the CNI network config. fabercp doe
 
 ```
 [Unit]
-After=network-online.target containerd.service
-Wants=network-online.target
+After=network-online.target containerd.service faber-node.service
+Wants=network-online.target faber-node.service
 
 [Service]
 User=faber
@@ -890,14 +894,12 @@ NoNewPrivileges=yes
 StateDirectory=faber
 StateDirectoryMode=0700
 ProtectSystem=strict
-ReadWritePaths=/etc/containerd/conf.d
-ReadWritePaths=/etc/cni/net.d
 ProtectHome=yes
 PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ```
 
-The second `ReadWritePaths=` line lets fabercp write `10-faber.conflist` under `ProtectSystem=strict`. systemd merges repeated `ReadWritePaths=` lines. The capabilities are unchanged: root CNI plugins create the bridge, not fabercp.
+fabercp has no write access to `/etc/containerd/conf.d` or `/etc/cni/net.d`: faber-node writes both, as root, and the directories are root-owned. The capabilities are unchanged: `CAP_NET_ADMIN` only, for WireGuard and nftables. root CNI plugins create the bridge, not fabercp. `faber-node.service` is described under "faber-node".
 
 fabercp shuts down cleanly on SIGTERM (what `systemctl stop` sends) as well as on SIGINT.
 
@@ -919,12 +921,11 @@ Order at startup, all before the peer listener binds:
 6. `ip link set faber0 mtu 1420 up`
 7. `ip route replace <container_cidr> dev faber0`, when the replicated `mesh` has a container range. It comes after the link is up, because the kernel rejects a route through a link that is down. fabercp never removes the route: the range does not change once a mesh exists, and deleting the link removes its routes
 8. `nft -f -` with the `inet faber` table on stdin
-9. write the containerd drop-in if it changed
-10. write `10-faber.conflist` if it changed, or remove it when this node has no container subnet. A missing CNI directory is an error only when there is a file to write
+9. the services step programs the nat chains and service rules into the table (see "Virtual IPs"). A node without nftables nat support fails startup here
 
-Steps 9 and 10 run once `config/containerd` is replicated. A fresh joiner has no `mesh` at startup, so it runs no step 7 and gets its route, container rules and conflist from the reconcile loop once the state reaches it.
+The runtime and containers steps are not required at startup, because faber-node may start after fabercp. The reconcile loop applies them on its first pass: `configure_runtime` to faber-node, which writes the containerd drop-in and `10-faber.conflist` or removes the latter when this node has no container subnet, then the containers step (see "The runner"). A fresh joiner has no `mesh` at startup, so it runs no step 7 and gets its route, container rules and conflist from the reconcile loop once the state reaches it. The route of step 7 is installed by the network step, which runs before the runtime step.
 
-Any failure exits the process, and systemd restarts it.
+A failure in steps 1 to 9 exits the process, and systemd restarts it.
 
 The peer listener then binds `<mesh_ip>:<peer_port>` from `identity.json`. It does not take whichever address the interface happens to have.
 
@@ -944,7 +945,7 @@ A record that names a different interface does not count. install.sh skips its o
 
 ## nftables
 
-Table `inet faber`, replaced atomically on each load. fabercp owns only this table and adds no default drop for the rest of the host.
+Table `inet faber`, replaced atomically on each load. With a container range it also has the nat chains `prerouting`, `output` and `postrouting`, which redirect DNS and send virtual IP traffic to backends, and the filter chains `service_reject_prerouting` and `service_reject_output` (see "Virtual IPs" and "DNS"). The table is one script, so a network reload keeps the service rules. fabercp owns only this table and adds no default drop for the rest of the host.
 
 | Set | Type | Members |
 |---|---|---|
@@ -1041,7 +1042,7 @@ From the replicated `mesh`, on every reconcile:
 - The route `ip route replace <container_cidr> dev faber0`. A destination in the node's own subnet goes to the bridge instead, because the bridge's route has the longer prefix.
 - WireGuard `AllowedIPs` for every other registered node: its mesh `/32` and its container subnet. Peers that are live invites, and the bootstrap peers of a joiner, keep the `/32` alone. The route sends the range into the interface, and `AllowedIPs` picks the peer that gets a packet and limits the source addresses a peer may send from.
 - The forward chain and the `node_mesh_ips` set of `inet faber` (see "nftables").
-- `/etc/cni/net.d/10-faber.conflist` for the node's own subnet, with the bridge `faberbr0` and the tunnel's MTU of 1420.
+- `/etc/cni/net.d/10-faber.conflist` for the node's own subnet, written by faber-node, with the bridge `faberbr0` and the tunnel's MTU of 1420.
 
 fabercp skips a subnet that does not fit, and logs why: one whose prefix length is not `container_subnet_prefix`, that has host bits set, that lies outside the range, that is this node's own subnet on a peer, or that an earlier peer already has. WireGuard gives an `AllowedIP` that two peers list to the last of them without an error, so a duplicate must not reach it. If the node's own subnet does not fit, the node gets no container rules that name it and no conflist.
 
@@ -1049,7 +1050,7 @@ In a mesh without a container range there is no route, no container rule and no 
 
 ### CNI network config
 
-fabercp writes this file for a node whose subnet is `10.200.3.0/24`. Exact text is set by the golden test for `faber_container_runtime::cni::render`.
+faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact text is set by the golden test for `faber_container_runtime::cni::render`.
 
 ```json
 {
@@ -1085,7 +1086,7 @@ fabercp writes this file for a node whose subnet is `10.200.3.0/24`. Exact text 
 - `ipMasq` is false: there is no NAT.
 - `dataDir` is under `/run`, so `host-local` address leases do not survive a reboot.
 - containerd watches the directory, so a new or removed file needs no restart. The reload path unit does not watch it.
-- fabercp removes the file while the node has no subnet. A node must not keep a config for a subnet that may now belong to another node.
+- faber-node removes the file while the node has no subnet. A node must not keep a config for a subnet that may now belong to another node.
 
 ### Who can reach what
 
@@ -1106,7 +1107,7 @@ fabercp writes this file for a node whose subnet is `10.200.3.0/24`. Exact text 
 
 Limits:
 
-- Container egress is off. There is no NAT and no rule that lets a container reach an address outside the container range. Image pulls are not affected, because containerd pulls on the host.
+- Container egress is off. The CNI config does no masquerading, and no rule lets a container reach an address outside the container range. The only NAT is the service DNAT, the hairpin and host-to-service masquerade rules of the nat chains (see "Virtual IPs"). Image pulls are not affected, because containerd pulls on the host.
 - There is no per-container policy. Any registered node can reach every container, and any container can reach every other container.
 - A host firewall whose forward chain has policy drop (ufw, Docker and firewalld commonly set one) blocks container traffic between nodes, because that traffic is forwarded between `faber0` and `faberbr0` and a drop in any chain on the hook is final. install.sh warns and names the chains. faber never edits that firewall: the admin has to allow forwarding between `faber0` and `faberbr0` in both directions.
 
@@ -1187,7 +1188,7 @@ version = 2
 imports = ["/etc/containerd/conf.d/*.toml"]
 ```
 
-Drop-in `/etc/containerd/conf.d/faber.toml` (fabercp), version 2. The keys are fixed. Exact whitespace is set by the golden test for `faber_container_runtime::containerd::render`.
+Drop-in `/etc/containerd/conf.d/faber.toml` (faber-node), version 2. The keys are fixed. Exact whitespace is set by the golden test for `faber_container_runtime::containerd::render`.
 
 ```toml
 # managed by faber
