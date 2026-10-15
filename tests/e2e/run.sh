@@ -1989,25 +1989,31 @@ phase_m() {
   rm -f "$LOG_DIR/m-roll-samples.log"
   m_roll_ping_start "$NODE_A" "$ca"
   sleep 2
-  m_deploy two
-  out="$M_OUT"
-  rc="$M_RC"
-  assert_ok "M redeploy with GREETING=two exits 0" "$rc" "$out"
-  assert_has "M the redeploy updated redis" "$out" '^updated: +redis$'
-  rev2="$(m_revision "$NODE_A")"
-  assert_ne "M the redeploy made a new revision (was $rev1)" "$rev2" "$rev1"
-  # Sample the replicas once a second until both run the new revision.
+  # The deploy runs in the background so the samples start before the roll.
+  rm -f "$LOG_DIR/m-deploy-two.rc"
+  (
+    m_deploy two
+    echo "$M_RC" >"$LOG_DIR/m-deploy-two.rc"
+  ) &
+  # Sample the replicas until both run the new revision.
   local deadline=$((SECONDS + 300)) ts rolled=0
+  rev2=""
   while ((SECONDS < deadline)); do
     ts="$(date +%s)"
     out="$(m_replicas "$NODE_A")"
     [[ -n "$out" ]] && awk -v t="$ts" '{ print t, $1, $3, $4 }' <<<"$out" >>"$LOG_DIR/m-roll-samples.log"
-    if [[ "$(awk -v r="$rev2" '$3 == r && $4 == "available" { n++ } END { print n + 0 }' <<<"$out")" == 2 ]]; then rolled=1; break; fi
+    if [[ -z "$rev2" && -f "$LOG_DIR/m-deploy-two.rc" ]]; then rev2="$(m_revision "$NODE_A")"; fi
+    if [[ -n "$rev2" && "$rev2" != "$rev1" && "$(awk -v r="$rev2" '$3 == r && $4 == "available" { n++ } END { print n + 0 }' <<<"$out")" == 2 ]]; then rolled=1; break; fi
     sleep 1
   done
+  wait
+  M_OUT="$(tr -d '\r' <"$LOG_DIR/m-deploy-two.log")"
+  assert_ok "M redeploy with GREETING=two exits 0" "$(cat "$LOG_DIR/m-deploy-two.rc" 2>/dev/null)" "$M_OUT"
+  assert_has "M the redeploy updated redis" "$M_OUT" '^updated: +redis$'
+  assert_ne "M the redeploy made a new revision (was $rev1)" "$rev2" "$rev1"
   sleep 3
   m_roll_ping_stop "$NODE_A" "$ca"
-  docker cp "$NODE_A:$M_ROLL_PING_LOG" "$LOG_DIR/m-roll-ping.log" >/dev/null 2>&1
+  dx "$NODE_A" "cat $M_ROLL_PING_LOG" >"$LOG_DIR/m-roll-ping.log"
   if ((rolled)); then
     pass "M both replicas become available on the new revision $rev2"
   else
