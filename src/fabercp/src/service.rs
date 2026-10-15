@@ -834,6 +834,27 @@ impl FaberService {
                 )));
             }
         }
+        // A node's first report records its instance id, which then guards
+        // its status and its lease. Only the node itself may claim it, never
+        // a registered node forwarding for it.
+        if self.inner.strict_peer_source && !report.instance_id.is_empty() {
+            let mesh = self.read_mesh()?;
+            let unclaimed = mesh
+                .as_ref()
+                .and_then(|m| m.nodes.get(&report.node_id))
+                .filter(|n| n.instance_id.is_none());
+            if unclaimed.is_some_and(|n| IpAddr::V4(n.mesh_ip) != source.ip().to_canonical()) {
+                tracing::warn!(
+                    node_id = report.node_id,
+                    source = %source.ip(),
+                    "refused to record an instance id from an address that is not the node's"
+                );
+                return Err(ServiceError::Forbidden(format!(
+                    "only node {} may record its instance id",
+                    report.node_id
+                )));
+            }
+        }
         self.report_node(report, forwarded).await
     }
 
@@ -851,7 +872,7 @@ impl FaberService {
         };
         let timing = self.inner.lease_timing.get().copied().unwrap_or_default();
         let tick = timing.tick_clock_secs(mesh.lease_secs);
-        crate::status::view(&self.inner.state, mesh.clock, tick)
+        crate::status::view(&self.inner.state, &mesh, tick)
             .map_err(|e| ServiceError::Internal(format!("status: {e}")))
     }
 
@@ -2754,6 +2775,49 @@ mod tests {
                 Err(ServiceError::NoLeader)
             );
         }
+        node.shutdown().await;
+    }
+
+    /// Node 1, the founder, has no instance id yet, and the first report
+    /// records one. Node 2 is registered and may forward for node 1, but it
+    /// may not claim node 1's instance id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_node_itself_records_its_instance_id_through_a_report() {
+        let node = TestNode::start_initialized().await;
+        let invite = invited(&node).await;
+        node.service
+            .peer_register(register_req(&invite, &"ef".repeat(16)), false)
+            .await
+            .unwrap();
+        let strict = strict_service(&node);
+        let report = |instance_id: &str| ReportNode {
+            node_id: 1,
+            instance_id: instance_id.into(),
+            capacity: Default::default(),
+            replicas: Vec::new(),
+        };
+        let claimed = || {
+            strict.read_mesh().unwrap().unwrap().nodes[&1]
+                .instance_id
+                .clone()
+        };
+        let other = "10.99.0.2:40000".parse().unwrap();
+        let own = "10.99.0.1:40000".parse().unwrap();
+        let thief = "ab".repeat(16);
+
+        let err = strict
+            .peer_report(report(&thief), true, other)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Forbidden(_)), "{err:?}");
+        assert_eq!(claimed(), None);
+
+        strict
+            .peer_report(report(&thief), false, own)
+            .await
+            .unwrap();
+        assert_eq!(claimed(), Some(thief));
+        drop(strict);
         node.shutdown().await;
     }
 

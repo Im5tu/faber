@@ -17,12 +17,13 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faber_api_types::workload::{ReplicaState, ReplicaStatus};
 use tokio_util::sync::CancellationToken;
 
+use crate::mesh::MeshState;
 use crate::raft::store::status::{
     Capacity, NodeStatus, ReplicaReport, ReportNode, STALE_AFTER_INTERVALS,
 };
@@ -149,42 +150,71 @@ impl ReportSink for FaberService {
     }
 }
 
+/// How long a capacity measurement is reused. Capacity moves slowly, and a
+/// probe reads `/proc` and asks the file system.
+const CAPACITY_REFRESH: Duration = Duration::from_secs(60);
+/// The first wait after a failed report; it doubles up to the interval.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// Who this node reports as: its id and instance id, or `None` while it has
+/// no mesh identity.
+type Identity = Box<dyn Fn() -> Option<(u64, String)> + Send + Sync>;
+
 /// Sends this node's status once per interval.
 pub struct Reporter<S> {
-    node_id: u64,
-    instance_id: String,
+    identity: Identity,
     sink: S,
     replicas: Arc<dyn ReplicaSource>,
     capacity: Arc<dyn CapacityProbe>,
+    /// The last measurement and when it was made.
+    measured: Mutex<Option<(tokio::time::Instant, Capacity)>>,
 }
 
 impl<S: ReportSink> Reporter<S> {
     pub fn new(
-        node_id: u64,
-        instance_id: String,
+        identity: impl Fn() -> Option<(u64, String)> + Send + Sync + 'static,
         sink: S,
         replicas: Arc<dyn ReplicaSource>,
         capacity: Arc<dyn CapacityProbe>,
     ) -> Self {
         Self {
-            node_id,
-            instance_id,
+            identity: Box::new(identity),
             sink,
             replicas,
             capacity,
+            measured: Mutex::new(None),
         }
     }
 
-    /// One report with all replicas in one write.
-    pub async fn report_once(&self) -> ServiceResult<()> {
+    /// The capacity, measured at most once per [`CAPACITY_REFRESH`].
+    async fn capacity(&self) -> ServiceResult<Capacity> {
+        let now = tokio::time::Instant::now();
+        let fresh = |m: &Option<(tokio::time::Instant, Capacity)>| {
+            m.filter(|(at, _)| now.duration_since(*at) < CAPACITY_REFRESH)
+                .map(|(_, c)| c)
+        };
+        if let Some(c) = fresh(&self.measured.lock().unwrap_or_else(|e| e.into_inner())) {
+            return Ok(c);
+        }
         let probe = self.capacity.clone();
-        let capacity = tokio::task::spawn_blocking(move || probe.capacity())
+        let c = tokio::task::spawn_blocking(move || probe.capacity())
             .await
             .map_err(|e| ServiceError::Internal(format!("the capacity probe failed: {e}")))?;
+        *self.measured.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, c));
+        Ok(c)
+    }
+
+    /// One report with all replicas in one write. An error while the node
+    /// has no identity: the next tick asks again.
+    pub async fn report_once(&self) -> ServiceResult<()> {
+        let (node_id, instance_id) = (self.identity)().ok_or_else(|| {
+            ServiceError::BadRequest("this node has no instance id to report with".into())
+        })?;
+        let capacity = self.capacity().await?;
         self.sink
             .send(ReportNode {
-                node_id: self.node_id,
-                instance_id: self.instance_id.clone(),
+                node_id,
+                instance_id,
                 capacity,
                 replicas: self.replicas.replicas(),
             })
@@ -194,15 +224,16 @@ impl<S: ReportSink> Reporter<S> {
     /// Reports at once and then every `interval()` seconds, each lasting
     /// `second` of real time, until `cancel` fires. `interval` is read before
     /// every wait, so a changed setting is followed from the next tick. A
-    /// failed report is logged and the next tick tries again; the first
-    /// failure after a success is a warning, the rest are debug.
+    /// failed report is logged and tried again after a wait that starts at
+    /// a second and doubles up to the interval; the first failure after a
+    /// success is a warning, the rest are debug.
     pub async fn run(
         &self,
         interval: impl Fn() -> u64 + Send,
         second: Duration,
         cancel: &CancellationToken,
     ) {
-        let mut failing = false;
+        let mut failures: u32 = 0;
         loop {
             let attempt = tokio::select! {
                 () = cancel.cancelled() => return,
@@ -210,7 +241,7 @@ impl<S: ReportSink> Reporter<S> {
             };
             match attempt {
                 Ok(Ok(())) => {
-                    failing = false;
+                    failures = 0;
                     tracing::debug!("reported this node's status");
                 }
                 failed => {
@@ -218,17 +249,23 @@ impl<S: ReportSink> Reporter<S> {
                         Ok(Err(e)) => e.to_string(),
                         _ => format!("no answer within {REPORT_TIMEOUT:?}"),
                     };
-                    if failing {
+                    if failures > 0 {
                         tracing::debug!(error = %why, "could not report this node's status");
                     } else {
-                        failing = true;
                         tracing::warn!(error = %why, "could not report this node's status");
                     }
+                    failures = failures.saturating_add(1);
                 }
             }
-            let wait = second
+            let every = second
                 .saturating_mul(u32::try_from(interval()).unwrap_or(u32::MAX))
                 .max(MIN_REPORT_WAIT);
+            let wait = match failures {
+                0 => every,
+                n => RETRY_MIN
+                    .saturating_mul(1u32.checked_shl(n - 1).unwrap_or(u32::MAX))
+                    .min(every),
+            };
             tokio::select! {
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
@@ -290,13 +327,28 @@ impl StatusView {
         view
     }
 
-    /// The replicas of one workload, by replica index and then node.
-    pub fn workload(&self, project: &str, environment: &str, workload: &str) -> Vec<ReplicaStatus> {
+    /// The replicas of one workload at `revision`, by replica index and then
+    /// node. `revision` is the stored revision of a workload that exists, so
+    /// reports for a workload that is gone, or for another revision, are
+    /// never shown.
+    ///
+    /// Entries are what nodes claim. Placement will add a check that the
+    /// node is one the workload is placed on; this is where it goes.
+    pub fn workload(
+        &self,
+        project: &str,
+        environment: &str,
+        workload: &str,
+        revision: u64,
+    ) -> Vec<ReplicaStatus> {
         let mut found: Vec<ReplicaStatus> = self
             .replicas
             .iter()
             .filter(|(_, r)| {
-                r.project == project && r.environment == environment && r.workload == workload
+                r.project == project
+                    && r.environment == environment
+                    && r.workload == workload
+                    && r.revision == revision
             })
             .map(|(node, r)| ReplicaStatus {
                 node: *node,
@@ -311,19 +363,22 @@ impl StatusView {
     }
 }
 
-/// The reports in `state` at `now` on the lease clock. A cluster with no
-/// reports gives an empty view.
-pub fn view(state: &StateReader, now: u64, tick_secs: u64) -> Result<StatusView, ReadError> {
-    let statuses = state.statuses()?;
+/// The reports in `state` as of the lease clock of `mesh`, for nodes that
+/// are in the mesh: a removed node's last report is not shown. A cluster
+/// with no reports gives an empty view. The interval is the one in force
+/// ([`crate::raft::store::status::IntervalSetting::effective`]).
+pub fn view(
+    state: &StateReader,
+    mesh: &MeshState,
+    tick_secs: u64,
+) -> Result<StatusView, ReadError> {
+    let mut statuses = state.statuses()?;
+    statuses.retain(|id, _| mesh.nodes.contains_key(id));
     if statuses.is_empty() {
         return Ok(StatusView::default());
     }
-    Ok(StatusView::new(
-        statuses,
-        state.status_interval()?,
-        now,
-        tick_secs,
-    ))
+    let interval = state.status_setting()?.effective(mesh.clock);
+    Ok(StatusView::new(statuses, interval, mesh.clock, tick_secs))
 }
 
 #[cfg(test)]
@@ -369,7 +424,7 @@ mod tests {
         // Interval 5: fresh up to and including 15 seconds of age.
         for (now, stale) in [(100, false), (115, false), (116, true), (10_000, true)] {
             let view = StatusView::new(statuses.clone(), 5, now, 0);
-            let got = view.workload("shop", "staging", "web");
+            let got = view.workload("shop", "staging", "web", 2);
             assert_eq!(got.len(), 2);
             let want = if stale {
                 [ReplicaState::Unavailable, ReplicaState::Unavailable]
@@ -393,7 +448,7 @@ mod tests {
                 record(100, vec![replica("web", 1, ReplicaState::Available)]),
             ),
         ]);
-        let got = StatusView::new(mixed, 5, 100, 0).workload("shop", "staging", "web");
+        let got = StatusView::new(mixed, 5, 100, 0).workload("shop", "staging", "web", 2);
         assert_eq!(
             got.iter().map(|r| (r.node, r.state)).collect::<Vec<_>>(),
             vec![(1, ReplicaState::Unavailable), (2, ReplicaState::Available)]
@@ -411,7 +466,8 @@ mod tests {
             )])
         };
         let state = |at, now| {
-            StatusView::new(reported(at), 5, now, tick).workload("shop", "staging", "web")[0].state
+            StatusView::new(reported(at), 5, now, tick).workload("shop", "staging", "web", 2)[0]
+                .state
         };
         // Reported just before the clock ticked, and not again yet: a whole
         // tick old on the clock.
@@ -443,15 +499,15 @@ mod tests {
             ),
         ]);
         let view = StatusView::new(statuses, 5, 0, 0);
-        let web = view.workload("shop", "staging", "web");
+        let web = view.workload("shop", "staging", "web", 2);
         assert_eq!(
             web.iter()
                 .map(|r| (r.replica_index, r.node))
                 .collect::<Vec<_>>(),
             vec![(0, 1), (2, 3)]
         );
-        assert!(view.workload("shop", "production", "web").is_empty());
-        assert!(StatusView::default().workload("a", "b", "c").is_empty());
+        assert!(view.workload("shop", "production", "web", 2).is_empty());
+        assert!(StatusView::default().workload("a", "b", "c", 2).is_empty());
     }
 
     #[test]
@@ -500,8 +556,7 @@ mod tests {
     async fn the_reporter_batches_every_replica_in_one_write_per_tick() {
         let recorder = Recorder::default();
         let reporter = Reporter::new(
-            4,
-            "ab".repeat(16),
+            || Some((4, "ab".repeat(16))),
             recorder.clone(),
             Arc::new(Replicas(vec![
                 replica("web", 0, ReplicaState::Available),
@@ -564,8 +619,7 @@ mod tests {
     async fn reports_are_never_closer_together_than_the_floor() {
         let recorder = Recorder::default();
         let reporter = Reporter::new(
-            1,
-            String::new(),
+            || Some((1, String::new())),
             recorder.clone(),
             Arc::new(NoReplicas),
             Arc::new(FixedCapacity(Capacity::default())),
@@ -602,11 +656,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_failed_report_is_tried_again_on_the_next_tick() {
+    async fn a_failed_report_is_tried_again_after_a_short_growing_wait() {
         let calls = Arc::new(AtomicU64::new(0));
         let reporter = Reporter::new(
-            1,
-            String::new(),
+            || Some((1, String::new())),
             Flaky(calls.clone()),
             Arc::new(NoReplicas),
             Arc::new(FixedCapacity(Capacity::default())),
@@ -618,8 +671,55 @@ mod tests {
                 reporter.run(|| 5, Duration::from_secs(1), &cancel).await;
             })
         };
+        // Fails at 0 s and 1 s, waits 1 s then 2 s, works at 3 s, and then
+        // waits the interval: 8 s, and 13 s is still to come.
         tokio::time::sleep(Duration::from_secs(11)).await;
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    struct CountingProbe(Arc<AtomicU64>);
+
+    impl CapacityProbe for CountingProbe {
+        fn capacity(&self) -> Capacity {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            fake_capacity()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_is_measured_once_a_minute_and_a_missing_identity_is_retried() {
+        let probes = Arc::new(AtomicU64::new(0));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recorder = Recorder::default();
+        let reporter = {
+            let ready = ready.clone();
+            Reporter::new(
+                move || ready.load(Ordering::Relaxed).then(|| (1, String::new())),
+                recorder.clone(),
+                Arc::new(NoReplicas),
+                Arc::new(CountingProbe(probes.clone())),
+            )
+        };
+        let cancel = CancellationToken::new();
+        let task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                reporter.run(|| 5, Duration::from_secs(1), &cancel).await;
+            })
+        };
+        // No identity: nothing is sent or measured, but the loop goes on.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(recorder.sent.lock().unwrap().len(), 0);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        ready.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!recorder.sent.lock().unwrap().is_empty());
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+        assert!(recorder.sent.lock().unwrap().len() >= 15);
         cancel.cancel();
         task.await.unwrap();
     }

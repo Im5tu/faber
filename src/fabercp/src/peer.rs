@@ -46,6 +46,10 @@ use crate::error::ApiJson;
 use crate::raft::store::status::ReportNode;
 use crate::service::{FaberService, ServiceResult};
 
+/// Largest body of `POST /raft/cluster/status`. A report of the most replicas
+/// with the longest names and details is about 50 KiB.
+const MAX_REPORT_BODY_BYTES: usize = 64 * 1024;
+
 pub fn router(service: FaberService) -> Router {
     let limit = DefaultBodyLimit::max(limits::MAX_HTTP_BODY_BYTES);
     Router::new()
@@ -58,9 +62,7 @@ pub fn router(service: FaberService) -> Router {
         .route("/raft/cluster/workloads", post(workloads).layer(limit))
         .route(
             "/raft/cluster/status",
-            get(status)
-                .post(report)
-                .layer(DefaultBodyLimit::max(limits::MAX_DEPLOY_REQUEST_BYTES)),
+            get(status).merge(post(report).layer(DefaultBodyLimit::max(MAX_REPORT_BODY_BYTES))),
         )
         .route("/raft/cluster/status-interval", post(status_interval))
         .with_state(service)
@@ -168,7 +170,7 @@ async fn workloads(
 /// node. 409 `mesh_node_removed` when the mesh no longer has the node, 403
 /// `forbidden` for another machine than the one the node is registered to.
 /// 400 `bad_request` for a report over its size limits and for a body over
-/// 128 KiB.
+/// 64 KiB.
 async fn report(
     State(svc): State<FaberService>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,

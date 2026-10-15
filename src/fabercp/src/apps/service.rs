@@ -246,7 +246,9 @@ impl FaberService {
         };
         // Reports are stamped with the lease clock, so staleness is judged on
         // it. Without a mesh nothing has reported.
-        let replicas = self.status_view()?.workload(project, environment, workload);
+        let replicas =
+            self.status_view()?
+                .workload(project, environment, workload, stored.revision);
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),
@@ -1683,7 +1685,10 @@ mod tests {
         let (_, public_key) = generate_keypair().unwrap();
         node.service
             .propose(Request::InitCluster {
-                mesh: MeshConfig::default(),
+                mesh: MeshConfig {
+                    container_cidr: Some("10.200.0.0/16".parse().unwrap()),
+                    ..MeshConfig::default()
+                },
                 founder: NodeRecord {
                     node_id: 1,
                     public_key,
@@ -1723,13 +1728,17 @@ mod tests {
                 .replicas
                 .is_empty()
         );
-
         seed_mesh(&node).await;
+        let rev = svc
+            .workload("shop", "staging", "web", false)
+            .await
+            .unwrap()
+            .revision;
         let report = |index: u32, state, pod_ip: Option<&str>| ReplicaReport {
             project: "shop".into(),
             environment: "staging".into(),
             workload: "web".into(),
-            revision: 1,
+            revision: rev,
             replica_index: index,
             state,
             pod_ip: pod_ip.map(|ip| ip.parse().unwrap()),
@@ -1741,7 +1750,12 @@ mod tests {
             capacity: Capacity::default(),
             replicas: vec![
                 report(1, ReplicaState::Deploying, None),
-                report(0, ReplicaState::Available, Some("10.200.1.2")),
+                // A replica of another revision is not shown.
+                ReplicaReport {
+                    revision: rev + 1,
+                    ..report(2, ReplicaState::Available, None)
+                },
+                report(0, ReplicaState::Available, Some("10.200.0.2")),
             ],
         }))
         .await
@@ -1751,18 +1765,18 @@ mod tests {
                 ReplicaStatus {
                     node: 1,
                     replica_index: 0,
-                    revision: 1,
+                    revision: rev,
                     state: if state {
                         ReplicaState::Available
                     } else {
                         ReplicaState::Unavailable
                     },
-                    pod_ip: Some("10.200.1.2".parse().unwrap()),
+                    pod_ip: Some("10.200.0.2".parse().unwrap()),
                 },
                 ReplicaStatus {
                     node: 1,
                     replica_index: 1,
-                    revision: 1,
+                    revision: rev,
                     state: if state {
                         ReplicaState::Deploying
                     } else {
