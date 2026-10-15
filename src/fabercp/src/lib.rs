@@ -574,6 +574,12 @@ pub async fn start_with(
             service.clone(),
             cancel.child_token(),
         ));
+        // No bridge gateway address or replicated service IPs are wired in yet.
+        tasks.push(dns::spawn(
+            None,
+            Arc::new(dns::NoServiceIps),
+            cancel.child_token(),
+        ));
         tasks.push(tokio::spawn(mesh_membership(
             MeshMembership {
                 service: service.clone(),
