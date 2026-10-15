@@ -94,12 +94,16 @@ pub fn listen_addr(subnet: Ipv4Net) -> SocketAddr {
 /// Runs the DNS server of a node until `cancel` fires. A bind failure is
 /// logged and leaves the node without DNS, not down.
 ///
+/// `excluded` are the container and service ranges: a host resolver inside
+/// one is not used as an upstream.
+///
 /// `listen` is the node's bridge gateway at [`DEFAULT_PORT`]. It is `None`
 /// until the caller can work that address out, and the task then only waits
 /// for `cancel`.
 pub fn spawn(
     listen: Option<SocketAddr>,
     ips: Arc<dyn ServiceIps>,
+    excluded: Vec<Ipv4Net>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -110,7 +114,7 @@ pub fn spawn(
         };
         let config = DnsConfig {
             listen,
-            upstreams: system_upstreams(Some(listen.ip())),
+            upstreams: system_upstreams(Some(listen.ip()), &excluded),
             upstream_timeout: UPSTREAM_TIMEOUT,
         };
         match DnsServer::start(config, ips, cancel) {

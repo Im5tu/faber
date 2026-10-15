@@ -9,20 +9,35 @@ use hickory_proto::op::ResponseCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use super::answer::{Outcome, answer, error_reply};
+use super::answer::{Outcome, answer, error_reply, fit_udp};
 use super::upstream::{forward_tcp, forward_udp};
 use super::{DnsConfig, ServiceIps};
 
-/// Queries and connections handled at once; more are dropped, so a flood
-/// cannot grow the task count without bound.
-const MAX_IN_FLIGHT: usize = 512;
+/// Forwarded UDP queries in flight at once; more are dropped, so a flood
+/// cannot grow the task count without bound. Names under `faber.local` are
+/// answered without a permit.
+const MAX_UDP_FORWARDS: usize = 512;
+
+/// TCP connections open at once; more are refused. A pool of its own, so a
+/// flood on one transport does not starve the other.
+const MAX_TCP_CONNECTIONS: usize = 256;
 
 /// How long a TCP client may stay silent before its connection is closed.
 const TCP_IDLE: Duration = Duration::from_secs(10);
+
+/// Longest a TCP connection lives, however busy.
+const TCP_LIFETIME: Duration = Duration::from_secs(30);
+
+/// Queries answered on one TCP connection before it is closed.
+const TCP_MAX_QUERIES: usize = 100;
+
+/// Pause after a failed receive or accept, so a persistent error (such as
+/// running out of file descriptors) does not spin the loop.
+const ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Biggest query datagram read; a query is a header and one question.
 const MAX_QUERY: usize = 4096;
@@ -35,21 +50,29 @@ struct Handler {
 }
 
 impl Handler {
-    /// The packet to send back for `query`, if any. `tcp` picks the
-    /// transport used towards the upstreams.
-    async fn handle(&self, query: &[u8], tcp: bool) -> Option<Vec<u8>> {
-        match answer(query, self.ips.as_ref()) {
-            Outcome::Drop => None,
-            Outcome::Reply(response) => Some(response),
-            Outcome::Forward => {
-                let forwarded = if tcp {
-                    forward_tcp(query, &self.upstreams, self.upstream_timeout).await
-                } else {
-                    forward_udp(query, &self.upstreams, self.upstream_timeout).await
-                };
-                forwarded.or_else(|| error_reply(query, ResponseCode::ServFail))
-            }
-        }
+    /// What the zone says about `query`; [`Outcome::Forward`] when the name
+    /// is not ours. Cheap and never waits.
+    fn local(&self, query: &[u8]) -> Outcome {
+        answer(query, self.ips.as_ref())
+    }
+
+    /// The upstreams' answer to `query`, or SERVFAIL when none answers in
+    /// time. `tcp` picks the transport used towards the upstreams.
+    async fn forward(&self, query: &[u8], tcp: bool) -> Option<Vec<u8>> {
+        let forwarded = if tcp {
+            forward_tcp(query, &self.upstreams, self.upstream_timeout).await
+        } else {
+            forward_udp(query, &self.upstreams, self.upstream_timeout).await
+        };
+        forwarded.or_else(|| error_reply(query, ResponseCode::ServFail))
+    }
+}
+
+/// Sleeps [`ERROR_BACKOFF`], or until `cancel` fires.
+async fn back_off(cancel: &CancellationToken) {
+    tokio::select! {
+        () = cancel.cancelled() => {}
+        () = tokio::time::sleep(ERROR_BACKOFF) => {}
     }
 }
 
@@ -75,11 +98,10 @@ impl DnsServer {
             upstreams: config.upstreams,
             upstream_timeout: config.upstream_timeout,
         });
-        let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let task = tokio::spawn(async move {
             tokio::join!(
-                serve_udp(udp, handler.clone(), permits.clone(), cancel.clone()),
-                serve_tcp(tcp, handler, permits, cancel),
+                serve_udp(udp, handler.clone(), cancel.clone()),
+                serve_tcp(tcp, handler, cancel),
             );
         });
         Ok(Self { addr, task })
@@ -140,83 +162,98 @@ fn bind_socket(addr: SocketAddr, kind: socket2::Type) -> io::Result<socket2::Soc
     Ok(socket)
 }
 
-async fn serve_udp(
-    socket: UdpSocket,
-    handler: Arc<Handler>,
-    permits: Arc<Semaphore>,
-    cancel: CancellationToken,
-) {
+async fn serve_udp(socket: UdpSocket, handler: Arc<Handler>, cancel: CancellationToken) {
     let socket = Arc::new(socket);
+    let forwards = Arc::new(Semaphore::new(MAX_UDP_FORWARDS));
+    // Dropping the set on return aborts the queries still in flight.
+    let mut tasks = JoinSet::new();
     let mut buf = vec![0u8; MAX_QUERY];
     loop {
+        while tasks.try_join_next().is_some() {}
         let (n, from) = tokio::select! {
             () = cancel.cancelled() => return,
             received = socket.recv_from(&mut buf) => match received {
                 Ok(received) => received,
                 Err(e) => {
                     tracing::debug!(error = %e, "DNS UDP receive failed");
+                    back_off(&cancel).await;
                     continue;
                 }
             },
         };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            tracing::debug!(%from, "DNS busy, dropping a query");
-            continue;
-        };
-        let query = buf[..n].to_vec();
-        let (handler, socket) = (handler.clone(), socket.clone());
-        tokio::spawn(async move {
-            if let Some(response) = handler.handle(&query, false).await
-                && let Err(e) = socket.send_to(&response, from).await
-            {
-                tracing::debug!(%from, error = %e, "DNS UDP send failed");
+        let query = &buf[..n];
+        match handler.local(query) {
+            Outcome::Drop => {}
+            Outcome::Reply(response) => send_udp(&socket, query, response, from).await,
+            Outcome::Forward => {
+                let Ok(permit) = forwards.clone().try_acquire_owned() else {
+                    tracing::debug!(%from, "DNS busy, dropping a query");
+                    continue;
+                };
+                let (query, handler, socket) = (query.to_vec(), handler.clone(), socket.clone());
+                tasks.spawn(async move {
+                    if let Some(response) = handler.forward(&query, false).await {
+                        send_udp(&socket, &query, response, from).await;
+                    }
+                    drop(permit);
+                });
             }
-            drop(permit);
-        });
+        }
     }
 }
 
-async fn serve_tcp(
-    listener: TcpListener,
-    handler: Arc<Handler>,
-    permits: Arc<Semaphore>,
-    cancel: CancellationToken,
-) {
+/// Sends `response` to `to`, cut to what the sender of `query` can take.
+async fn send_udp(socket: &UdpSocket, query: &[u8], response: Vec<u8>, to: SocketAddr) {
+    let response = fit_udp(query, response);
+    if let Err(e) = socket.send_to(&response, to).await {
+        tracing::debug!(%to, error = %e, "DNS UDP send failed");
+    }
+}
+
+async fn serve_tcp(listener: TcpListener, handler: Arc<Handler>, cancel: CancellationToken) {
+    let connections = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+    let mut tasks = JoinSet::new();
     loop {
+        while tasks.try_join_next().is_some() {}
         let (stream, from) = tokio::select! {
             () = cancel.cancelled() => return,
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
                 Err(e) => {
                     tracing::debug!(error = %e, "DNS TCP accept failed");
+                    back_off(&cancel).await;
                     continue;
                 }
             },
         };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
             tracing::debug!(%from, "DNS busy, dropping a connection");
             continue;
         };
-        let (handler, cancel) = (handler.clone(), cancel.clone());
-        tokio::spawn(async move {
-            tokio::select! {
-                () = cancel.cancelled() => {}
-                () = serve_connection(stream, &handler) => {}
-            }
+        let handler = handler.clone();
+        tasks.spawn(async move {
+            // A client that keeps a connection busy still lets go of it.
+            let _ = timeout(TCP_LIFETIME, serve_connection(stream, &handler)).await;
             drop(permit);
         });
     }
 }
 
 /// Answers the length-prefixed queries on `stream` one after another until
-/// the client closes it, errs or stays silent for [`TCP_IDLE`].
+/// the client closes it, errs, stays silent for [`TCP_IDLE`] or has had
+/// [`TCP_MAX_QUERIES`] answered.
 async fn serve_connection(mut stream: TcpStream, handler: &Handler) {
-    loop {
+    for _ in 0..TCP_MAX_QUERIES {
         let Ok(Ok(query)) = timeout(TCP_IDLE, read_frame(&mut stream)).await else {
             return;
         };
-        let Some(response) = handler.handle(&query, true).await else {
-            continue;
+        let response = match handler.local(&query) {
+            Outcome::Drop => continue,
+            Outcome::Reply(response) => response,
+            Outcome::Forward => match handler.forward(&query, true).await {
+                Some(response) => response,
+                None => continue,
+            },
         };
         let Ok(len) = u16::try_from(response.len()) else {
             return;
@@ -393,6 +430,55 @@ mod tests {
         timeout(Duration::from_secs(5), server.wait())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_connection_closes_after_its_query_cap() {
+        let (server, cancel) = start(vec![]);
+        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+        let q = query("web.prod.shop.faber.local.", RecordType::A);
+        for _ in 0..TCP_MAX_QUERIES {
+            stream
+                .write_all(&(q.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&q).await.unwrap();
+            read_frame(&mut stream).await.unwrap();
+        }
+        // The server has let go: the next read hits the end of the stream.
+        assert!(read_frame(&mut stream).await.is_err());
+        cancel.cancel();
+        server.wait().await;
+    }
+
+    #[tokio::test]
+    async fn dns_service_names_are_answered_while_forwards_wait() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (server, cancel) = start(vec![silent.local_addr().unwrap()]);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&query("example.com.", RecordType::A), server.local_addr())
+            .await
+            .unwrap();
+        client
+            .send_to(
+                &query("web.prod.shop.faber.local.", RecordType::A),
+                server.local_addr(),
+            )
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        // The first reply is the service answer, not the SERVFAIL that
+        // comes only after the upstream timeout.
+        let m = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(only_ip(&m), SERVICE_IP);
+        cancel.cancel();
+        server.wait().await;
     }
 
     #[test]

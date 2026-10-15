@@ -578,6 +578,7 @@ pub async fn start_with(
         tasks.push(dns::spawn(
             None,
             Arc::new(dns::NoServiceIps),
+            Vec::new(),
             cancel.child_token(),
         ));
         tasks.push(tokio::spawn(mesh_membership(
