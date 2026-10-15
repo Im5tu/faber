@@ -284,6 +284,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::raft::store::place::ReplicaPlacement;
     use crate::raft::store::status::{Capacity, ReplicaReport};
     use faber_api_types::workload::ReplicaState;
 
@@ -374,9 +375,14 @@ mod tests {
             Request::PlaceReplicas(PlaceReplicas {
                 project: project.clone(),
                 environment: environment.clone(),
-                workload: workload.clone(),
-                nodes: vec![1, 2],
-                at: 6,
+                generation: 6,
+                workloads: BTreeMap::from([(
+                    workload.clone(),
+                    vec![
+                        ReplicaPlacement::on(0, 1),
+                        ReplicaPlacement::unplaced(1, "insufficient_capacity"),
+                    ],
+                )]),
             }),
             Request::ReportNode(ReportNode {
                 node_id: 2,

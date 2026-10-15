@@ -93,6 +93,7 @@ fn is_reserved(key: &str) -> bool {
         || is_reserved_key(key)
         || keys::is_reserved_key(key)
         || status::is_reserved_key(key)
+        || place::is_reserved_key(key)
 }
 
 fn reject(code: &str, message: impl Into<String>) -> Response {
@@ -211,7 +212,9 @@ impl StateMachineStore {
             EntryPayload::Normal(Request::SetClusterKeyId(cmd)) => {
                 self.apply_set_cluster_key_id(pending, cmd)?
             }
-            EntryPayload::Normal(Request::PlaceReplicas(cmd)) => place::apply_place_replicas(cmd),
+            EntryPayload::Normal(Request::PlaceReplicas(cmd)) => {
+                self.apply_place_replicas(pending, cmd)?
+            }
             // A report reads the mesh and writes only its own node's record:
             // it never goes through `apply_mesh`, which writes `mesh` back.
             EntryPayload::Normal(Request::ReportNode(cmd)) => {
@@ -290,6 +293,47 @@ impl StateMachineStore {
             Ok(None) => Response::None,
             Err(rejection) => rejection.into(),
         })
+    }
+
+    /// Applies `PlaceReplicas`: the plan of one environment is stored with
+    /// the uid ranges of its workloads. Nothing else is written, so the
+    /// environment record and its generation stay as they are.
+    fn apply_place_replicas(
+        &self,
+        pending: &mut Pending<'_>,
+        cmd: place::PlaceReplicas,
+    ) -> Result<Response, StorageError> {
+        let key = place::place_key(&cmd.project, &cmd.environment);
+        // A name that is no label has no record: `place_replicas` refuses it.
+        let environment: Option<EnvironmentRecord> =
+            self.typed(pending, &env_key(&cmd.project, &cmd.environment))?;
+        let mesh = self.mesh(pending)?;
+        let stored: Option<place::PlacementRecord> = self.typed(pending, &key)?;
+        let uids: place::UidAllocator = self.typed(pending, place::KEY_UIDS)?.unwrap_or_default();
+        Ok(
+            match place::place_replicas(
+                environment.as_ref(),
+                mesh.as_ref(),
+                stored.as_ref(),
+                &uids,
+                cmd,
+            ) {
+                Ok(placed) => {
+                    match &placed.record {
+                        Some(record) if stored.as_ref() != Some(record) => {
+                            pending.put(&key, record)?;
+                        }
+                        None if stored.is_some() => pending.delete(&key),
+                        _ => {}
+                    }
+                    if placed.uids != uids {
+                        pending.put(place::KEY_UIDS, &placed.uids)?;
+                    }
+                    Response::None
+                }
+                Err(rejection) => rejection.into(),
+            },
+        )
     }
 
     /// Applies one project or workload command, the entry at log index
@@ -846,6 +890,42 @@ impl StateReader {
         }
         // Key order is not name order: `-` sorts before `/`.
         found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        Ok(found)
+    }
+
+    /// The placement record of one environment, or `None` when nothing is
+    /// placed there.
+    pub fn placement(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Option<place::PlacementRecord>, ReadError> {
+        self.typed(&place::place_key(project, environment))
+    }
+
+    /// Every placement record by `(project, environment)`, read from one
+    /// view of the database. A record that cannot be read is an error: the
+    /// planner must not take a damaged record for an empty one.
+    pub fn placements(
+        &self,
+    ) -> Result<BTreeMap<(String, String), place::PlacementRecord>, ReadError> {
+        let storage = |e: &dyn std::fmt::Display| ReadError::Storage(e.to_string());
+        let db = self.db.upgrade().ok_or(ReadError::Closed)?;
+        let view = db.snapshot();
+        let from = IteratorMode::From(place::KEY_PREFIX.as_bytes(), Direction::Forward);
+        let mut found = BTreeMap::new();
+        for item in view.iterator_cf(cf(&db, CF_SM_DATA), from) {
+            let (key, value) = item.map_err(|e| storage(&e))?;
+            let Some(names) = key.strip_prefix(place::KEY_PREFIX.as_bytes()) else {
+                break;
+            };
+            let (project, environment) = std::str::from_utf8(names)
+                .ok()
+                .and_then(|names| names.split_once('/'))
+                .ok_or_else(|| storage(&"a placement key is not place/<project>/<environment>"))?;
+            let record = serde_json::from_slice(&value).map_err(|e| storage(&e))?;
+            found.insert((project.to_string(), environment.to_string()), record);
+        }
         Ok(found)
     }
 
@@ -3117,6 +3197,141 @@ mod tests {
         drop(s);
     }
 
+    fn place(generation: u64, workloads: &[(&str, &[Option<u64>])]) -> Request {
+        Request::PlaceReplicas(place::PlaceReplicas {
+            project: "shop".into(),
+            environment: "staging".into(),
+            generation,
+            workloads: workloads
+                .iter()
+                .map(|(name, nodes)| {
+                    let replicas = nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| match n {
+                            Some(n) => place::ReplicaPlacement::on(i as u32, *n),
+                            None => place::ReplicaPlacement::unplaced(i as u32, "volume_lost"),
+                        })
+                        .collect();
+                    (name.to_string(), replicas)
+                })
+                .collect(),
+        })
+    }
+
+    fn generation(s: &Storage) -> u64 {
+        s.reader
+            .environment("shop", "staging")
+            .unwrap()
+            .unwrap()
+            .generation
+    }
+
+    #[tokio::test]
+    async fn placement_is_stored_beside_the_environment_and_never_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        s.state_machine
+            .apply([
+                normal(1, init_cluster()),
+                normal(2, create_project("shop")),
+                normal(3, deploy("shop", &[("db", "pg"), ("web", "nginx")], false)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(generation(&s), 3);
+        let before = dump(&s);
+
+        let replies = s
+            .state_machine
+            .apply([
+                // Stale, a node the mesh does not have, and a reserved key.
+                normal(4, place(2, &[("web", &[Some(1)])])),
+                normal(5, place(3, &[("web", &[Some(9)])])),
+                set(1, 6, "place/shop/staging", json!({})),
+            ])
+            .await
+            .unwrap();
+        assert!(replies.iter().all(rejected("bad_request")), "{replies:?}");
+        assert_eq!(dump(&s), before);
+
+        let both = place(3, &[("db", &[None]), ("web", &[Some(1), Some(1)])]);
+        let replies = s
+            .state_machine
+            .apply([normal(7, both.clone())])
+            .await
+            .unwrap();
+        assert_eq!(replies, vec![Response::None]);
+        let after = dump(&s);
+        // The environment record is as it was.
+        assert_eq!(after["env/shop/staging"], before["env/shop/staging"]);
+        assert_eq!(generation(&s), 3);
+        let record = s.reader.placement("shop", "staging").unwrap().unwrap();
+        assert_eq!(record.generation, 3);
+        assert_eq!(record.workloads["db"].uid_base, place::UID_RANGE_START);
+        assert_eq!(
+            record.workloads["web"].uid_base,
+            place::UID_RANGE_START + place::UID_BLOCK
+        );
+        assert_eq!(s.reader.placements().unwrap().len(), 1);
+        assert!(s.reader.placement("shop", "production").unwrap().is_none());
+
+        // The same plan again changes nothing.
+        s.state_machine.apply([normal(8, both)]).await.unwrap();
+        assert_eq!(dump(&s)[place::KEY_UIDS], after[place::KEY_UIDS]);
+        assert_eq!(dump(&s)["place/shop/staging"], after["place/shop/staging"]);
+
+        // `db` is removed: it leaves the plan and its range is free.
+        s.state_machine
+            .apply([normal(9, remove_workloads("shop", &["db"]))])
+            .await
+            .unwrap();
+        let generation = generation(&s);
+        s.state_machine
+            .apply([normal(10, place(generation, &[("web", &[Some(1)])]))])
+            .await
+            .unwrap();
+        let record = s.reader.placement("shop", "staging").unwrap().unwrap();
+        assert!(!record.workloads.contains_key("db"));
+        let uids: place::UidAllocator =
+            serde_json::from_value(s.reader.get(place::KEY_UIDS).unwrap().unwrap()).unwrap();
+        assert_eq!(uids.free, BTreeSet::from([0]));
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_removed_environment_is_cleaned_up_with_an_empty_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        s.state_machine
+            .apply([
+                normal(1, init_cluster()),
+                normal(2, create_project("shop")),
+                normal(3, deploy("shop", &[("web", "nginx")], false)),
+                normal(4, place(3, &[("web", &[Some(1)])])),
+                normal(5, remove_workloads("shop", &["web"])),
+                normal(
+                    6,
+                    Request::RemoveEnvironment {
+                        project: "shop".into(),
+                        name: "staging".into(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(s.reader.environment("shop", "staging").unwrap().is_none());
+        assert!(s.reader.placement("shop", "staging").unwrap().is_some());
+        let replies = s
+            .state_machine
+            .apply([normal(7, place(0, &[]))])
+            .await
+            .unwrap();
+        assert_eq!(replies, vec![Response::None]);
+        assert!(s.reader.placement("shop", "staging").unwrap().is_none());
+        drop(s);
+    }
+
     #[tokio::test]
     async fn scaffold_commands_are_rejected_and_write_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3128,13 +3343,6 @@ mod tests {
         let before = dump(&s);
 
         let commands = [
-            Request::PlaceReplicas(place::PlaceReplicas {
-                project: "shop".into(),
-                environment: "staging".into(),
-                workload: "web".into(),
-                nodes: vec![1],
-                at: 1,
-            }),
             Request::AllocateServiceIp(services::AllocateServiceIp {
                 project: "shop".into(),
                 environment: "staging".into(),
@@ -3152,7 +3360,7 @@ mod tests {
             .map(|(n, req)| normal(2 + n as u64, req))
             .collect();
         let replies = s.state_machine.apply(entries).await.unwrap();
-        assert_eq!(replies.len(), 3);
+        assert_eq!(replies.len(), 2);
         assert!(replies.iter().all(rejected("internal")), "{replies:?}");
         assert_eq!(dump(&s), before);
         drop(s);
