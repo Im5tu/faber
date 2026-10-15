@@ -41,7 +41,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::apps::EnvironmentRecord;
 use crate::mesh::MeshState;
-use crate::raft::store::place::{PlaceReplicas, PlacementRecord, ReplicaPlacement, reason};
+use crate::raft::store::place::{
+    MAX_REASON_BYTES, PlaceReplicas, PlacementRecord, ReplicaPlacement, reason,
+};
 use crate::raft::store::status::{Capacity, NodeStatus};
 use crate::raft::types::Request;
 use crate::reconcile::{ReconcileTiming, debounce};
@@ -58,6 +60,8 @@ pub type Plan = BTreeMap<EnvKey, BTreeMap<String, Vec<ReplicaPlacement>>>;
 pub struct Cost {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    /// The sizes of the block volumes of the pod. Ramdisks count as memory.
+    pub disk_bytes: u64,
 }
 
 /// What the planner needs to know about a workload.
@@ -161,6 +165,30 @@ impl<'a> Planner<'a> {
         let used = self.reserved.get(&node).copied().unwrap_or_default();
         used.cpu_millis.saturating_add(cost.cpu_millis) <= capacity.cpu_millis
             && used.memory_bytes.saturating_add(cost.memory_bytes) <= capacity.memory_bytes
+            && used.disk_bytes.saturating_add(cost.disk_bytes) <= capacity.disk_bytes
+    }
+
+    /// Whether a replica already on `node` may stay: the node is alive and
+    /// the workload's pins allow it. Capacity is not asked again: a smaller
+    /// report or none at all moves nothing.
+    fn may_stay(&self, wl: &WorkloadInput, node: u64) -> bool {
+        self.inputs
+            .nodes
+            .get(&node)
+            .is_some_and(|n| n.live && (wl.pins.is_empty() || wl.pins.contains(&n.name)))
+    }
+
+    /// The pinned names no node has, sorted.
+    fn unknown_pins<'w>(&self, wl: &'w WorkloadInput) -> Vec<&'w str> {
+        let mut names: Vec<&str> = wl
+            .pins
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !self.by_name.contains_key(*p))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// How full `node` is, in thousandths of its tighter resource.
@@ -185,6 +213,7 @@ impl<'a> Planner<'a> {
         let used = self.reserved.entry(node).or_default();
         used.cpu_millis = used.cpu_millis.saturating_add(cost.cpu_millis);
         used.memory_bytes = used.memory_bytes.saturating_add(cost.memory_bytes);
+        used.disk_bytes = used.disk_bytes.saturating_add(cost.disk_bytes);
         self.hosts.entry(env).or_default().insert(node);
     }
 
@@ -216,11 +245,7 @@ impl<'a> Planner<'a> {
                             kept.push(r.clone());
                         }
                     }
-                    Some(node)
-                        if self.is_candidate(wl, node)
-                            && !nodes.contains(&node)
-                            && self.fits(node, wl.cost) =>
-                    {
+                    Some(node) if self.may_stay(wl, node) && !nodes.contains(&node) => {
                         if daemon {
                             nodes.insert(node);
                         }
@@ -270,7 +295,7 @@ impl<'a> Planner<'a> {
                     self.reserve(env, node, wl.cost);
                     ReplicaPlacement::on(index, node)
                 }
-                Err(why) => ReplicaPlacement::unplaced(index, why),
+                Err(why) => ReplicaPlacement::unplaced(index, &why),
             };
             replicas.push(placement);
         }
@@ -286,7 +311,16 @@ impl<'a> Planner<'a> {
         wl: &WorkloadInput,
         strategy: Strategy,
         placed: &[ReplicaPlacement],
-    ) -> Result<u64, &'static str> {
+    ) -> Result<u64, String> {
+        // A pinned name no node has explains every replica left unplaced.
+        let unknown = self.unknown_pins(wl);
+        let unplaced = |why: &str| {
+            if unknown.is_empty() {
+                why.to_string()
+            } else {
+                pinned_unknown_reason(&unknown)
+            }
+        };
         let allowed: Vec<u64> = self
             .inputs
             .nodes
@@ -295,18 +329,14 @@ impl<'a> Planner<'a> {
             .map(|(id, _)| *id)
             .collect();
         if allowed.is_empty() {
-            return Err(if wl.pins.is_empty() {
-                reason::NO_NODE_AVAILABLE
-            } else {
-                reason::PINNED_NODE_UNKNOWN
-            });
+            return Err(unplaced(reason::NO_NODE_AVAILABLE));
         }
         let candidates: Vec<u64> = allowed
             .into_iter()
             .filter(|id| self.is_candidate(wl, *id))
             .collect();
         if candidates.is_empty() {
-            return Err(reason::NO_NODE_AVAILABLE);
+            return Err(unplaced(reason::NO_NODE_AVAILABLE));
         }
         let hosts = self.hosts.get(env);
         let running = |node: u64| placed.iter().filter(|r| r.node == Some(node)).count();
@@ -325,7 +355,7 @@ impl<'a> Planner<'a> {
                 )
             }),
         };
-        chosen.ok_or(reason::INSUFFICIENT_CAPACITY)
+        chosen.ok_or_else(|| unplaced(reason::INSUFFICIENT_CAPACITY))
     }
 
     fn place_daemon(
@@ -369,7 +399,7 @@ impl<'a> Planner<'a> {
             {
                 added.push(ReplicaPlacement::unplaced(
                     next_index(),
-                    reason::PINNED_NODE_UNKNOWN,
+                    &pinned_unknown_reason(&[pin.as_str()]),
                 ));
             }
         }
@@ -377,6 +407,20 @@ impl<'a> Planner<'a> {
         replicas.sort_by_key(|r| r.index);
         replicas
     }
+}
+
+/// `pinned_node_unknown: a, b`, cut to [`MAX_REASON_BYTES`].
+fn pinned_unknown_reason(names: &[&str]) -> String {
+    let mut text = format!("{}: {}", reason::PINNED_NODE_UNKNOWN, names.join(", "));
+    if text.len() > MAX_REASON_BYTES {
+        let mut end = MAX_REASON_BYTES - 3;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
 }
 
 /// The inputs for [`plan`] from the replicated state: the environments, the
@@ -413,7 +457,20 @@ pub fn gather(
                         .fold(Cost::default(), |sum, c| Cost {
                             cpu_millis: sum.cpu_millis.saturating_add(c.resources.cpu_millis),
                             memory_bytes: sum.memory_bytes.saturating_add(c.resources.memory_bytes),
+                            disk_bytes: sum.disk_bytes,
                         });
+                    let cost = Cost {
+                        disk_bytes: w
+                            .spec
+                            .volumes
+                            .values()
+                            .map(|v| match v {
+                                VolumeSource::Block { size_bytes } => *size_bytes,
+                                VolumeSource::Ramdisk { .. } => 0,
+                            })
+                            .fold(0, u64::saturating_add),
+                        ..cost
+                    };
                     let input = WorkloadInput {
                         scale: w.spec.scale,
                         pins: w.spec.placement.nodes.clone(),
@@ -448,7 +505,8 @@ pub fn gather(
     }
 }
 
-/// The commands that bring the stored plans to `plan`: one per environment
+/// The commands that bring the stored plans to `plan`, which was computed
+/// from the state as of log entry `basis`: one per environment
 /// whose workloads or replicas differ from the stored record, and an empty
 /// one for every record whose environment is gone. Nothing for a plan that
 /// is already stored, whatever generation it was made at.
@@ -456,6 +514,7 @@ pub fn proposals(
     environments: &[(String, String, EnvironmentRecord)],
     records: &BTreeMap<EnvKey, PlacementRecord>,
     plan: &Plan,
+    basis: u64,
 ) -> Vec<PlaceReplicas> {
     let mut commands = Vec::new();
     for (project, environment, record) in environments {
@@ -479,6 +538,7 @@ pub fn proposals(
                 project: project.clone(),
                 environment: environment.clone(),
                 generation: record.generation,
+                basis,
                 workloads: wanted.cloned().unwrap_or_default(),
             });
         }
@@ -492,6 +552,7 @@ pub fn proposals(
                 project: project.clone(),
                 environment: environment.clone(),
                 generation: 0,
+                basis,
                 workloads: BTreeMap::new(),
             });
         }
@@ -512,16 +573,23 @@ impl FaberService {
     /// accepted. A command that apply refuses is normal when the state moved
     /// since it was computed: the next change plans again.
     pub(crate) async fn place_once(&self) -> ServiceResult<usize> {
-        let internal = |e: crate::raft::store::ReadError| ServiceError::Internal(e.to_string());
-        let state = self.state();
-        let Some(mesh) = state.mesh().map_err(internal)? else {
+        // Plan from what the cluster has agreed on, not from what this
+        // node has applied so far, and from one view of it.
+        self.settle().await?;
+        let view = self
+            .state()
+            .placement_view()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let Some(mesh) = view.mesh.as_ref() else {
             return Ok(0);
         };
-        let environments = state.environments().map_err(internal)?;
-        let statuses = state.statuses().map_err(internal)?;
-        let records = state.placements().map_err(internal)?;
-        let inputs = gather(&environments, &mesh, &statuses, &records);
-        let commands = proposals(&environments, &records, &plan(&inputs));
+        let inputs = gather(&view.environments, mesh, &view.statuses, &view.records);
+        let commands = proposals(
+            &view.environments,
+            &view.records,
+            &plan(&inputs),
+            view.applied,
+        );
         let mut accepted = 0;
         for command in commands {
             let (project, environment) = (command.project.clone(), command.environment.clone());
@@ -569,6 +637,9 @@ pub fn spawn_placement_task(
             match service.place_once().await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(commands = n, "placed replicas"),
+                Err(ServiceError::NotReady(why)) => {
+                    tracing::debug!(%why, "placement waits for the next change");
+                }
                 Err(e) => tracing::warn!(error = %e, "placement failed; trying on the next change"),
             }
         }
@@ -598,6 +669,7 @@ mod tests {
         Cost {
             cpu_millis: CPU,
             memory_bytes: MEM,
+            disk_bytes: 0,
         }
     }
 
@@ -860,7 +932,7 @@ mod tests {
         );
         assert_eq!(
             replicas[2].reason.as_deref(),
-            Some(reason::PINNED_NODE_UNKNOWN)
+            Some("pinned_node_unknown: ghost")
         );
         assert_stable(&inputs, &planned);
     }
@@ -888,8 +960,8 @@ mod tests {
         assert_eq!(
             reasons_of(&planned, "staging", "web"),
             [
-                Some(reason::PINNED_NODE_UNKNOWN),
-                Some(reason::PINNED_NODE_UNKNOWN)
+                Some("pinned_node_unknown: ghost"),
+                Some("pinned_node_unknown: ghost")
             ]
         );
         assert_stable(&inputs, &planned);
@@ -897,6 +969,22 @@ mod tests {
         workload_mut(&mut inputs, "web").pins = vec!["ghost".into(), "n2".into()];
         let planned = plan(&inputs);
         assert_eq!(nodes_of(&planned, "staging", "web"), [Some(2), Some(2)]);
+        // When the known node is full, the unknown name is the reason.
+        inputs.nodes.get_mut(&2).unwrap().capacity = capacity(1);
+        inputs.current.clear();
+        let planned = plan(&inputs);
+        assert_eq!(nodes_of(&planned, "staging", "web"), [Some(2), None]);
+        assert_eq!(
+            reasons_of(&planned, "staging", "web")[1],
+            Some("pinned_node_unknown: ghost")
+        );
+        // Many long names are cut to the bound.
+        let names: Vec<String> = (0..20).map(|i| format!("missing-node-{i}")).collect();
+        workload_mut(&mut inputs, "web").pins = names;
+        let planned = plan(&inputs);
+        let why = planned[&env("staging")]["web"][0].reason.clone().unwrap();
+        assert!(why.len() <= MAX_REASON_BYTES, "{why}");
+        assert!(why.starts_with("pinned_node_unknown: missing-node-0"));
     }
 
     #[test]
@@ -956,22 +1044,84 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_replica_that_no_longer_fits_is_moved() {
+    fn a_replica_stays_when_its_node_reports_less_or_nothing() {
         let mut inputs = cluster(2, 10);
-        add(&mut inputs, "staging", "web", replicas(1, Strategy::Spread));
+        add(&mut inputs, "staging", "web", replicas(2, Strategy::Spread));
+        let both = vec![ReplicaPlacement::on(0, 1), ReplicaPlacement::on(1, 1)];
+        set_current(&mut inputs, "staging", "web", both.clone());
+        // The node now reports less than the replicas need...
+        inputs.nodes.get_mut(&1).unwrap().capacity = Some(Capacity {
+            cpu_millis: 50,
+            memory_bytes: 50,
+            disk_bytes: 0,
+        });
+        assert_eq!(plan(&inputs)[&env("staging")]["web"], both);
+        // ...or no report at all.
+        inputs.nodes.get_mut(&1).unwrap().capacity = None;
+        assert_eq!(plan(&inputs)[&env("staging")]["web"], both);
+        // A daemon replica stays too.
+        add(&mut inputs, "staging", "agent", daemon());
+        set_current(
+            &mut inputs,
+            "staging",
+            "agent",
+            vec![ReplicaPlacement::on(0, 1)],
+        );
+        assert_eq!(nodes_of(&plan(&inputs), "staging", "agent")[0], Some(1));
+    }
+
+    #[test]
+    fn only_new_replicas_must_fit_beside_the_kept_ones() {
+        let mut inputs = cluster(1, 2);
+        add(&mut inputs, "staging", "web", replicas(3, Strategy::Spread));
         set_current(
             &mut inputs,
             "staging",
             "web",
             vec![ReplicaPlacement::on(0, 1)],
         );
-        // The node now reports less than a replica needs.
-        inputs.nodes.get_mut(&1).unwrap().capacity = Some(Capacity {
-            cpu_millis: 50,
-            memory_bytes: 50,
-            disk_bytes: 0,
-        });
+        // One is kept, one more fits, the third does not.
+        let planned = plan(&inputs);
+        assert_eq!(
+            nodes_of(&planned, "staging", "web"),
+            [Some(1), Some(1), None]
+        );
+        // A pin that now excludes the node does move the replica.
+        let mut inputs = cluster(2, 10);
+        let mut wl = replicas(1, Strategy::Spread);
+        wl.pins = vec!["n2".into()];
+        add(&mut inputs, "staging", "web", wl);
+        set_current(
+            &mut inputs,
+            "staging",
+            "web",
+            vec![ReplicaPlacement::on(0, 1)],
+        );
         assert_eq!(nodes_of(&plan(&inputs), "staging", "web"), [Some(2)]);
+    }
+
+    #[test]
+    fn block_volumes_are_reserved_against_the_disk_a_node_reported() {
+        let mut inputs = cluster(2, 10);
+        inputs.nodes.get_mut(&1).unwrap().capacity = Some(Capacity {
+            cpu_millis: 10_000,
+            memory_bytes: 10_000,
+            disk_bytes: 250,
+        });
+        let mut wl = replicas(3, Strategy::Pack);
+        wl.cost.disk_bytes = 100;
+        add(&mut inputs, "staging", "db", wl);
+        // Node 2 reports no disk at all: nothing with a volume fits there.
+        let planned = plan(&inputs);
+        assert_eq!(
+            nodes_of(&planned, "staging", "db"),
+            [Some(1), Some(1), None]
+        );
+        assert_eq!(
+            reasons_of(&planned, "staging", "db")[2],
+            Some(reason::INSUFFICIENT_CAPACITY)
+        );
+        assert_stable(&inputs, &planned);
     }
 
     #[test]
@@ -1059,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn block_volume_replicas_hold_their_place_before_others_are_placed() {
+    fn block_volume_replicas_and_kept_replicas_hold_their_place_before_new_ones() {
         let mut inputs = cluster(1, 1);
         let mut db = replicas(1, Strategy::Spread);
         db.block_volume = true;
@@ -1080,7 +1230,10 @@ mod tests {
         );
         let planned = plan(&inputs);
         assert_eq!(nodes_of(&planned, "staging", "db"), [Some(1)]);
-        assert_eq!(nodes_of(&planned, "staging", "api"), [None]);
+        assert_eq!(nodes_of(&planned, "staging", "api"), [Some(1)]);
+        // A new replica finds the node full: kept replicas hold their place.
+        add(&mut inputs, "staging", "new", replicas(1, Strategy::Spread));
+        assert_eq!(nodes_of(&plan(&inputs), "staging", "new"), [None]);
     }
 
     #[test]
@@ -1200,7 +1353,8 @@ mod tests {
             wl.cost,
             Cost {
                 cpu_millis: 500,
-                memory_bytes: 1024
+                memory_bytes: 1024,
+                disk_bytes: 1_048_576
             }
         );
         assert!(wl.block_volume);
@@ -1213,6 +1367,7 @@ mod tests {
     fn record(generation: u64, workloads: &[(&str, Vec<ReplicaPlacement>)]) -> PlacementRecord {
         PlacementRecord {
             generation,
+            basis: 0,
             workloads: workloads
                 .iter()
                 .map(|(name, replicas)| {
@@ -1245,31 +1400,35 @@ mod tests {
         let on_2 = vec![ReplicaPlacement::on(0, 2)];
         let wanted = plan_of(&[("web", on_2.clone())]);
         // Nothing stored yet: one command, at the environment's generation.
-        let got = proposals(&environments, &BTreeMap::new(), &wanted);
+        let got = proposals(&environments, &BTreeMap::new(), &wanted, 11);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].generation, 5);
+        assert_eq!(got[0].basis, 11);
         assert_eq!(got[0].workloads["web"], on_2);
         // The same plan stored, at an older generation: nothing.
         let stored = BTreeMap::from([(env("staging"), record(3, &[("web", on_2.clone())]))]);
-        assert!(proposals(&environments, &stored, &wanted).is_empty());
+        assert!(proposals(&environments, &stored, &wanted, 11).is_empty());
         // A different node: a command.
         let other = vec![ReplicaPlacement::on(0, 1)];
         let moved = BTreeMap::from([(env("staging"), record(5, &[("web", other)]))]);
-        assert_eq!(proposals(&environments, &moved, &wanted).len(), 1);
+        assert_eq!(proposals(&environments, &moved, &wanted, 11).len(), 1);
         // A workload in the record that the plan no longer has: a command.
         let extra = record(5, &[("web", on_2.clone()), ("old", on_2)]);
         let extra = BTreeMap::from([(env("staging"), extra)]);
-        assert_eq!(proposals(&environments, &extra, &wanted).len(), 1);
+        assert_eq!(proposals(&environments, &extra, &wanted, 11).len(), 1);
         // A new workload with no replicas still needs its record.
         let none = plan_of(&[("web", Vec::new())]);
-        assert_eq!(proposals(&environments, &BTreeMap::new(), &none).len(), 1);
+        assert_eq!(
+            proposals(&environments, &BTreeMap::new(), &none, 11).len(),
+            1
+        );
         // An environment with no workloads and no record: nothing.
         let empty = vec![(
             "shop".to_string(),
             "staging".to_string(),
             environment(5, &[]),
         )];
-        assert!(proposals(&empty, &BTreeMap::new(), &Plan::new()).is_empty());
+        assert!(proposals(&empty, &BTreeMap::new(), &Plan::new(), 11).is_empty());
     }
 
     #[test]
@@ -1278,7 +1437,7 @@ mod tests {
             env("gone"),
             record(3, &[("web", vec![ReplicaPlacement::on(0, 2)])]),
         )]);
-        let got = proposals(&[], &stored, &Plan::new());
+        let got = proposals(&[], &stored, &Plan::new(), 11);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].environment, "gone");
         assert!(got[0].workloads.is_empty());

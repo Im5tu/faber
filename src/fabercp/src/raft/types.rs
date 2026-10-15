@@ -376,6 +376,7 @@ mod tests {
                 project: project.clone(),
                 environment: environment.clone(),
                 generation: 6,
+                basis: 9,
                 workloads: BTreeMap::from([(
                     workload.clone(),
                     vec![

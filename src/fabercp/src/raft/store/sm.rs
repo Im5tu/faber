@@ -100,6 +100,20 @@ fn reject(code: &str, message: impl Into<String>) -> Response {
     Rejection::new(code, message).into()
 }
 
+/// The state the planner reads, from one view of the database. See
+/// [`StateReader::placement_view`].
+#[derive(Debug, Clone)]
+pub struct PlacementView {
+    /// The index of the last log entry applied in this view.
+    pub applied: u64,
+    pub mesh: Option<MeshState>,
+    /// `(project, environment, record)`, sorted by the two names.
+    pub environments: Vec<(String, String, EnvironmentRecord)>,
+    pub statuses: BTreeMap<u64, NodeStatus>,
+    /// The stored plans by `(project, environment)`.
+    pub records: BTreeMap<(String, String), place::PlacementRecord>,
+}
+
 /// Builds snapshots from a point-in-time RocksDB snapshot, so it can run while
 /// the state machine keeps applying entries.
 #[derive(Debug, Clone)]
@@ -927,6 +941,80 @@ impl StateReader {
             found.insert((project.to_string(), environment.to_string()), record);
         }
         Ok(found)
+    }
+
+    /// Everything the planner reads, from one view of the database: the
+    /// state as of one applied batch, with the index of the last entry
+    /// applied in it. A record that cannot be read is an error, except a
+    /// status record, which is left out as in [`Self::statuses`].
+    pub fn placement_view(&self) -> Result<PlacementView, ReadError> {
+        let storage = |e: &dyn std::fmt::Display| ReadError::Storage(e.to_string());
+        let db = self.db.upgrade().ok_or(ReadError::Closed)?;
+        let view = db.snapshot();
+        let data = cf(&db, CF_SM_DATA);
+        let scan = |prefix: &str| -> Result<Vec<(String, Vec<u8>)>, ReadError> {
+            let from = IteratorMode::From(prefix.as_bytes(), Direction::Forward);
+            let mut found = Vec::new();
+            for item in view.iterator_cf(data, from) {
+                let (key, value) = item.map_err(|e| storage(&e))?;
+                let Some(rest) = key.strip_prefix(prefix.as_bytes()) else {
+                    break;
+                };
+                let rest =
+                    String::from_utf8(rest.to_vec()).map_err(|_| storage(&"a key is not UTF-8"))?;
+                found.push((rest, value.to_vec()));
+            }
+            Ok(found)
+        };
+        let applied = view
+            .get_cf(cf(&db, CF_SM_META), KEY_LAST_APPLIED)
+            .map_err(|e| storage(&e))?
+            .map(|b| serde_json::from_slice::<Option<LogId>>(&b).map_err(|e| storage(&e)))
+            .transpose()?
+            .flatten()
+            .map_or(0, |id| id.index);
+        let mesh = view
+            .get_cf(data, KEY_MESH.as_bytes())
+            .map_err(|e| storage(&e))?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| storage(&e)))
+            .transpose()?;
+        let split = |rest: &str| -> Result<(String, String), ReadError> {
+            rest.split_once('/')
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .ok_or_else(|| storage(&"a key is not <prefix><project>/<environment>"))
+        };
+        let mut environments = Vec::new();
+        for (rest, value) in scan(ENV_PREFIX)? {
+            let (project, environment) = split(&rest)?;
+            let record = serde_json::from_slice(&value).map_err(|e| storage(&e))?;
+            environments.push((project, environment, record));
+        }
+        // Key order is not name order: `-` sorts before `/`.
+        environments.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let statuses = scan(status::KEY_PREFIX)?
+            .into_iter()
+            .filter_map(|(id, value)| {
+                Some((
+                    id.parse::<u64>().ok()?,
+                    serde_json::from_slice(&value).ok()?,
+                ))
+            })
+            .collect();
+        let mut records = BTreeMap::new();
+        for (rest, value) in scan(place::KEY_PREFIX)? {
+            let key = split(&rest)?;
+            records.insert(
+                key,
+                serde_json::from_slice(&value).map_err(|e| storage(&e))?,
+            );
+        }
+        Ok(PlacementView {
+            applied,
+            mesh,
+            environments,
+            statuses,
+            records,
+        })
     }
 
     /// The data key stored for `scope` (`cluster` or `<project>/<environment>`).
@@ -3202,6 +3290,7 @@ mod tests {
             project: "shop".into(),
             environment: "staging".into(),
             generation,
+            basis: 0,
             workloads: workloads
                 .iter()
                 .map(|(name, nodes)| {
@@ -3296,6 +3385,39 @@ mod tests {
         let uids: place::UidAllocator =
             serde_json::from_value(s.reader.get(place::KEY_UIDS).unwrap().unwrap()).unwrap();
         assert_eq!(uids.free, BTreeSet::from([0]));
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn the_placement_view_is_one_consistent_read_with_its_applied_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let empty = s.reader.placement_view().unwrap();
+        assert_eq!(empty.applied, 0);
+        assert!(empty.mesh.is_none() && empty.environments.is_empty());
+        s.state_machine
+            .apply([
+                normal(1, init_cluster()),
+                normal(2, create_project("shop")),
+                normal(3, deploy("shop", &[("web", "nginx")], false)),
+                normal(4, place(3, &[("web", &[Some(1)])])),
+            ])
+            .await
+            .unwrap();
+        let view = s.reader.placement_view().unwrap();
+        assert_eq!(view.applied, 4);
+        assert!(view.mesh.is_some());
+        let names: Vec<_> = view
+            .environments
+            .iter()
+            .map(|(p, e, r)| (p.as_str(), e.as_str(), r.generation))
+            .collect();
+        assert_eq!(names, [("shop", "production", 2), ("shop", "staging", 3)]);
+        assert_eq!(
+            view.records[&("shop".to_string(), "staging".to_string())].generation,
+            3
+        );
+        assert!(view.statuses.is_empty());
         drop(s);
     }
 

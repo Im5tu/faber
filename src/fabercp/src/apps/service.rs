@@ -1950,6 +1950,18 @@ mod tests {
             record.workloads[name].uid_base
         };
         let web_uids = uid_base("web");
+        // The plan records the log entry it was computed at, and a plan made
+        // from older state than that is refused.
+        let record = svc.state().placement("shop", "staging").unwrap().unwrap();
+        assert!(record.basis > 0);
+        let older = Request::PlaceReplicas(crate::raft::store::place::PlaceReplicas {
+            project: "shop".into(),
+            environment: "staging".into(),
+            generation: record.generation,
+            basis: record.basis - 1,
+            workloads: BTreeMap::new(),
+        });
+        assert!(svc.propose(older).await.is_err());
 
         // A change of scale is placed once; the workload keeps its uids.
         svc.deploy(

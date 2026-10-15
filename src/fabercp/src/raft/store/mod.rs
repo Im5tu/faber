@@ -25,7 +25,7 @@ use openraft::{EntryPayload, RaftLogReader};
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 
 pub use log::LogStore;
-pub use sm::{ReadError, SnapshotBuilder, StateMachineStore, StateReader};
+pub use sm::{PlacementView, ReadError, SnapshotBuilder, StateMachineStore, StateReader};
 
 use crate::raft::types::{NodeId, StorageError};
 

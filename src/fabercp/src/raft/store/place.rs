@@ -115,6 +115,11 @@ pub struct PlaceReplicas {
     pub project: String,
     pub environment: String,
     pub generation: u64,
+    /// The index of the last log entry the leader had applied when it read
+    /// the state the plan was computed from. A plan whose basis is older than
+    /// the stored plan's is refused: it was made from older state.
+    #[serde(default)]
+    pub basis: u64,
     /// The replicas of each workload, by workload name.
     pub workloads: BTreeMap<String, Vec<ReplicaPlacement>>,
 }
@@ -134,6 +139,9 @@ pub struct WorkloadPlacement {
 pub struct PlacementRecord {
     /// The generation of the environment record the plan came from.
     pub generation: u64,
+    /// The basis of the command that stored the plan.
+    #[serde(default)]
+    pub basis: u64,
     pub workloads: BTreeMap<String, WorkloadPlacement>,
 }
 
@@ -202,7 +210,9 @@ fn bad_request(message: impl Into<String>) -> Rejection {
 /// - The environment does not exist: with no workloads in the command, the
 ///   record is deleted and its uid ranges are freed; otherwise `not_found`.
 /// - A generation other than the environment's, or older than the stored
-///   plan's: `bad_request`. The plan was made from state that has changed.
+///   plan's, or a basis older than the stored plan's: `bad_request`. The plan
+///   was made from state that has changed, or from older state than the one
+///   stored.
 /// - A workload the environment does not have, more than
 ///   [`MAX_REPLICAS`] replicas, a replica index twice, or a `reason` over
 ///   [`MAX_REASON_BYTES`]: `bad_request`.
@@ -236,6 +246,12 @@ pub fn place_replicas(
         }
         return Ok(Placed { record: None, uids });
     };
+    if stored.is_some_and(|r| r.basis > cmd.basis) {
+        return Err(bad_request(format!(
+            "the plan is made from state up to entry {}, a newer plan is stored",
+            cmd.basis
+        )));
+    }
     if cmd.generation != environment.generation
         || stored.is_some_and(|r| r.generation > cmd.generation)
     {
@@ -272,6 +288,7 @@ pub fn place_replicas(
     }
     let record = (!workloads.is_empty()).then_some(PlacementRecord {
         generation: cmd.generation,
+        basis: cmd.basis,
         workloads,
     });
     Ok(Placed { record, uids })
@@ -370,6 +387,7 @@ mod tests {
             project: "shop".into(),
             environment: "staging".into(),
             generation,
+            basis: 0,
             workloads: workloads
                 .iter()
                 .map(|(name, nodes)| {
@@ -443,6 +461,7 @@ mod tests {
         // Older than the stored plan's, whatever the environment says.
         let stored = PlacementRecord {
             generation: 9,
+            basis: 0,
             workloads: BTreeMap::new(),
         };
         let got = place_replicas(
@@ -456,6 +475,7 @@ mod tests {
         // The same generation again is fine: capacity moved, not the spec.
         let stored = PlacementRecord {
             generation: 8,
+            basis: 0,
             workloads: BTreeMap::new(),
         };
         let got = place_replicas(
@@ -466,6 +486,28 @@ mod tests {
             cmd(8, &[("web", &[Some(1)])]),
         );
         assert!(got.is_ok());
+    }
+
+    #[test]
+    fn a_plan_made_from_older_state_than_the_stored_one_is_rejected() {
+        let env = env(8, &["web"]);
+        let mesh = mesh(&[1, 2]);
+        let uids = UidAllocator::default();
+        let stored = PlacementRecord {
+            generation: 8,
+            basis: 20,
+            workloads: BTreeMap::new(),
+        };
+        let run = |basis| {
+            let mut c = cmd(8, &[("web", &[Some(2)])]);
+            c.basis = basis;
+            place_replicas(Some(&env), Some(&mesh), Some(&stored), &uids, c)
+        };
+        assert_eq!(code(run(19)).as_deref(), Some(error_code::BAD_REQUEST));
+        // The same basis or a newer one is fine; the record keeps the basis.
+        assert!(run(20).is_ok());
+        let placed = run(25).unwrap();
+        assert_eq!(placed.record.unwrap().basis, 25);
     }
 
     #[test]
@@ -680,6 +722,7 @@ mod tests {
     fn records_have_a_pinned_shape() {
         let record = PlacementRecord {
             generation: 3,
+            basis: 4,
             workloads: BTreeMap::from([(
                 "web".to_string(),
                 WorkloadPlacement {
@@ -695,6 +738,7 @@ mod tests {
             serde_json::to_value(&record).unwrap(),
             serde_json::json!({
                 "generation": 3,
+                "basis": 4,
                 "workloads": {"web": {"uid_base": 1_048_576, "replicas": [
                     {"index": 0, "node": 2},
                     {"index": 1, "node": null, "reason": "volume_lost"},
