@@ -151,9 +151,7 @@ impl<'a> Planner<'a> {
         let Some(n) = self.inputs.nodes.get(&node) else {
             return false;
         };
-        n.live
-            && n.capacity.is_some()
-            && (wl.pins.is_empty() || wl.pins.iter().any(|p| *p == n.name))
+        n.live && n.capacity.is_some() && (wl.pins.is_empty() || wl.pins.contains(&n.name))
     }
 
     fn fits(&self, node: u64, cost: Cost) -> bool {
@@ -293,7 +291,7 @@ impl<'a> Planner<'a> {
             .inputs
             .nodes
             .iter()
-            .filter(|(_, n)| wl.pins.is_empty() || wl.pins.iter().any(|p| *p == n.name))
+            .filter(|(_, n)| wl.pins.is_empty() || wl.pins.contains(&n.name))
             .map(|(id, _)| *id)
             .collect();
         if allowed.is_empty() {
