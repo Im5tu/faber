@@ -782,7 +782,7 @@ async fn sleep_until_due(at: Option<Instant>) {
 /// Swallows further change ticks until `debounce_quiet` passes without one,
 /// or `debounce_max` after the call. Returns `false` if `shutdown` fired or
 /// the change feed closed.
-async fn debounce(
+pub(crate) async fn debounce(
     changes: &mut watch::Receiver<u64>,
     timing: &ReconcileTiming,
     shutdown: &CancellationToken,
