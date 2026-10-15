@@ -1089,6 +1089,135 @@ async fn a_name_that_is_not_a_dns_label_is_refused_before_any_request() {
     }
 }
 
+// ---- mesh status-interval ----
+
+#[tokio::test]
+async fn mesh_status_interval_text_and_json() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        "GET",
+        "/api/v1/mesh/status-interval",
+        200,
+        json!({"interval_secs": 5}),
+    )
+    .await;
+
+    let text = run_ok(&server, &["mesh", "status-interval"]).await;
+    assert_eq!(text, "status_interval: 5s\n");
+
+    let out = run_ok(&server, &["-o", "json", "mesh", "status-interval"]).await;
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v, json!({"status_interval_secs": 5}));
+    assert!(out.ends_with('\n'));
+}
+
+#[tokio::test]
+async fn mesh_status_interval_set_puts_the_seconds_and_prints_the_new_interval() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/mesh/status-interval"))
+        .and(body_json(json!({"interval_secs": 120})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"interval_secs": 120})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let text = run_ok(&server, &["mesh", "status-interval", "--set", "2m"]).await;
+    assert_eq!(text, "status_interval: 2m (120s)\n");
+
+    let args = ["-o", "json", "mesh", "status-interval", "--set", "120"];
+    let v: Value = serde_json::from_str(&run_ok(&server, &args).await).unwrap();
+    assert_eq!(v, json!({"status_interval_secs": 120}));
+}
+
+#[tokio::test]
+async fn mesh_status_interval_errors_are_readable() {
+    let server = MockServer::start().await;
+    mount_json(
+        &server,
+        "GET",
+        "/api/v1/mesh/status-interval",
+        503,
+        json!({"error": "no_leader"}),
+    )
+    .await;
+    let (err, out) = run_err(&server, &["mesh", "status-interval"]).await;
+    assert_eq!(err, "no_leader");
+    assert!(out.is_empty());
+}
+
+// ---- cluster key export ----
+
+const KEY: &str = "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq8s=";
+
+#[tokio::test]
+async fn cluster_key_export_prints_exactly_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cluster.key");
+    // The file may end with a newline or not; the output always does.
+    for content in [KEY.to_string(), format!("{KEY}\n")] {
+        std::fs::write(&file, content).unwrap();
+        let file = file.to_str().unwrap();
+        let server = silent_server().await;
+
+        let text = run_ok(&server, &["cluster", "key", "export", "--file", file]).await;
+        assert_eq!(text, format!("{KEY}\n"));
+
+        let args = ["-o", "json", "cluster", "key", "export", "--file", file];
+        let out = run_ok(&server, &args).await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v, json!({"cluster_key": KEY}));
+        assert!(out.ends_with('\n'));
+    }
+}
+
+#[tokio::test]
+async fn cluster_key_export_of_a_missing_file_names_the_file_and_no_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("absent.key");
+    let server = silent_server().await;
+
+    let args = ["cluster", "key", "export", "--file", file.to_str().unwrap()];
+    let (err, out) = run_err(&server, &args).await;
+    assert!(err.contains("absent.key"), "{err}");
+    assert!(err.contains("root or faber"), "{err}");
+    assert!(!err.contains(KEY), "{err}");
+    assert!(out.is_empty());
+}
+
+/// A path that is not a readable file fails with an error that holds no
+/// content of whatever was there.
+#[tokio::test]
+async fn cluster_key_export_of_an_unreadable_path_holds_no_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = silent_server().await;
+
+    let args = [
+        "cluster",
+        "key",
+        "export",
+        "--file",
+        dir.path().to_str().unwrap(),
+    ];
+    let (err, out) = run_err(&server, &args).await;
+    assert!(err.contains("root or faber"), "{err}");
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn cluster_key_export_of_an_empty_file_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cluster.key");
+    std::fs::write(&file, "\n").unwrap();
+    let server = silent_server().await;
+
+    let args = ["cluster", "key", "export", "--file", file.to_str().unwrap()];
+    let (err, out) = run_err(&server, &args).await;
+    assert!(err.contains("empty"), "{err}");
+    assert!(out.is_empty());
+}
+
 // ---- app ls ----
 
 fn workload_list_body() -> Value {
@@ -1106,13 +1235,49 @@ fn workload_list_body() -> Value {
     ]})
 }
 
+/// Mounts the `app show` route of `name` with the given scale and replica
+/// reports. It fails the test when asked for the env values.
+async fn mount_replicas(server: &MockServer, name: &str, scale: Value, replicas: Value) {
+    let mut body = workload_body();
+    body["name"] = json!(name);
+    body["spec"]["scale"] = scale;
+    body["replicas"] = replicas;
+    Mock::given(method("GET"))
+        .and(path(workload_route(name)))
+        .and(query_param_is_missing("reveal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+fn replica(node: u64, index: u32, state: &str) -> Value {
+    json!({"node": node, "replica_index": index, "revision": 7, "state": state})
+}
+
+async fn mount_list_replicas(server: &MockServer) {
+    let count = |count: u32| json!({"replicas": {"count": count, "strategy": "spread"}});
+    mount_replicas(server, "db", count(1), json!([replica(1, 0, "available")])).await;
+    // Daemon: desired is the nodes that hold a replica.
+    let logs = json!([
+        replica(1, 0, "available"),
+        replica(2, 1, "deploying"),
+        replica(3, 2, "unavailable"),
+    ]);
+    mount_replicas(server, "logs", json!("daemon"), logs).await;
+    // Fewer reports than replicas wanted: the rest are not available.
+    let web = json!([replica(1, 0, "available"), replica(2, 1, "available")]);
+    mount_replicas(server, "web", count(3), web).await;
+}
+
 #[tokio::test]
 async fn app_ls_text_and_json() {
     let server = MockServer::start().await;
+    mount_list_replicas(&server).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workloads"))
         .and(query_param("project", "shop"))
         .and(query_param("environment", "staging"))
+        .and(query_param_is_missing("reveal"))
         .respond_with(ResponseTemplate::new(200).set_body_json(workload_list_body()))
         .expect(2)
         .mount(&server)
@@ -1121,14 +1286,14 @@ async fn app_ls_text_and_json() {
     let args = ["app", "ls", "--project", "shop", "--env", "staging"];
     assert_eq!(
         run_ok(&server, &args).await,
-        "\
-NAME  PROJECT  ENVIRONMENT  SCALE       EXPOSE       FQDN
-db    shop     staging      1 (spread)  environment  db.staging.shop.faber.internal
-logs  shop     staging      daemon      environment  logs.staging.shop.faber.internal
-web   shop     staging      3 (pack)    cluster      web.staging.shop.faber.internal
+        "NAME  PROJECT  ENVIRONMENT  SCALE       AVAILABLE  EXPOSE       FQDN
+db    shop     staging      1 (spread)  1/1        environment  db.staging.shop.faber.internal
+logs  shop     staging      daemon      1/3        environment  logs.staging.shop.faber.internal
+web   shop     staging      3 (pack)    2/3        cluster      web.staging.shop.faber.internal
 "
     );
 
+    // JSON is the list as it came, so it needs no per-workload reads.
     let out = run_ok(&server, &[&["-o", "json"][..], &args].concat()).await;
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v, workload_list_body());
@@ -1137,6 +1302,7 @@ web   shop     staging      3 (pack)    cluster      web.staging.shop.faber.inte
 #[tokio::test]
 async fn app_ls_sends_only_the_filters_it_was_given() {
     let server = MockServer::start().await;
+    mount_list_replicas(&server).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workloads"))
         .and(query_param_is_missing("project"))
@@ -1156,7 +1322,7 @@ async fn app_ls_sends_only_the_filters_it_was_given() {
 
     assert_eq!(
         run_ok(&server, &["app", "ls"]).await,
-        "NAME  PROJECT  ENVIRONMENT  SCALE  EXPOSE  FQDN\n"
+        "NAME  PROJECT  ENVIRONMENT  SCALE  AVAILABLE  EXPOSE  FQDN\n"
     );
     let text = run_ok(&server, &["app", "ls", "--env", "staging"]).await;
     assert_eq!(text.lines().count(), 4, "{text}");
@@ -1245,6 +1411,10 @@ restart:     on-failure
 expose:      cluster
 nodes:       node-1, node-2
 stop_grace:  30s
+replicas:
+  REPLICA  NODE  REVISION  STATE        POD IP
+  0        2     7         available    10.200.2.5
+  1        3     7         unavailable  -
 volumes:
   data:  block, 1073741824 bytes
   spare: block, 2097152 bytes
@@ -1256,8 +1426,8 @@ containers:
     args:              -g \"daemon off;\"
     working_dir:       /srv
     user:              101:101
-    env:               API_KEY=***
-                       MODE=***
+    env:               API_KEY=hunter2
+                       MODE=prod
     ports:             http:8080/tcp
                        53/udp
     mounts:            data:/data (block, 1073741824 bytes, read-only)
@@ -1282,11 +1452,13 @@ timeout 2s)
     probe:             -
 ";
 
+/// Env values are always shown, so the request always asks for them.
 #[tokio::test]
-async fn app_show_text_masks_env_values() {
+async fn app_show_always_reveals_and_prints_the_values() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(WORKLOAD_ROUTE))
+        .and(query_param("reveal", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(workload_body()))
         .expect(1)
         .mount(&server)
@@ -1295,36 +1467,43 @@ async fn app_show_text_masks_env_values() {
     let (out, err) = run_split(&server, &with_target(&["app", "show", "web"], &[])).await;
     assert_eq!(out, WORKLOAD_TEXT);
     assert_eq!(err, "");
-    // Neither the env values nor the value of a probe header.
-    assert!(!out.contains("hunter2") && !out.contains("s3cret"), "{out}");
 }
 
+/// JSON is the response as it came.
 #[tokio::test]
-async fn app_show_with_show_env_prints_the_values() {
+async fn app_show_json_is_the_dto() {
     let server = MockServer::start().await;
-    mount_json(&server, "GET", WORKLOAD_ROUTE, 200, workload_body()).await;
+    Mock::given(method("GET"))
+        .and(path(WORKLOAD_ROUTE))
+        .and(query_param("reveal", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(workload_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
 
-    let args = with_target(&["app", "show", "web"], &["--show-env"]);
+    let args = with_target(&["-o", "json", "app", "show", "web"], &[]);
     let out = run_ok(&server, &args).await;
-    let want = WORKLOAD_TEXT
-        .replace("API_KEY=***", "API_KEY=hunter2")
-        .replace("MODE=***", "MODE=prod");
-    assert_eq!(out, want);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v, workload_body());
 }
 
-/// JSON is for programs: it is the response as it came, values included,
-/// with or without `--show-env`.
 #[tokio::test]
-async fn app_show_json_is_the_dto_unmasked() {
+async fn app_show_without_replica_reports_says_so() {
     let server = MockServer::start().await;
-    mount_json(&server, "GET", WORKLOAD_ROUTE, 200, workload_body()).await;
+    let mut body = workload_body();
+    body["replicas"] = json!([]);
+    mount_json(&server, "GET", WORKLOAD_ROUTE, 200, body).await;
 
-    for tail in [&[][..], &["--show-env"]] {
-        let args = with_target(&["-o", "json", "app", "show", "web"], tail);
-        let out = run_ok(&server, &args).await;
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v, workload_body());
-    }
+    let out = run_ok(&server, &with_target(&["app", "show", "web"], &[])).await;
+    assert!(
+        out.contains(
+            "stop_grace:  30s
+replicas: -
+volumes:
+"
+        ),
+        "{out}"
+    );
 }
 
 #[tokio::test]
@@ -1364,6 +1543,8 @@ async fn text_output_escapes_control_characters_from_the_api() {
     list["workloads"][0]["environment"] = json!("stag\u{8}ing");
     list["workloads"][0]["fqdn"] = json!("db\u{1b}c");
     mount_json(&server, "GET", "/api/v1/workloads", 200, list).await;
+    // The first entry's name is no DNS label, so it is never read.
+    mount_replicas(&server, "logs", json!("daemon"), json!([])).await;
 
     let mut project = project_body();
     project["name"] = json!("sh\u{1b}op");
@@ -1395,7 +1576,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
     )
     .await;
 
-    let show = with_target(&["app", "show", "web", "--show-env"], &[]);
+    let show = with_target(&["app", "show", "web"], &[]);
     let deploy = with_target(&["deploy", "spec", "spec.json"], &[]);
     for args in [
         &show[..],
@@ -1429,7 +1610,9 @@ async fn text_output_escapes_control_characters_from_the_api() {
 
     let (out, _) = run_fx(&server, &["app", "ls"]).await.ok();
     assert!(
-        out.contains("d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1 (spread)  environment  db\\x1bc\n"),
+        out.contains(
+            "d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1 (spread)  -          environment  db\\x1bc\n"
+        ),
         "{out}"
     );
 

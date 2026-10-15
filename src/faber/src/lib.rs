@@ -174,16 +174,12 @@ pub enum AppCommand {
         #[arg(long = "env", value_name = "ENV")]
         environment: Option<String>,
     },
-    /// Show one workload.
+    /// Show one workload, with env values and the status of each replica.
     Show {
         #[arg(value_name = "WORKLOAD")]
         workload: String,
         #[command(flatten)]
         target: Target,
-        /// Show the values of env variables instead of ***. JSON output
-        /// (-o json) is never masked: it always carries the values.
-        #[arg(long)]
-        show_env: bool,
     },
     /// Remove workloads, one after the other, stopping at the first failure.
     Rm {
@@ -212,6 +208,13 @@ pub enum MeshCommand {
         /// d. The server default is 1h and the maximum 7d.
         #[arg(long, value_name = "DURATION", value_parser = parse_ttl)]
         ttl: Option<u64>,
+    },
+    /// Show or set how often nodes report the status of their replicas.
+    StatusInterval {
+        /// Set the interval: seconds, or a number with s or m. The server
+        /// accepts 1s to 300s.
+        #[arg(long, value_name = "DURATION", value_parser = parse_interval)]
+        set: Option<u64>,
     },
     /// Show or set the node lease duration.
     ///
@@ -252,6 +255,33 @@ fn parse_ttl(s: &str) -> Result<u64, String> {
     Ok(secs)
 }
 
+/// `90` or `90s` or `2m`, as seconds, from 1 s to 300 s.
+fn parse_interval(s: &str) -> Result<u64, String> {
+    if s.ends_with(['h', 'd']) {
+        return Err("use seconds, or a number with s or m".into());
+    }
+    let secs = parse_ttl(s)?;
+    if !(1..=300).contains(&secs) {
+        return Err("the interval must be from 1s to 300s".into());
+    }
+    Ok(secs)
+}
+
+/// Where the cluster key lives when neither the flag nor the variable says.
+const DEFAULT_KEY_FILE: &str = "/var/lib/faber/cluster.key";
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum KeyCommand {
+    /// Print the cluster key (base64) from its file on this node. The key
+    /// seals env values; keep it secret. Reads the file directly, so run it
+    /// as root or as the faber user.
+    Export {
+        /// The key file. Defaults to /var/lib/faber/cluster.key.
+        #[arg(long, value_name = "PATH", env = "FABER_CLUSTER_KEY_FILE")]
+        file: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ClusterCommand {
     /// Show this node's role, the leader and replication progress of each member.
@@ -264,6 +294,9 @@ pub enum ClusterCommand {
         #[arg(value_name = "PEER")]
         peer: SocketAddr,
     },
+    /// Work with the cluster key.
+    #[command(subcommand)]
+    Key(KeyCommand),
 }
 
 /// Executes a parsed command, writing its result to `out` and any extra
@@ -289,6 +322,16 @@ pub async fn run_with_inputs(
     mut inputs: deploy::Inputs,
 ) -> anyhow::Result<()> {
     let format = cli.output;
+    // No request: the key is read from its file.
+    if let Command::Cluster(ClusterCommand::Key(KeyCommand::Export { file })) = &cli.command {
+        let path = file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY_FILE));
+        let key = read_key(&path).await?;
+        out.write_all(output::cluster_key(format, &key)?.as_bytes())?;
+        out.flush()?;
+        return Ok(());
+    }
     let client = FaberClient::new(&cli.endpoint)
         .with_context(|| format!("invalid endpoint {}", cli.endpoint))?;
     let endpoint = client.base().to_string();
@@ -301,6 +344,7 @@ pub async fn run_with_inputs(
                 ClusterCommand::Status => client.cluster_status().await,
                 ClusterCommand::Init => client.cluster_init().await,
                 ClusterCommand::Join { peer } => client.cluster_join(&peer.to_string()).await,
+                ClusterCommand::Key(_) => unreachable!("handled before the client"),
             }
             .map_err(api)?;
             output::status(format, &status)?
@@ -328,6 +372,14 @@ pub async fn run_with_inputs(
             }
             .map_err(api)?;
             output::lease(format, &lease)?
+        }
+        Command::Mesh(MeshCommand::StatusInterval { set }) => {
+            let interval = match set {
+                Some(secs) => client.mesh_set_status_interval(secs).await,
+                None => client.mesh_status_interval().await,
+            }
+            .map_err(api)?;
+            output::status_interval(format, &interval)?
         }
         Command::Project(cmd) => match cmd {
             ProjectCommand::Create { name, environments } => {
@@ -423,20 +475,37 @@ pub async fn run_with_inputs(
                 project,
                 environment,
             };
-            output::workloads(
-                format,
-                &client.workload_list(&query, true).await.map_err(api)?,
-            )?
+            let list = client.workload_list(&query, false).await.map_err(api)?;
+            // The list carries no replica status, so text mode reads each
+            // workload for its AVAILABLE column. JSON is the list as it came.
+            let mut available = Vec::new();
+            if format == OutputFormat::Text {
+                for w in &list.workloads {
+                    let found = client
+                        .workload_get(&w.project, &w.environment, &w.name, false)
+                        .await;
+                    available.push(match found {
+                        Ok(found) => Some(output::availability(&found)),
+                        // Gone since the list, or a name the client refuses
+                        // to put in a URL: no count to show.
+                        Err(ClientError::Invalid(_)) => None,
+                        Err(ClientError::Api { body, .. })
+                            if body.error == faber_api_types::error_code::NOT_FOUND =>
+                        {
+                            None
+                        }
+                        Err(e) => return Err(api(e)),
+                    });
+                }
+            }
+            output::workloads(format, &list, &available)?
         }
-        Command::App(AppCommand::Show {
-            workload,
-            target,
-            show_env,
-        }) => {
+        Command::App(AppCommand::Show { workload, target }) => {
+            // Env values are always shown, so they are always asked for.
             let found = client
                 .workload_get(&target.project, &target.environment, &workload, true)
                 .await;
-            output::workload(format, &found.map_err(api)?, show_env)?
+            output::workload(format, &found.map_err(api)?)?
         }
         Command::App(AppCommand::Rm { workloads, target }) => {
             let (project, environment) = (&target.project, &target.environment);
@@ -466,6 +535,22 @@ pub async fn run_with_inputs(
     out.write_all(rendered.as_bytes())?;
     out.flush()?;
     Ok(())
+}
+
+/// The key in `path`, without its surrounding whitespace. No error here
+/// carries any of the file's content.
+async fn read_key(path: &std::path::Path) -> anyhow::Result<String> {
+    let shown = output::esc(&path.display().to_string());
+    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+        anyhow!(
+            "cannot read the cluster key file {shown}: {e} (run as root or faber, or pass --file)"
+        )
+    })?;
+    let key = text.trim();
+    if key.is_empty() {
+        bail!("the cluster key file {shown} is empty");
+    }
+    Ok(key.to_string())
 }
 
 /// Turns a client error into a message a person can act on.

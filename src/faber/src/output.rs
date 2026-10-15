@@ -10,7 +10,10 @@ use faber_api_types::workload::{
     ProjectListResponse, ProjectResponse, Protocol, Resources, RestartPolicy, Scale, Strategy,
     VolumeSource, WorkloadListResponse, WorkloadResponse, WorkloadSpec,
 };
-use faber_api_types::{ClusterStatus, HealthResponse, InviteResponse, LeaseResponse};
+use faber_api_types::workload::{ReplicaState, ReplicaStatus};
+use faber_api_types::{
+    ClusterStatus, HealthResponse, InviteResponse, LeaseResponse, StatusIntervalResponse,
+};
 use serde::Serialize;
 
 use crate::deploy::Diagnostic;
@@ -270,6 +273,32 @@ pub fn lease(format: OutputFormat, l: &LeaseResponse) -> Result<String> {
     }
 }
 
+/// `mesh status-interval` with and without `--set`. The JSON key says what the
+/// number is, unlike the wire DTO's `interval_secs`.
+pub fn status_interval(format: OutputFormat, i: &StatusIntervalResponse) -> Result<String> {
+    match format {
+        OutputFormat::Json => pretty(&serde_json::json!({"status_interval_secs": i.interval_secs})),
+        OutputFormat::Text => {
+            let shown = duration(i.interval_secs);
+            let value = if shown == format!("{}s", i.interval_secs) {
+                shown
+            } else {
+                format!("{shown} ({}s)", i.interval_secs)
+            };
+            Ok(aligned(&[("status_interval", value)]))
+        }
+    }
+}
+
+/// `cluster key export`: the key alone in text, so `$(faber cluster key
+/// export)` captures it.
+pub fn cluster_key(format: OutputFormat, key: &str) -> Result<String> {
+    match format {
+        OutputFormat::Json => pretty(&serde_json::json!({"cluster_key": key})),
+        OutputFormat::Text => Ok(format!("{key}\n")),
+    }
+}
+
 /// Names from the API separated by commas, or `-` for none.
 fn names<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
     let all: Vec<String> = names.into_iter().map(|n| esc(n)).collect();
@@ -369,23 +398,89 @@ fn exposure(expose: Exposure) -> &'static str {
     }
 }
 
-pub fn workloads(format: OutputFormat, list: &WorkloadListResponse) -> Result<String> {
+/// How many replicas are available and how many are wanted: the replica
+/// count, or for a daemon the nodes that hold a replica.
+pub fn availability(w: &WorkloadResponse) -> (usize, usize) {
+    let available = w
+        .replicas
+        .iter()
+        .filter(|r| r.state == ReplicaState::Available)
+        .count();
+    let desired = match w.spec.scale {
+        Scale::Replicas { count, .. } => count as usize,
+        Scale::Daemon => {
+            let mut nodes: Vec<u64> = w.replicas.iter().map(|r| r.node).collect();
+            nodes.sort_unstable();
+            nodes.dedup();
+            nodes.len()
+        }
+    };
+    (available, desired)
+}
+
+/// `app ls`. `available` holds [`availability`] for each listed workload in
+/// order, `None` when it could not be read; text mode shows `-` for a missing
+/// entry.
+pub fn workloads(
+    format: OutputFormat,
+    list: &WorkloadListResponse,
+    available: &[Option<(usize, usize)>],
+) -> Result<String> {
     if format == OutputFormat::Json {
         return pretty(list);
     }
-    let header = ["NAME", "PROJECT", "ENVIRONMENT", "SCALE", "EXPOSE", "FQDN"].map(String::from);
-    let workloads = list.workloads.iter().map(|w| {
+    let header = [
+        "NAME",
+        "PROJECT",
+        "ENVIRONMENT",
+        "SCALE",
+        "AVAILABLE",
+        "EXPOSE",
+        "FQDN",
+    ]
+    .map(String::from);
+    let workloads = list.workloads.iter().enumerate().map(|(i, w)| {
+        let available = available
+            .get(i)
+            .copied()
+            .flatten()
+            .map_or_else(none, |(up, want)| format!("{up}/{want}"));
         [
             esc(&w.name),
             esc(&w.project),
             esc(&w.environment),
             scale(w.scale),
+            available,
             exposure(w.expose).to_string(),
             esc(&w.fqdn),
         ]
     });
-    let all: Vec<[String; 6]> = std::iter::once(header).chain(workloads).collect();
+    let all: Vec<[String; 7]> = std::iter::once(header).chain(workloads).collect();
     Ok(table("", &all))
+}
+
+/// The `replicas:` block of `app show`.
+fn replicas(replicas: &[ReplicaStatus]) -> String {
+    if replicas.is_empty() {
+        return "replicas: -\n".to_string();
+    }
+    let header = ["REPLICA", "NODE", "REVISION", "STATE", "POD IP"].map(String::from);
+    let rows = replicas.iter().map(|r| {
+        let state = match r.state {
+            ReplicaState::Deploying => "deploying",
+            ReplicaState::Available => "available",
+            ReplicaState::Unavailable => "unavailable",
+        };
+        [
+            r.replica_index.to_string(),
+            r.node.to_string(),
+            r.revision.to_string(),
+            state.to_string(),
+            r.pod_ip.map_or_else(none, |ip| ip.to_string()),
+        ]
+    });
+    let all: Vec<[String; 5]> = std::iter::once(header).chain(rows).collect();
+    format!("replicas:\n{}", table("  ", &all))
 }
 
 /// `key: value` lines under `indent` for keys with any number of values:
@@ -516,18 +611,11 @@ fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.to_string()
 }
 
-fn container(c: &ContainerSpec, spec: &WorkloadSpec, show_env: bool) -> String {
+fn container(c: &ContainerSpec, spec: &WorkloadSpec) -> String {
     let env = c
         .env
         .iter()
-        .map(|(name, value)| {
-            let value = if show_env {
-                esc(value)
-            } else {
-                MASK.to_string()
-            };
-            format!("{}={value}", esc(name))
-        })
+        .map(|(name, value)| format!("{}={}", esc(name), esc(value)))
         .collect();
     let mut s = format!("  {}:\n", esc(&c.name));
     s.push_str(&fields(
@@ -553,12 +641,8 @@ fn container(c: &ContainerSpec, spec: &WorkloadSpec, show_env: bool) -> String {
     s
 }
 
-/// Shown in place of an env value.
-const MASK: &str = "***";
-
-/// `app show`. Text shows env values as `***` unless `show_env` is set;
-/// JSON is the response as it came, with the values.
-pub fn workload(format: OutputFormat, w: &WorkloadResponse, show_env: bool) -> Result<String> {
+/// `app show`. Text shows the env values; JSON is the response as it came.
+pub fn workload(format: OutputFormat, w: &WorkloadResponse) -> Result<String> {
     if format == OutputFormat::Json {
         return pretty(w);
     }
@@ -585,6 +669,7 @@ pub fn workload(format: OutputFormat, w: &WorkloadResponse, show_env: bool) -> R
                 .map_or_else(|| "(runner default)".to_string(), |secs| format!("{secs}s")),
         ),
     ]);
+    s.push_str(&replicas(&w.replicas));
     // Every volume, mounted or not: an unmounted one is still created.
     if spec.volumes.is_empty() {
         s.push_str("volumes: -\n");
@@ -600,7 +685,7 @@ pub fn workload(format: OutputFormat, w: &WorkloadResponse, show_env: bool) -> R
     }
     s.push_str("containers:\n");
     for c in &spec.containers {
-        s.push_str(&container(c, spec, show_env));
+        s.push_str(&container(c, spec));
     }
     Ok(s)
 }

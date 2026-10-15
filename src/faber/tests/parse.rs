@@ -441,8 +441,8 @@ fn app_subcommands_parse() {
             environment: Some("staging".into()),
         })
     );
-    for show_env in [false, true] {
-        let mut args = vec![
+    assert_eq!(
+        parse(&[
             "app",
             "show",
             "web",
@@ -450,19 +450,13 @@ fn app_subcommands_parse() {
             "shop",
             "--env",
             "staging",
-        ];
-        if show_env {
-            args.push("--show-env");
-        }
-        assert_eq!(
-            parse(&args).command,
-            Command::App(AppCommand::Show {
-                workload: "web".into(),
-                target: target("shop", "staging"),
-                show_env,
-            })
-        );
-    }
+        ])
+        .command,
+        Command::App(AppCommand::Show {
+            workload: "web".into(),
+            target: target("shop", "staging"),
+        })
+    );
     assert_eq!(
         parse(&[
             "app",
@@ -514,8 +508,10 @@ fn app_show_and_rm_require_a_workload_project_and_env() {
     parse_err(&[&["app", "show"][..], &both].concat());
     parse_err(&[&["app", "rm"][..], &both].concat());
     parse_err(&[&["app", "show", "web", "db"][..], &both].concat());
-    // --show-env belongs to show.
-    parse_err(&[&["app", "rm", "web", "--show-env"][..], &both].concat());
+    // Values are always shown: there is no flag for it.
+    for sub in ["show", "rm"] {
+        parse_err(&[&["app", sub, "web", "--show-env"][..], &both].concat());
+    }
     for sub in ["show", "rm"] {
         let message = parse_err(&["app", sub, "web", "--project", "shop"]);
         assert!(message.contains("--env <ENV>"), "{sub}: {message}");
@@ -611,16 +607,64 @@ fn short_e_is_still_the_endpoint_on_the_new_commands() {
 }
 
 #[test]
-fn show_env_help_says_json_is_not_masked() {
-    let mut cmd = Cli::command();
-    let show = cmd
-        .find_subcommand_mut("app")
-        .and_then(|app| app.find_subcommand_mut("show"))
-        .expect("app show subcommand");
-    let help = show.render_long_help().to_string();
-    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        help.contains("JSON output (-o json) is never masked"),
-        "{help}"
+fn cluster_key_export_parses() {
+    use faber::KeyCommand;
+    assert_eq!(
+        parse(&["cluster", "key", "export"]).command,
+        Command::Cluster(ClusterCommand::Key(KeyCommand::Export { file: None }))
     );
+    assert_eq!(
+        parse(&["cluster", "key", "export", "--file", "/tmp/k"]).command,
+        Command::Cluster(ClusterCommand::Key(KeyCommand::Export {
+            file: Some(PathBuf::from("/tmp/k")),
+        }))
+    );
+    parse_err(&["cluster", "key"]);
+    parse_err(&["cluster", "key", "export", "--file"]);
+    parse_err(&["cluster", "key", "export", "extra"]);
+}
+
+#[test]
+fn cluster_key_export_file_reads_the_key_file_env() {
+    let cmd = Cli::command();
+    let export = cmd
+        .find_subcommand("cluster")
+        .and_then(|c| c.find_subcommand("key"))
+        .and_then(|c| c.find_subcommand("export"))
+        .expect("cluster key export subcommand");
+    let file = export
+        .get_arguments()
+        .find(|a| a.get_id() == "file")
+        .expect("file arg");
+    assert_eq!(
+        file.get_env(),
+        Some(std::ffi::OsStr::new("FABER_CLUSTER_KEY_FILE"))
+    );
+}
+
+#[test]
+fn mesh_status_interval_parses() {
+    use faber::MeshCommand;
+    assert_eq!(
+        parse(&["mesh", "status-interval"]).command,
+        Command::Mesh(MeshCommand::StatusInterval { set: None })
+    );
+    for (duration, secs) in [("1", 1), ("5s", 5), ("90", 90), ("2m", 120), ("5m", 300)] {
+        assert_eq!(
+            parse(&["mesh", "status-interval", "--set", duration]).command,
+            Command::Mesh(MeshCommand::StatusInterval { set: Some(secs) }),
+            "duration {duration}"
+        );
+    }
+}
+
+#[test]
+fn mesh_status_interval_requires_one_to_three_hundred_seconds() {
+    parse_err(&["mesh", "status-interval", "--set"]);
+    parse_err(&["mesh", "status-interval", "5"]);
+    for bad in [
+        "", "0", "0s", "301", "6m", "1h", "1d", "1w", "m", "-1", "1.5s",
+    ] {
+        parse_err(&["mesh", "status-interval", "--set", bad]);
+    }
 }
