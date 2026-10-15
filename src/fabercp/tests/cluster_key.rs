@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use common::TestNode;
 
 fn founder_key(c: &mut fabercp::Config) {
-    c.cluster_key_file = Some(c.state_dir.join("founder.key"));
+    c.cluster_key_file = Some(c.data_dir.join("founder.key"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

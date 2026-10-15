@@ -2581,6 +2581,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leader_records_the_key_id_that_a_crash_before_init_finished_left_out() {
+        // Raft is initialised, as when init stopped before it proposed the
+        // id; nothing proposes it but the leader's own start-up check.
+        let node = TestNode::start().await;
+        assert_eq!(node.state().cluster_key_id().unwrap(), None);
+        let members = BTreeMap::from([(1, Node::new(node.peer_addr.to_string()))]);
+        node.service.raft().initialize(members).await.unwrap();
+
+        let want = faber_crypto::key_id(&crate::testing::test_cluster_key());
+        let mut recorded = None;
+        for _ in 0..200 {
+            recorded = node.state().cluster_key_id().unwrap();
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(recorded.map(|r| r.key_id), Some(want));
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_join_token_never_holds_the_cluster_key() {
         let node = TestNode::start_initialized().await;
         seed_mesh(&node).await;

@@ -483,6 +483,6 @@ mod tests {
         );
         let shown = format!("{ck:?} {:?}", DataKey::generate().unwrap());
         assert!(shown.contains("redacted"));
-        assert!(!shown.contains(&text));
+        assert!(!shown.contains(text));
     }
 }

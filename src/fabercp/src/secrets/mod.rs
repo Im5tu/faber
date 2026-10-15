@@ -147,7 +147,7 @@ impl ClusterKeyProvider for FileClusterKey {
         let text = Zeroizing::new(format!(
             "{}
 ",
-            &*key.to_base64()
+            *key.to_base64()
         ));
         write_atomic(dir, name, text.as_bytes(), Some(0o600)).map_err(|_| unwritable())
     }

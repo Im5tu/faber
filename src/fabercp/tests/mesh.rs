@@ -1083,7 +1083,7 @@ async fn node_joins_from_token_and_invites_are_single_use_and_expire() {
     let again = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance2);
     assert_eq!(
         post_code(&register_url, &again).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
     let again = join_body(2, n2_addr, &token.invite_id, &instance2);
     assert_eq!(
@@ -1240,7 +1240,7 @@ async fn follower_invites_are_forwarded_and_restart_does_not_rejoin() {
     let body = register_body(&token.invite_id, 3, &token.endpoint, &other_machine());
     assert_eq!(
         post_code(&register_url, &body).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
     let mesh = n1.handle().state().mesh().unwrap().unwrap();
     assert_eq!(
@@ -1351,7 +1351,7 @@ async fn a_joiner_registers_again_after_a_lost_answer() {
     let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
     assert_eq!(
         post_code(&register_url, &body).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
 
     n2.launch(Bootstrap::Token(invite.token.clone()), None)
@@ -1393,7 +1393,7 @@ async fn a_joiner_restarted_between_register_and_join_resumes() {
     let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
     assert_eq!(
         post_code(&register_url, &body).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
     identity::mark_registered(&n2.state_dir(), &mut made).unwrap();
     assert_eq!(n1.voters(), [1]);
@@ -1922,7 +1922,7 @@ async fn a_stopped_node_is_removed_when_its_lease_runs_out() {
     );
     assert_eq!(
         post_code(&register_url, &body).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
     assert_eq!(
         n1.mesh().nodes[&invite.node_id].container_subnet,
@@ -2426,7 +2426,7 @@ async fn a_joiner_removed_before_it_joined_gives_up_its_identity() {
     let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
     assert_eq!(
         post_code(&register_url, &body).await,
-        (StatusCode::NO_CONTENT, None)
+        (StatusCode::OK, None)
     );
     identity::mark_registered(&n2.state_dir(), &mut made).unwrap();
     assert!(n1.mesh().nodes.contains_key(&2));

@@ -550,6 +550,7 @@ pub async fn start_with(
             ),
         }
     });
+    tasks.push(service.spawn_key_id_healer(cancel.child_token()));
     let left_mesh = Arc::new(OnceLock::new());
     if let Some(identity) = identity {
         // Every mesh node runs the leader's side of the leases; it acts only

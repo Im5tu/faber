@@ -211,4 +211,63 @@ impl FaberService {
         tracing::info!(key_id = %got, "stored the cluster key sent by the cluster");
         Ok(())
     }
+
+    /// Records the id of this node's cluster key in raft when raft has none.
+    /// Nothing happens when raft has an id, or this node has no usable key
+    /// file. For the leader only.
+    pub(crate) async fn record_missing_key_id(&self) -> ServiceResult<()> {
+        if self.recorded_key_id()?.is_some() {
+            return Ok(());
+        }
+        let provider = self.cluster_keys().clone();
+        let read = tokio::task::spawn_blocking(move || provider.cluster_key())
+            .await
+            .map_err(|e| ServiceError::Internal(format!("reading the cluster key: {e}")))?;
+        let Ok(key) = read else {
+            return Ok(());
+        };
+        let record = SetClusterKeyId {
+            key_id: key_id(&key),
+        };
+        self.propose(Request::SetClusterKeyId(record))
+            .await
+            .map(drop)
+    }
+
+    /// Starts a task that, while this node leads an initialised cluster
+    /// whose raft holds no cluster key id, records the id of the local key
+    /// file. A crash between `cluster init` and the write of the id heals
+    /// itself this way, at start-up and after every election.
+    pub(crate) fn spawn_key_id_healer(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let mut metrics = svc.raft().metrics();
+            let mut done = false;
+            loop {
+                let leads = {
+                    let m = metrics.borrow_and_update();
+                    m.current_leader == Some(svc.node_id())
+                        && m.membership_config.membership().nodes().next().is_some()
+                };
+                if !leads {
+                    done = false;
+                } else if !done {
+                    match svc.record_missing_key_id().await {
+                        Ok(()) => done = true,
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not record the cluster key id; will retry"
+                        ),
+                    }
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    changed = metrics.changed() => if changed.is_err() { return },
+                }
+            }
+        })
+    }
 }
