@@ -4401,14 +4401,6 @@ removed_node() {
   [ "$status" -eq 1 ]
 }
 
-@test "real run: a custom socket reaches both env files and its directory is made" {
-  setup_full_run systemd
-  FABER_NODE_SOCKET="$TMP/srv/faber/node.sock" install_run
-  [ "$status" -eq 0 ]
-  grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/fabercp.env"
-  grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/faber-node.env"
-  [ "$(stat -c '%U:%G %a' "$TMP/srv/faber")" = "root:root 755" ]
-}
 
 @test "real run: a changed faber-node binary or env restarts only faber-node, a re-run restarts nothing" {
   setup_full_run systemd
@@ -4580,4 +4572,149 @@ removed_node() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"WARN"*"'bob' has ids 1048576-1114111"* ]]
   [[ "$output" == *"cluster: created"* ]]
+}
+
+# --- review fixes: hardening, paths, ids ----------------------------------
+
+@test "real run: a custom socket reaches both env files, and the unit makes its directory at start" {
+  setup_full_run systemd
+  local dir="/srv/faber-bats-$$"
+  FABER_NODE_SOCKET="$dir/node.sock" install_run
+  rm -rf "$dir"
+  [ "$status" -eq 0 ]
+  grep -qxF "FABER_NODE_SOCKET=$dir/node.sock" "$FABER_ETC/fabercp.env"
+  grep -qxF "FABER_NODE_SOCKET=$dir/node.sock" "$FABER_ETC/faber-node.env"
+  grep -qxF "ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 $dir" "$SYSTEMD_UNIT_DIR/faber-node.service"
+}
+
+@test "render_faber_node_unit: hardening without a mount namespace, caps with reasons" {
+  run render_faber_node_unit
+  local line
+  for line in 'NoNewPrivileges=yes' 'LockPersonality=yes' 'RestrictRealtime=yes' \
+    'SystemCallArchitectures=native' 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
+    'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE'; do
+    grep -qxF -- "$line" <<<"$output"
+  done
+  run grep -E '^(CAP_MKNOD|CapabilityBoundingSet=.*MKNOD|Protect|Private|Inaccessible)' <<<"$output"
+  [ "$status" -eq 1 ]
+}
+
+@test "render_faber_node_unit: a custom socket directory is created by ExecStartPre" {
+  FABER_NODE_SOCKET=/srv/faber/node.sock run render_faber_node_unit
+  grep -qxF 'ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /srv/faber' <<<"$output"
+  run render_faber_node_unit
+  [[ "$output" != *"ExecStartPre"* ]]
+}
+
+@test "check_node_paths: plain absolute paths only" {
+  local bad
+  for bad in 'rel/dir' '/opt/a b' '/opt/a;b' '/opt/../etc' '/opt//x' '/opt/$x' ''; do
+    FABER_NODE_INSTALL_DIR="$bad" run check_node_paths
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"FABER_NODE_INSTALL_DIR must be an absolute path"* ]]
+  done
+  FABER_NODE_SOCKET='/srv/a b/node.sock' run check_node_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FABER_NODE_SOCKET must be an absolute path"* ]]
+  run check_node_paths
+  [ "$status" -eq 0 ]
+}
+
+@test "check_node_paths: an install dir under a directory others can write is refused" {
+  need_root_faber_account
+  mkdir -p "$TMP/loose/sbin"
+  chmod 0777 "$TMP/loose"
+  FABER_NODE_INSTALL_DIR="$TMP/loose/sbin" run check_node_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$TMP/loose must be owned by root and not group/world-writable"* ]]
+  chmod 0755 "$TMP/loose"
+  chown 1234 "$TMP/loose"
+  FABER_NODE_INSTALL_DIR="$TMP/loose/sbin" run check_node_paths
+  [ "$status" -eq 1 ]
+  chown 0 "$TMP/loose"
+  FABER_NODE_INSTALL_DIR="$TMP/loose/sbin" run check_node_paths
+  [ "$status" -eq 0 ]
+}
+
+@test "check_node_paths: a custom socket needs a directory of its own, not /tmp" {
+  local sock
+  for sock in /run/node.sock /var/run/node.sock /tmp/node.sock /node.sock; do
+    FABER_NODE_SOCKET="$sock" run check_node_paths
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"shared directory"* ]]
+  done
+  for sock in /tmp/faber/node.sock /var/tmp/faber/node.sock; do
+    FABER_NODE_SOCKET="$sock" run check_node_paths
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"must not be under /tmp"* ]]
+  done
+  FABER_NODE_SOCKET=/run/faber2/node.sock run check_node_paths
+  [ "$status" -eq 0 ]
+}
+
+@test "check_node_paths: an existing socket directory must be root's alone" {
+  need_root_faber_account
+  local dir="/srv/faber-bats-dir-$$"
+  mkdir -p "$dir"
+  chown 1234 "$dir"
+  FABER_NODE_SOCKET="$dir/node.sock" run check_node_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$dir must be owned by root"* ]]
+  chown 0 "$dir"
+  chmod 0777 "$dir"
+  FABER_NODE_SOCKET="$dir/node.sock" run check_node_paths
+  [ "$status" -eq 1 ]
+  chmod 0755 "$dir"
+  FABER_NODE_SOCKET="$dir/node.sock" run check_node_paths
+  rm -rf "$dir"
+  [ "$status" -eq 0 ]
+}
+
+@test "dry-run: a bad FABER_NODE_SOCKET dies before any package command" {
+  make_stub_path
+  FABER_NODE_SOCKET=/tmp/faber/node.sock install_run --dry-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FABER_NODE_SOCKET must not be under /tmp"* ]]
+  [[ "$output" != *"apt-get"* ]]
+}
+
+@test "check_containerd_version: a containerd whose version cannot be read dies on a real run" {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\necho "containerd garbage"\n' > "$TMP/bin/containerd"
+  chmod +x "$TMP/bin/containerd"
+  PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot read the version of the installed containerd"* ]]
+  DRY_RUN=1 PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 0 ]
+}
+
+@test "warn_uid_range_overlaps: an entry with a count of 0 is empty and does not warn" {
+  mkdir -p "$TMP/etc"
+  printf 'zed:1048576:0\nyan:1500000:0\n' > "$SUBUID_FILE"
+  run warn_uid_range_overlaps
+  [ -z "$output" ]
+}
+
+@test "warn_uid_range_overlaps: the nspawn warning names --private-users=pick" {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/systemd-nspawn"
+  chmod +x "$TMP/bin/systemd-nspawn"
+  PATH="$TMP/bin:$PATH" run warn_uid_range_overlaps
+  [[ "$output" == *"--private-users=pick"* ]]
+}
+
+@test "check_faber_account: a faber uid or gid inside the pod range is refused" {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\ncase "$1" in -gn) echo faber ;; -u) echo 1048576 ;; -g) echo 989 ;; esac\nexit 0\n' > "$TMP/bin/id"
+  chmod +x "$TMP/bin/id"
+  PATH="$TMP/bin:$PATH" run check_faber_account
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"has id 1048576, inside the pod id range"* ]]
+  printf '#!/bin/sh\ncase "$1" in -gn) echo faber ;; -u) echo 990 ;; -g) echo 2147483647 ;; esac\nexit 0\n' > "$TMP/bin/id"
+  PATH="$TMP/bin:$PATH" run check_faber_account
+  [ "$status" -eq 1 ]
+  printf '#!/bin/sh\ncase "$1" in -gn) echo faber ;; -u) echo 990 ;; -g) echo 2147483648 ;; esac\nexit 0\n' > "$TMP/bin/id"
+  PATH="$TMP/bin:$PATH" run check_faber_account
+  [ "$status" -eq 0 ]
 }

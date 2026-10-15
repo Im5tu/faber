@@ -1653,9 +1653,23 @@ StateDirectoryMode=0755
 EOF
   if [[ "$FABER_NODE_SOCKET" == "$DEFAULT_NODE_SOCKET" ]]; then
     printf 'RuntimeDirectory=faber\nRuntimeDirectoryMode=0755\n'
+  else
+    # /run is tmpfs: make the directory again at every start.
+    printf 'ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 %s\n' "$(dirname "$FABER_NODE_SOCKET")"
   fi
   cat <<EOF
+# Hardening that needs no mount namespace. No inet sockets: it talks to
+# containerd over a unix socket and to fabercp over its own.
+# Capabilities, from what faber-node does: mount, umount and loop setup
+# (CAP_SYS_ADMIN); chown and chmod of volumes (CAP_CHOWN, CAP_FOWNER); reading
+# and writing root-owned or other users' files (CAP_DAC_OVERRIDE). No
+# CAP_MKNOD: it never creates device nodes.
 NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
 
 [Install]
 WantedBy=multi-user.target
@@ -1703,9 +1717,6 @@ configure_faber_etc() {
   resolve_faber_ids
   write_file "$(node_env_file)" "$(render_node_env)" root root 0640
   NODE_ENV_CHANGED="$FILE_CHANGED"
-  if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
-    run_cmd install -d -o root -g root -m 0755 "$(dirname "$FABER_NODE_SOCKET")"
-  fi
   TOKEN_CHANGED=0
   if [[ "$MODE" == join ]]; then
     if [[ "$JOIN_REQUESTED" == 1 ]]; then
@@ -2168,11 +2179,65 @@ check_faber_home() { check_real_dir "$FABER_HOME"; }
 
 # check_faber_account: an existing faber user must have primary group faber.
 check_faber_account() {
-  local group
+  local group id
   id -u "$FABER_USER" >/dev/null 2>&1 || return 0
   group="$(id -gn "$FABER_USER" 2>/dev/null || true)"
   if [[ "$group" != "$FABER_USER" ]]; then
     die "user $FABER_USER exists but its primary group is '${group:-unknown}', expected '$FABER_USER'; fix the account (e.g. usermod -g $FABER_USER $FABER_USER) and re-run"
+  fi
+  for id in "$(id -u "$FABER_USER" 2>/dev/null || true)" "$(id -g "$FABER_USER" 2>/dev/null || true)"; do
+    if [[ "$id" =~ ^[0-9]+$ ]] && ((10#$id >= NODE_UID_MIN && 10#$id < NODE_UID_MAX)); then
+      die "user $FABER_USER has id $id, inside the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); faber-node would refuse to start. Recreate the account with a system id"
+    fi
+  done
+}
+
+# check_root_only_path PATH NAME: PATH, as far as it exists, and every ancestor
+# must belong to root and not be writable by group or others (a sticky
+# directory such as /tmp is let through: others cannot replace root's entries
+# in it). Only checked as root; a non-root dry-run cannot tell.
+check_root_only_path() {
+  local dir="$1" name="$2" uid mode
+  [[ "$EUID" == 0 ]] || return 0
+  while [[ -n "$dir" && "$dir" != / ]]; do
+    if [[ -e "$dir" || -L "$dir" ]]; then
+      read -r uid mode < <(stat -L -c '%u %a' "$dir")
+      if [[ "$uid" != 0 ]] || { (((8#$mode & 8#022) != 0)) && (((8#$mode & 8#1000) == 0)); }; then
+        die "$name: $dir must be owned by root and not group/world-writable (faber-node runs as root from there)"
+      fi
+    fi
+    dir="$(dirname "$dir")"
+  done
+}
+
+# check_node_paths: FABER_NODE_INSTALL_DIR and FABER_NODE_SOCKET go into unit
+# files, so they are plain absolute paths. The install dir and its ancestors
+# are root's alone. A custom socket directory must not be a shared directory
+# or live in /tmp (a private /tmp is not the one the faber user sees), and an
+# existing one must be root's alone.
+check_node_paths() {
+  local path name sock_dir
+  for name in FABER_NODE_INSTALL_DIR FABER_NODE_SOCKET; do
+    path="${!name}"
+    if [[ ! "$path" =~ ^/[A-Za-z0-9._/-]+$ || "/$path/" == *"/../"* || "$path" == *//* ]]; then
+      die "$name must be an absolute path of letters, digits, '.', '_', '-' and '/' without '..' (got '$path')"
+    fi
+  done
+  check_root_only_path "$FABER_NODE_INSTALL_DIR" FABER_NODE_INSTALL_DIR
+  [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]] || return 0
+  sock_dir="$(dirname "$FABER_NODE_SOCKET")"
+  case "$sock_dir" in
+    / | /run | /var/run | /tmp | /var/tmp | /dev/shm | /var | /etc | /usr | /var/lib)
+      die "FABER_NODE_SOCKET: $sock_dir is a shared directory; use a directory of its own, for example /run/faber"
+      ;;
+  esac
+  case "$FABER_NODE_SOCKET" in
+    /tmp/* | /var/tmp/* | /dev/shm/*)
+      die "FABER_NODE_SOCKET must not be under /tmp, /var/tmp or /dev/shm"
+      ;;
+  esac
+  if [[ -e "$sock_dir" || -L "$sock_dir" ]]; then
+    check_root_only_path "$sock_dir" FABER_NODE_SOCKET
   fi
 }
 
@@ -2204,6 +2269,9 @@ check_kernel_version() {
 check_containerd_version() {
   local version major
   version="$(component_version containerd)"
+  if [[ "$version" == unknown && "$DRY_RUN" != 1 ]]; then
+    die "cannot read the version of the installed containerd ('containerd --version' printed nothing usable); faber needs containerd $MIN_CONTAINERD_MAJOR.0 or newer. Fix the install and re-run"
+  fi
   [[ "$version" =~ ^([0-9]+)\. ]] || return 0
   major=$((10#${BASH_REMATCH[1]}))
   if ((major >= MIN_CONTAINERD_MAJOR)); then
@@ -2229,6 +2297,7 @@ warn_uid_range_overlaps() {
       [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ ]] || continue
       start=$((10#$start))
       count=$((10#$count))
+      ((count > 0)) || continue
       if ((start < NODE_UID_MAX && start + count > NODE_UID_MIN)); then
         warn "$file: '$name' has ids $start-$((start + count - 1)), which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)) that faber maps pods into; narrow the entry"
       fi
@@ -2236,7 +2305,7 @@ warn_uid_range_overlaps() {
   done
   if have systemd-nspawn; then
     # systemd-nspawn -U picks from 524288-1879048191 (systemd UIDS-GIDS docs).
-    warn "systemd-nspawn is installed and picks container ids from 524288-1879048191, which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); do not run both on this node"
+    warn "systemd-nspawn is installed; with --private-users=pick it takes ids from 524288-1879048191, which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); do not use that on this node"
   fi
 }
 
@@ -2249,6 +2318,7 @@ preflight() {
   check_faber_account
   check_config_paths
   check_stage_parents
+  check_node_paths
   resolve_mode
   check_wg_interface
   resolve_endpoint
