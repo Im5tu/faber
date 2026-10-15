@@ -563,9 +563,6 @@ fn check_container(
         if !mount_paths.insert(mount.path.as_str()) {
             out.push(Violation::new(format!("{at}.path"), "duplicate mount path"));
         }
-        if let Some(sub_path) = &mount.sub_path {
-            check_sub_path(&format!("{at}.sub_path"), sub_path, out);
-        }
     }
     // A mount under another hides it or is hidden by it. Equal paths are
     // reported as duplicates above.
@@ -735,29 +732,6 @@ fn check_absolute_path(at: &str, path: &str, out: &mut Vec<Violation>) {
     check_path_bytes(at, path, out);
     if path.split('/').any(|part| part == "." || part == "..") {
         out.push(Violation::new(at, "must not contain . or .. components"));
-    }
-    if path.contains("//") {
-        out.push(Violation::new(at, "must not contain //"));
-    }
-    if path.len() > 1 && path.ends_with('/') {
-        out.push(Violation::new(at, "must not end with /"));
-    }
-}
-
-/// A directory inside a volume: relative, and never above the volume.
-fn check_sub_path(at: &str, path: &str, out: &mut Vec<Violation>) {
-    if path.is_empty() {
-        out.push(Violation::new(at, "must not be empty"));
-    }
-    if path.starts_with('/') {
-        out.push(Violation::new(at, "must be a relative path"));
-    }
-    check_path_bytes(at, path, out);
-    if path.split('/').any(|part| part == "..") {
-        out.push(Violation::new(at, "must not contain .. components"));
-    }
-    if path.split('/').any(|part| part == ".") {
-        out.push(Violation::new(at, "must not contain . components"));
     }
     if path.contains("//") {
         out.push(Violation::new(at, "must not contain //"));
@@ -1180,9 +1154,6 @@ pub struct MountSpec {
     pub path: String,
     #[serde(default)]
     pub read_only: bool,
-    /// Mount this directory of the volume instead of its root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub_path: Option<String>,
 }
 
 /// The most a container may use. They are maximums: the kernel limit of the
@@ -1522,7 +1493,6 @@ mod tests {
             volume: "data".into(),
             path: "/data".into(),
             read_only: true,
-            sub_path: Some("web".into()),
         }];
         web.resources = Resources {
             cpu_millis: 500,
@@ -1588,7 +1558,7 @@ mod tests {
                 "user": "101:101",
                 "ports": [{"name": "http", "port": 8080, "protocol": "tcp"}],
                 "mounts": [{
-                    "volume": "data", "path": "/data", "read_only": true, "sub_path": "web",
+                    "volume": "data", "path": "/data", "read_only": true,
                 }],
                 "resources": {"cpu_millis": 500, "memory_bytes": 268_435_456},
                 "capabilities": ["NET_BIND_SERVICE"],
@@ -1712,6 +1682,9 @@ mod tests {
             container_with(json!({"probe": {"action": {"type": "tcp", "port": 1}, "grpc": 1}})),
             container_with(json!({"probe": {"action": {"type": "tcp", "port": 1, "host": "x"}}})),
             container_with(json!({"resources": {"gpu": 1}})),
+            container_with(
+                json!({"mounts": [{"volume": "data", "path": "/data", "sub_path": "web"}]}),
+            ),
             json!({"containers": [container.clone()],
                    "scale": {"replicas": {"count": 1, "zone": "a"}}}),
         ] {
@@ -1891,7 +1864,6 @@ mod tests {
             volume: volume.to_string(),
             path: path.to_string(),
             read_only: false,
-            sub_path: None,
         }
     }
 
@@ -1995,7 +1967,7 @@ mod tests {
                 "user": "101:101",
                 "ports": [{"name": "http", "port": 8080}, {"port": 8080, "protocol": "udp"}],
                 "mounts": [
-                    {"volume": "data", "path": "/data", "sub_path": "web/a"},
+                    {"volume": "data", "path": "/data"},
                     {"volume": "tmp", "path": "/tmp", "read_only": true},
                 ],
                 "resources": {"cpu_millis": 500, "memory_bytes": 2097152},
@@ -2852,85 +2824,6 @@ mod tests {
                     "must not contain . or .. components",
                 )],
             ),
-            (
-                "sub path",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some("web/..cache/a".into());
-                },
-                &[],
-            ),
-            (
-                "absolute sub path",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some("/web".into());
-                },
-                &[(
-                    "containers[0].mounts[0].sub_path",
-                    "must be a relative path",
-                )],
-            ),
-            (
-                "sub path with a parent component",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some("web/../../etc".into());
-                },
-                &[(
-                    "containers[0].mounts[0].sub_path",
-                    "must not contain .. components",
-                )],
-            ),
-            (
-                "sub path that is a parent component",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some("..".into());
-                },
-                &[(
-                    "containers[0].mounts[0].sub_path",
-                    "must not contain .. components",
-                )],
-            ),
-            (
-                "empty sub path",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some(String::new());
-                },
-                &[("containers[0].mounts[0].sub_path", "must not be empty")],
-            ),
-            (
-                "sub path with a NUL",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path = Some("a\0".into());
-                },
-                &[(
-                    "containers[0].mounts[0].sub_path",
-                    "must not contain control characters",
-                )],
-            ),
-            (
-                "sub path too long",
-                |s| {
-                    s.volumes.insert("a".into(), ramdisk());
-                    s.containers[0].mounts = vec![mount("a", "/data")];
-                    s.containers[0].mounts[0].sub_path =
-                        Some("a".repeat(limits::MAX_PATH_BYTES + 1));
-                },
-                &[(
-                    "containers[0].mounts[0].sub_path",
-                    "must be at most 4096 bytes",
-                )],
-            ),
         ]);
     }
 
@@ -3165,7 +3058,6 @@ mod tests {
             c.working_dir = Some(format!("/srv/{hidden}"));
             c.user = Some(format!("www{hidden}"));
             c.mounts = vec![mount("data", &format!("/data{hidden}"))];
-            c.mounts[0].sub_path = Some(format!("a{hidden}"));
             c.probe = Some(Probe::new(ProbeAction::Http {
                 port: 80,
                 path: format!("/{hidden}"),
@@ -3187,7 +3079,6 @@ mod tests {
                         "must be a uid, uid:gid or a user name"
                     ),
                     ("containers[0].mounts[0].path", ASCII),
-                    ("containers[0].mounts[0].sub_path", ASCII),
                     ("containers[0].probe.action.path", ASCII),
                     ("containers[0].probe.action.host", ASCII),
                 ]
@@ -3795,28 +3686,6 @@ mod tests {
                 &[],
             ),
         ]);
-    }
-
-    #[test]
-    fn sub_path_is_normalised() {
-        fn with(sub: &str) -> Vec<(String, String)> {
-            let mut s = base();
-            s.volumes.insert("a".into(), ramdisk());
-            let mut m = mount("a", "/a");
-            m.sub_path = Some(sub.to_string());
-            s.containers[0].mounts = vec![m];
-            violations(&s)
-        }
-        let at = "containers[0].mounts[0].sub_path";
-        let one = |msg: &str| vec![(at.to_string(), msg.to_string())];
-        assert_eq!(with("a/b"), vec![]);
-        assert_eq!(with("a..b/.c"), vec![]);
-        assert_eq!(with("."), one("must not contain . components"));
-        assert_eq!(with("a/./b"), one("must not contain . components"));
-        assert_eq!(with("a//b"), one("must not contain //"));
-        assert_eq!(with("a/"), one("must not end with /"));
-        assert_eq!(with(""), one("must not be empty"));
-        assert_eq!(with("a/../b"), one("must not contain .. components"));
     }
 
     #[test]

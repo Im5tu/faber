@@ -474,16 +474,14 @@ fn port_and_mount_shapes() {
             volume: "data".into(),
             path: "/data".into(),
             read_only: true,
-            sub_path: Some("web".into()),
         },
-        json!({"volume": "data", "path": "/data", "read_only": true, "sub_path": "web"}),
+        json!({"volume": "data", "path": "/data", "read_only": true}),
     );
     assert_shape(
         MountSpec {
             volume: "data".into(),
             path: "/data".into(),
             read_only: false,
-            sub_path: None,
         },
         json!({"volume": "data", "path": "/data", "read_only": false}),
     );
@@ -579,7 +577,6 @@ fn container_spec_shapes() {
         volume: "data".into(),
         path: "/data".into(),
         read_only: false,
-        sub_path: None,
     }];
     full.resources.cpu_millis = 500;
     full.capabilities = vec!["NET_BIND_SERVICE".into()];
@@ -661,7 +658,6 @@ fn defaulted_fields_may_be_absent() {
             volume: "data".into(),
             path: "/data".into(),
             read_only: false,
-            sub_path: None,
         }
     );
     let decoded: Resources = serde_json::from_value(json!({})).unwrap();

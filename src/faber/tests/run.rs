@@ -1197,8 +1197,7 @@ fn workload_body() -> Value {
                         {"port": 53, "protocol": "udp"},
                     ],
                     "mounts": [
-                        {"volume": "data", "path": "/data", "read_only": true,
-                         "sub_path": "web"},
+                        {"volume": "data", "path": "/data", "read_only": true},
                         {"volume": "tmp", "path": "/tmp", "read_only": false},
                     ],
                     "resources": {"cpu_millis": 500, "memory_bytes": 268_435_456},
@@ -1256,7 +1255,7 @@ containers:
                        MODE=***
     ports:             http:8080/tcp
                        53/udp
-    mounts:            data:/data (block, 1073741824 bytes, read-only, sub-path web)
+    mounts:            data:/data (block, 1073741824 bytes, read-only)
                        tmp:/tmp (ramdisk, 1048576 bytes)
     resources:         cpu 500m, memory 268435456 bytes
     capabilities:      NET_BIND_SERVICE, CHOWN

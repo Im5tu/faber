@@ -459,9 +459,6 @@ fn mount(m: &MountSpec, volumes: &BTreeMap<String, VolumeSource>) -> String {
     if m.read_only {
         details.push("read-only".to_string());
     }
-    if let Some(sub_path) = &m.sub_path {
-        details.push(format!("sub-path {}", esc(sub_path)));
-    }
     format!(
         "{}:{} ({})",
         esc(&m.volume),
