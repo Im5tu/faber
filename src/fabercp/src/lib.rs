@@ -48,7 +48,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
 use faber_api_types::error_code;
-use faber_container_runtime::{ContainerRuntime, Containerd};
+use faber_container_runtime::ContainerRuntime;
 use faber_network_management::{BoxFuture, NetworkError, NetworkManager};
 use openraft::RaftMetrics;
 use tokio::net::TcpListener;
@@ -426,7 +426,6 @@ pub async fn start_with(
             identity,
             join_pending: join_pending.clone(),
             peer_port: config.peer_port,
-            cni_conf_dir: config.cni_conf_dir.clone(),
             lease_timing: config.lease_timing,
             reader: reader.clone(),
             containers: reconcile::containers::ContainersWiring {
@@ -875,7 +874,6 @@ pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
             .with(RuntimeStep::new(
                 host.backends.runtime.clone(),
                 host.identity.node_id,
-                host.cni_conf_dir.clone(),
             ))
             .with(ServicesStep::new(
                 host.backends.network.clone(),
@@ -2052,10 +2050,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.api_listen))?;
     let backends = config.manage_host.then(|| HostBackends {
         network: NetworkManager::system(),
-        runtime: Arc::new(Containerd {
-            conf_dir: config.containerd_conf_dir.clone(),
-            cni_conf_dir: config.cni_conf_dir.clone(),
-        }),
+        runtime: Arc::new(runner::NodeRuntime::new(runner::SocketNodeClient::new(
+            config.node_socket.clone(),
+        ))),
     });
 
     let peer = if config.mesh_mode() {
@@ -2125,6 +2122,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use faber_api_types::{ErrorBody, error_code};
+    use faber_container_runtime::Containerd;
     use faber_network_management::fake::RecordingRunner;
     use faber_network_management::{CommandOutput, CommandRunner};
 

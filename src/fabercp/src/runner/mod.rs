@@ -19,6 +19,7 @@ pub mod env;
 pub mod launch;
 pub mod node;
 pub mod probe;
+pub mod runtime;
 pub mod state;
 pub mod supervisor;
 #[cfg(test)]
@@ -32,6 +33,7 @@ pub use desired::{DesiredContainer, DesiredReplica, DesiredVolume};
 pub use env::{EnvSource, StateEnvSource};
 pub use node::{DEFAULT_NODE_SOCKET, NodeCallError, NodeClient, SocketNodeClient};
 pub use probe::{NetProber, ProbeOutcome, ProbeTarget, Prober};
+pub use runtime::NodeRuntime;
 pub use state::RunnerState;
 pub use supervisor::{Supervisor, SupervisorConfig};
 

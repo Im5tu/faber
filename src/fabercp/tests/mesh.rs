@@ -159,8 +159,6 @@ impl MeshNode {
         let mut c = common::fast_config(1, &self.dir.path().join("data"));
         c.node_id = None;
         c.state_dir = self.state_dir();
-        c.containerd_conf_dir = self.containerd_dir();
-        c.cni_conf_dir = self.cni_dir();
         c.manage_host = true;
         c.reconcile_interval_secs = 2;
         match boot {

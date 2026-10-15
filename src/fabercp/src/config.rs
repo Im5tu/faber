@@ -36,10 +36,6 @@ pub const DEFAULT_DATA_DIR: &str = "./data";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/faber";
 /// Name of the cluster key file in `--state-dir`.
 pub const CLUSTER_KEY_FILE: &str = "cluster.key";
-/// Default `--containerd-conf-dir`.
-pub const DEFAULT_CONTAINERD_CONF_DIR: &str = "/etc/containerd/conf.d";
-/// Default `--cni-conf-dir`.
-pub const DEFAULT_CNI_CONF_DIR: &str = "/etc/cni/net.d";
 /// Default `--heartbeat-ms`.
 pub const DEFAULT_HEARTBEAT_MS: u64 = 250;
 /// Default `--election-min-ms`.
@@ -185,20 +181,6 @@ pub struct Config {
     )]
     pub manage_host: bool,
 
-    /// Directory for the containerd drop-in (faber.toml).
-    #[arg(
-        long,
-        env = "FABER_CONTAINERD_CONF_DIR",
-        default_value = DEFAULT_CONTAINERD_CONF_DIR
-    )]
-    pub containerd_conf_dir: PathBuf,
-
-    /// Directory this node writes its CNI network config to
-    /// (10-faber.conflist). Must be the directory containerd reads, which is
-    /// a replicated setting; fabercp warns when the two differ.
-    #[arg(long, env = "FABER_CNI_CONF_DIR", default_value = DEFAULT_CNI_CONF_DIR)]
-    pub cni_conf_dir: PathBuf,
-
     /// Unix socket of faber-node, the root helper that runs the containers.
     #[arg(long, env = "FABER_NODE_SOCKET", default_value = DEFAULT_NODE_SOCKET)]
     pub node_socket: PathBuf,
@@ -247,8 +229,6 @@ impl Config {
             wg_endpoint: None,
             wg_port: DEFAULT_WG_PORT,
             manage_host: false,
-            containerd_conf_dir: PathBuf::from(DEFAULT_CONTAINERD_CONF_DIR),
-            cni_conf_dir: PathBuf::from(DEFAULT_CNI_CONF_DIR),
             node_socket: PathBuf::from(DEFAULT_NODE_SOCKET),
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             lease_timing: LeaseTiming::default(),
@@ -500,7 +480,7 @@ mod tests {
     /// or sets variables holds this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const MESH_VARS: [&str; 14] = [
+    const MESH_VARS: [&str; 12] = [
         "FABER_STATE_DIR",
         "FABER_NEW_MESH",
         "FABER_MESH_CIDR",
@@ -510,8 +490,6 @@ mod tests {
         "FABER_WG_ENDPOINT",
         "FABER_WG_PORT",
         "FABER_MANAGE_HOST",
-        "FABER_CONTAINERD_CONF_DIR",
-        "FABER_CNI_CONF_DIR",
         "FABER_NODE_ID",
         "FABER_RECONCILE_INTERVAL_SECS",
         "FABER_WG_INTERFACE",
@@ -614,11 +592,6 @@ mod tests {
         assert_eq!(c.wg_endpoint, None);
         assert_eq!(c.wg_port, 51820);
         assert!(!c.manage_host);
-        assert_eq!(
-            c.containerd_conf_dir,
-            PathBuf::from("/etc/containerd/conf.d")
-        );
-        assert_eq!(c.cni_conf_dir, PathBuf::from("/etc/cni/net.d"));
         assert!(!c.mesh_mode());
     }
 
@@ -639,10 +612,6 @@ mod tests {
             "--wg-port",
             "51000",
             "--manage-host",
-            "--containerd-conf-dir",
-            "/c",
-            "--cni-conf-dir",
-            "/n",
         ]);
         assert_eq!(c.state_dir, PathBuf::from("/s"));
         assert!(c.new_mesh);
@@ -655,8 +624,6 @@ mod tests {
         assert_eq!(c.wg_endpoint.as_deref(), Some("203.0.113.1:51820"));
         assert_eq!(c.wg_port, 51000);
         assert!(c.manage_host);
-        assert_eq!(c.containerd_conf_dir, PathBuf::from("/c"));
-        assert_eq!(c.cni_conf_dir, PathBuf::from("/n"));
         assert!(c.mesh_mode());
 
         let c = parse(&["--join-token-file", "/etc/faber/join.token"]);
@@ -679,8 +646,6 @@ mod tests {
                 ("FABER_WG_ENDPOINT", "203.0.113.1:51820"),
                 ("FABER_WG_PORT", "51000"),
                 ("FABER_MANAGE_HOST", "1"),
-                ("FABER_CONTAINERD_CONF_DIR", "/c"),
-                ("FABER_CNI_CONF_DIR", "/n"),
                 ("FABER_NODE_ID", "7"),
             ],
             || Config::parse_from(["fabercp"]),
@@ -697,8 +662,6 @@ mod tests {
         assert_eq!(c.wg_endpoint.as_deref(), Some("203.0.113.1:51820"));
         assert_eq!(c.wg_port, 51000);
         assert!(c.manage_host);
-        assert_eq!(c.containerd_conf_dir, PathBuf::from("/c"));
-        assert_eq!(c.cni_conf_dir, PathBuf::from("/n"));
 
         let c = with_env(&[("FABER_JOIN_TOKEN_FILE", "/t")], || {
             Config::parse_from(["fabercp"])
@@ -946,7 +909,6 @@ mod tests {
             ("FABER_DATA_DIR", "/var/lib/faber/data"),
             ("FABER_WG_PORT", "51820"),
             ("FABER_MANAGE_HOST", "1"),
-            ("FABER_CONTAINERD_CONF_DIR", "/etc/containerd/conf.d"),
         ];
 
         let mut founder = common.to_vec();

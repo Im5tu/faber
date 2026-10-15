@@ -31,7 +31,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -295,22 +294,6 @@ pub fn desired_runtime(
     })
 }
 
-/// A warning when the directory containerd is told to read CNI configs from
-/// (the replicated `settings.cni_conf_dir`) is not the one this node writes
-/// its config to (`--cni-conf-dir`): containerd would never see the file.
-/// Compared as paths, so a trailing slash makes no difference.
-pub fn cni_dir_warning(settings: &ContainerRuntimeSpec, cni_conf_dir: &Path) -> Option<String> {
-    if Path::new(&settings.cni_conf_dir) == cni_conf_dir {
-        return None;
-    }
-    Some(format!(
-        "containerd reads CNI configs from {} but this node writes its config to {} \
-         (--cni-conf-dir); containers get no network until the two match",
-        settings.cni_conf_dir,
-        cni_conf_dir.display()
-    ))
-}
-
 /// The two host integrations, each behind its own `reconcile`.
 #[derive(Clone)]
 pub struct HostBackends {
@@ -389,16 +372,11 @@ impl ReconcileStep for NetworkStep {
 pub struct RuntimeStep {
     runtime: Arc<dyn ContainerRuntime>,
     node_id: u64,
-    cni_conf_dir: PathBuf,
 }
 
 impl RuntimeStep {
-    pub fn new(runtime: Arc<dyn ContainerRuntime>, node_id: u64, cni_conf_dir: PathBuf) -> Self {
-        Self {
-            runtime,
-            node_id,
-            cni_conf_dir,
-        }
+    pub fn new(runtime: Arc<dyn ContainerRuntime>, node_id: u64) -> Self {
+        Self { runtime, node_id }
     }
 }
 
@@ -410,16 +388,16 @@ impl ReconcileStep for RuntimeStep {
     }
 
     fn plan(&self, view: &ReplicatedStateView) -> Planned<Option<NodeRuntimeSpec>> {
-        let warnings = view
-            .containerd
-            .as_ref()
-            .and_then(|settings| cni_dir_warning(settings, &self.cni_conf_dir))
-            .into_iter()
-            .collect();
         Planned {
             desired: desired_runtime(view.containerd.clone(), view.mesh.as_ref(), self.node_id),
-            warnings,
+            warnings: Vec::new(),
         }
+    }
+
+    /// The files are written by faber-node, which may not be up yet when
+    /// fabercp starts. The reconcile loop applies this step, not startup.
+    fn required_at_startup(&self) -> bool {
+        false
     }
 
     fn apply<'a>(&'a self, desired: &'a Option<NodeRuntimeSpec>) -> StepFuture<'a> {
@@ -450,10 +428,6 @@ pub struct HostReconciler {
     pub join_pending: JoinPending,
     /// TCP port of the peer listener, for the firewall.
     pub peer_port: u16,
-    /// Where this host's runtime backend writes the CNI config
-    /// (`--cni-conf-dir`). Only compared with the replicated setting, see
-    /// [`cni_dir_warning`].
-    pub cni_conf_dir: PathBuf,
     /// The clocks of the lease task: how stale a node's report can look
     /// though the node is on time ([`LeaseTiming::tick_clock_secs`]).
     pub lease_timing: LeaseTiming,
@@ -814,6 +788,7 @@ pub(crate) async fn debounce(
 mod tests {
     use std::collections::BTreeMap;
     use std::net::IpAddr;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1169,7 +1144,6 @@ mod tests {
             identity: joiner(9, bootstrap),
             join_pending: JoinPending::new(true),
             peer_port: 7401,
-            cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
             lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
             containers: wiring(),
@@ -1814,30 +1788,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_cni_directory_other_than_the_replicated_one_is_a_warning() {
-        let settings = ContainerRuntimeSpec::default();
-        assert_eq!(settings.cni_conf_dir, "/etc/cni/net.d");
-        assert_eq!(
-            cni_dir_warning(&settings, Path::new("/etc/cni/net.d")),
-            None
-        );
-        // Spelling does not matter.
-        assert_eq!(
-            cni_dir_warning(&settings, Path::new("/etc/cni/net.d/")),
-            None
-        );
-        let warning = cni_dir_warning(&settings, Path::new("/tmp/cni")).expect("a warning");
-        assert!(warning.contains("/etc/cni/net.d"), "{warning}");
-        assert!(warning.contains("/tmp/cni"), "{warning}");
-        assert!(warning.contains("--cni-conf-dir"), "{warning}");
-        // One sentence, not a line broken in the source.
-        assert!(
-            warning.contains("to /tmp/cni (--cni-conf-dir)"),
-            "{warning}"
-        );
-    }
-
     /// [`crate::host_steps`] over real storage: nothing before
     /// `InitCluster`, and after it the founder's subnet in every part of the
     /// plan.
@@ -1852,27 +1802,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut storage = store::open(dir.path().join("data")).unwrap();
         let runner = Arc::new(RecordingRunner::new());
-        let host = |cni_conf_dir: &str| HostReconciler {
+        let host = HostReconciler {
             backends: backends(&runner, dir.path()),
             iface: "faber0".into(),
             identity: local(1),
             join_pending: JoinPending::new(false),
             peer_port: 7401,
-            cni_conf_dir: PathBuf::from(cni_conf_dir),
             lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
             containers: wiring(),
         };
-        let (replicated, elsewhere) = (host("/etc/cni/net.d"), host("/var/tmp/cni"));
 
-        // Nothing replicated: no runtime spec, so no directory to compare.
-        for host in [&replicated, &elsewhere] {
-            let plan = plan_of(host);
-            assert_eq!(plan.desired.runtime, None);
-            assert!(plan.desired.network.wireguard.routes.is_empty());
-            assert_eq!(plan.desired.network.firewall.containers, None);
-            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-        }
+        // Nothing replicated: no runtime spec.
+        let plan = plan_of(&host);
+        assert_eq!(plan.desired.runtime, None);
+        assert!(plan.desired.network.wireguard.routes.is_empty());
+        assert_eq!(plan.desired.network.firewall.containers, None);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 
         let seed = Entry {
             log_id: openraft::testing::log_id(1, 1, 1),
@@ -1887,7 +1833,7 @@ mod tests {
         };
         storage.state_machine.apply([seed]).await.unwrap();
 
-        let plan = plan_of(&replicated);
+        let plan = plan_of(&host);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         let own = net("10.200.0.0/24");
         assert_eq!(plan.desired.network.wireguard.routes, vec![net(RANGE)]);
@@ -1903,15 +1849,6 @@ mod tests {
         );
         let runtime = plan.desired.runtime.clone().expect("settings replicated");
         assert_eq!(runtime.pod_network.map(|p| p.subnet), Some(own));
-
-        // The same state with another local directory: one warning, on every
-        // plan, and the same desired state.
-        for _ in 0..2 {
-            let other = plan_of(&elsewhere);
-            assert_eq!(other.desired, plan.desired);
-            assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
-            assert!(other.warnings[0].contains("/var/tmp/cni"));
-        }
     }
 
     #[test]
@@ -2262,7 +2199,6 @@ mod tests {
                 .with(RuntimeStep {
                     runtime: backends.runtime.clone(),
                     node_id: 2,
-                    cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
                 }),
         );
         let values = [
@@ -2300,6 +2236,62 @@ mod tests {
                 cni_conf_dir: dir.join("cni"),
             }),
         }
+    }
+
+    fn node_runtime_step(node: &crate::runner::node::fake::FakeNode) -> RuntimeStep {
+        RuntimeStep::new(
+            Arc::new(crate::runner::runtime::NodeRuntime::new(node.clone())),
+            2,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_runtime_step_has_faber_node_write_the_files() {
+        let node = crate::runner::node::fake::FakeNode::default();
+        let step = node_runtime_step(&node);
+        let mut spec = runtime_spec();
+        spec.pod_network = Some(PodNetworkSpec {
+            bridge: POD_BRIDGE.into(),
+            subnet: net("10.200.1.0/24"),
+            mtu: WG_MTU,
+        });
+
+        step.apply(&Some(spec.clone())).await.unwrap();
+        let files = node.runtime_files().expect("configured");
+        assert_eq!(files.sandbox_image, spec.settings.sandbox_image);
+        assert_eq!(
+            files.pod_network.map(|n| (n.bridge, n.subnet, n.mtu)),
+            Some((POD_BRIDGE.to_owned(), net("10.200.1.0/24"), WG_MTU))
+        );
+
+        // No replicated settings yet: faber-node is not asked for anything.
+        node.take_log();
+        step.apply(&None).await.unwrap();
+        assert!(node.log().is_empty());
+
+        // No subnet any more: the CNI config goes.
+        step.apply(&Some(runtime_spec())).await.unwrap();
+        assert_eq!(node.runtime_files().unwrap().pod_network, None);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_by_faber_node_fails_the_runtime_step() {
+        let node = crate::runner::node::fake::FakeNode::default();
+        node.fail_next("configure_runtime");
+        let step = node_runtime_step(&node);
+        let err = step.apply(&Some(runtime_spec())).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("configure_runtime failed on purpose"),
+            "{err:#}"
+        );
+        // The next pass tries again.
+        step.apply(&Some(runtime_spec())).await.unwrap();
+    }
+
+    #[test]
+    fn startup_leaves_the_runtime_step_to_the_loop() {
+        let node = crate::runner::node::fake::FakeNode::default();
+        assert!(!node_runtime_step(&node).required_at_startup());
     }
 
     #[tokio::test]

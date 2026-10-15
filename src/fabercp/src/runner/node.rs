@@ -68,6 +68,7 @@ fn name_of(response: &Response) -> &'static str {
         Response::Sandbox { .. } => "sandbox",
         Response::Container { .. } => "container",
         Response::Done => "done",
+        Response::Changed { .. } => "changed",
         Response::Replicas { .. } => "replicas",
         Response::Volumes { .. } => "volumes",
         Response::Error { .. } => "error",
@@ -112,6 +113,21 @@ pub async fn call_container<C: NodeClient>(
         Response::Container { container_id } => Ok(container_id),
         other => Err(NodeCallError::Unexpected {
             request: "create_container",
+            response: name_of(&other),
+        }),
+    }
+}
+
+/// A request answered with whether a file on the node changed.
+pub async fn call_changed<C: NodeClient>(
+    client: &C,
+    request: Request,
+    name: &'static str,
+) -> Result<bool, NodeCallError> {
+    match client.call(request).await? {
+        Response::Changed { changed } => Ok(changed),
+        other => Err(NodeCallError::Unexpected {
+            request: name,
             response: name_of(&other),
         }),
     }
@@ -280,8 +296,8 @@ pub mod fake {
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     use faber_node_protocol::{
-        ContainerInfo, ContainerState, LABEL_CONTAINER, ReplicaInfo, ReplicaRef, SandboxState,
-        VolumeKind,
+        ContainerInfo, ContainerState, LABEL_CONTAINER, PodNetwork, ReplicaInfo, ReplicaRef,
+        SandboxState, VolumeKind,
     };
 
     use super::*;
@@ -296,8 +312,18 @@ pub mod fake {
         env: BTreeMap<String, String>,
     }
 
+    /// What the node's runtime config holds: the drop-in's settings and the
+    /// CNI network, if there is a CNI config.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RuntimeFiles {
+        pub systemd_cgroup: bool,
+        pub sandbox_image: String,
+        pub pod_network: Option<PodNetwork>,
+    }
+
     #[derive(Debug, Default)]
     struct Inner {
+        runtime: Option<RuntimeFiles>,
         next_id: u32,
         sandboxes: Vec<(String, ReplicaRef, SandboxState, String)>,
         containers: Vec<Container>,
@@ -381,6 +407,11 @@ pub mod fake {
                 .collect()
         }
 
+        /// The runtime config files as the node holds them, once configured.
+        pub fn runtime_files(&self) -> Option<RuntimeFiles> {
+            self.inner().runtime.clone()
+        }
+
         pub fn sandbox_count(&self) -> usize {
             self.inner().sandboxes.len()
         }
@@ -456,6 +487,21 @@ pub mod fake {
                 ),
                 Request::ListReplicas => ("list_replicas".into(), "list_replicas"),
                 Request::ListVolumes => ("list_volumes".into(), "list_volumes"),
+                Request::ConfigureRuntime {
+                    systemd_cgroup,
+                    sandbox_image,
+                    pod_network,
+                } => (
+                    format!(
+                        "configure_runtime cgroup={systemd_cgroup} image={sandbox_image} network={}",
+                        pod_network.as_ref().map_or_else(
+                            || "none".to_owned(),
+                            |n| format!("{} {} {}", n.bridge, n.subnet, n.mtu)
+                        )
+                    ),
+                    "configure_runtime",
+                ),
+                Request::RemoveCniConfig => ("remove_cni_config".into(), "remove_cni_config"),
             };
             if kind != "list_replicas" && kind != "list_volumes" {
                 inner.log.push(line);
@@ -610,6 +656,27 @@ pub mod fake {
                         ))
                     });
                     Ok(Response::Volumes { volumes })
+                }
+                Request::ConfigureRuntime {
+                    systemd_cgroup,
+                    sandbox_image,
+                    pod_network,
+                } => {
+                    let files = RuntimeFiles {
+                        systemd_cgroup,
+                        sandbox_image,
+                        pod_network,
+                    };
+                    let changed = inner.runtime.as_ref() != Some(&files);
+                    inner.runtime = Some(files);
+                    Ok(Response::Changed { changed })
+                }
+                Request::RemoveCniConfig => {
+                    let changed = inner
+                        .runtime
+                        .as_mut()
+                        .is_some_and(|files| files.pod_network.take().is_some());
+                    Ok(Response::Changed { changed })
                 }
                 Request::ListReplicas => {
                     let replicas = inner
