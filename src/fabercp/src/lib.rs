@@ -565,6 +565,12 @@ pub async fn start_with(
             config.lease_timing,
             cancel.child_token(),
         ));
+        // Every mesh node runs the leader's side of placement; it acts only
+        // while the node leads.
+        tasks.push(placement::spawn_default(
+            service.clone(),
+            cancel.child_token(),
+        ));
         tasks.push(tokio::spawn(mesh_membership(
             MeshMembership {
                 service: service.clone(),
