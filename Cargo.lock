@@ -784,10 +784,12 @@ dependencies = [
  "anyhow",
  "clap",
  "faber-api-types",
+ "faber-container-runtime",
  "faber-cri",
  "faber-image",
  "faber-network-management",
  "faber-node-protocol",
+ "ipnet",
  "nix",
  "serde_json",
  "sha2",
@@ -803,6 +805,7 @@ name = "faber-node-protocol"
 version = "0.1.0"
 dependencies = [
  "faber-api-types",
+ "ipnet",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 use faber_api_types::workload::{ContainerSpec, PortSpec};
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -35,6 +36,18 @@ pub struct DnsConfig {
     pub nameservers: Vec<Ipv4Addr>,
     /// DNS names, without a trailing dot.
     pub searches: Vec<String>,
+}
+
+/// The container network of this node: the fields of the CNI config.
+/// faber-node checks every one before it writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PodNetwork {
+    /// Name of the bridge containers attach to.
+    pub bridge: String,
+    /// This node's container subnet.
+    pub subnet: Ipv4Net,
+    pub mtu: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +117,19 @@ pub enum Request {
     /// Every volume under faber-node's volume root, found on disk. Takes no
     /// argument: no path is ever sent.
     ListVolumes,
+    /// Brings the containerd drop-in and the CNI network config to this
+    /// state, in files and directories that faber-node alone names. No path
+    /// is ever sent. Answered with [`Response::Changed`].
+    ConfigureRuntime {
+        /// Use the systemd cgroup driver.
+        systemd_cgroup: bool,
+        sandbox_image: String,
+        /// `None` removes the CNI network config: this node has no subnet.
+        pod_network: Option<PodNetwork>,
+    },
+    /// Removes the CNI network config and nothing else, for a node that is
+    /// leaving the mesh. Answered with [`Response::Changed`].
+    RemoveCniConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +218,10 @@ pub enum Response {
     },
     /// The request had no result to return.
     Done,
+    /// Whether a file on the host changed.
+    Changed {
+        changed: bool,
+    },
     Replicas {
         replicas: Vec<ReplicaInfo>,
     },
@@ -296,6 +326,21 @@ mod tests {
             },
             Request::ListReplicas,
             Request::ListVolumes,
+            Request::ConfigureRuntime {
+                systemd_cgroup: true,
+                sandbox_image: "registry.k8s.io/pause:3.10".into(),
+                pod_network: Some(PodNetwork {
+                    bridge: "faberbr0".into(),
+                    subnet: "10.200.3.0/24".parse().unwrap(),
+                    mtu: 1420,
+                }),
+            },
+            Request::ConfigureRuntime {
+                systemd_cgroup: false,
+                sandbox_image: "pause:3".into(),
+                pod_network: None,
+            },
+            Request::RemoveCniConfig,
         ]
     }
 
@@ -328,6 +373,7 @@ mod tests {
                 container_id: "c".into(),
             },
             Response::Done,
+            Response::Changed { changed: true },
             Response::Replicas {
                 replicas: vec![ReplicaInfo {
                     replica: replica(),
@@ -372,6 +418,22 @@ mod tests {
         );
         assert!(serde_json::from_str::<Request>(r#"{"type":"list_replicas"}"#).is_ok());
         assert!(serde_json::from_str::<Request>(r#"{"type":"list_volumes"}"#).is_ok());
+        // Neither a path nor a file body can be named.
+        for extra in [
+            r#""path":"/etc""#,
+            r#""content":"x""#,
+            r#""conf_dir":"/tmp""#,
+        ] {
+            let configure = format!(
+                r#"{{"type":"configure_runtime","systemd_cgroup":true,"sandbox_image":"p:1","pod_network":null,{extra}}}"#
+            );
+            assert!(
+                serde_json::from_str::<Request>(&configure).is_err(),
+                "{extra}"
+            );
+        }
+        let network = r#"{"bridge":"faberbr0","subnet":"10.200.3.0/24","mtu":1420,"dir":"/x"}"#;
+        assert!(serde_json::from_str::<PodNetwork>(network).is_err());
     }
 
     #[test]
