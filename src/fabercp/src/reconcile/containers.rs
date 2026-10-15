@@ -34,7 +34,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use faber_api_types::workload::{VolumeSource, WorkloadSpec};
+use faber_api_types::workload::{DNS_SUFFIX, VolumeSource, WorkloadSpec};
 use faber_node_protocol::{DnsConfig, ReplicaInfo, ReplicaRef, VolumeKind};
 use ipnet::Ipv4Net;
 
@@ -49,9 +49,6 @@ use crate::runner::{
     DEFAULT_STOP_GRACE_SECS, DesiredContainer, DesiredReplica, DesiredVolume, EnvSource,
 };
 use crate::secrets::{ClusterKeyProvider, env_scope};
-
-/// Search domain suffix of the pods' names.
-const DNS_SUFFIX: &str = "faber.local";
 
 /// What the host needs to run containers.
 #[derive(Clone)]

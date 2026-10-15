@@ -4,6 +4,7 @@
 use std::net::Ipv4Addr;
 
 use faber_api_types::name::validate_dns_label;
+use faber_api_types::workload::DNS_SUFFIX;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
@@ -13,11 +14,8 @@ use super::{LookupFailed, ServiceIps};
 /// Seconds a client may cache a service address.
 const ANSWER_TTL: u32 = 30;
 
-/// Labels of the zone every service name sits under.
-const ZONE: [&[u8]; 2] = [b"faber", b"local"];
-
-/// Labels of a service name: `<svc>.<env>.<project>` and the zone.
-const SERVICE_NAME_LABELS: usize = 3 + ZONE.len();
+/// Labels of a service name before the zone: `<svc>.<env>.<project>`.
+const SERVICE_PREFIX_LABELS: usize = 3;
 
 /// Size of a DNS header, the least a packet needs to be answered at all.
 const HEADER_LEN: usize = 12;
@@ -122,19 +120,25 @@ pub fn fit_udp(query: &[u8], response: Vec<u8>) -> Vec<u8> {
     header
 }
 
+/// Number of labels in the zone, [`DNS_SUFFIX`].
+fn zone_len() -> usize {
+    DNS_SUFFIX.split('.').count()
+}
+
 fn in_zone(labels: &[&[u8]]) -> bool {
-    labels.len() >= ZONE.len()
-        && labels[labels.len() - ZONE.len()..]
+    labels.len() >= zone_len()
+        && labels
             .iter()
-            .zip(ZONE)
-            .all(|(label, zone)| label.eq_ignore_ascii_case(zone))
+            .rev()
+            .zip(DNS_SUFFIX.rsplit('.'))
+            .all(|(label, zone)| label.eq_ignore_ascii_case(zone.as_bytes()))
 }
 
 /// The virtual IP of the service `labels` names, if it is a well-formed
 /// service name that has one. `Ok(None)` for a name that is not a service
 /// name, or names a service without an address.
 fn service_ip(labels: &[&[u8]], ips: &dyn ServiceIps) -> Result<Option<Ipv4Addr>, LookupFailed> {
-    if labels.len() != SERVICE_NAME_LABELS {
+    if labels.len() != SERVICE_PREFIX_LABELS + zone_len() {
         return Ok(None);
     }
     let label = |i: usize| -> Option<String> {
@@ -212,6 +216,17 @@ mod tests {
         assert_eq!(m.answers.len(), 1);
         assert_eq!(m.answers[0].data, RData::A(A(IP)));
         assert_eq!(m.queries.len(), 1);
+    }
+
+    #[test]
+    fn answers_the_name_the_workload_response_carries() {
+        let name = format!(
+            "{}.",
+            faber_api_types::workload::fqdn("web", "prod", "shop")
+        );
+        let m = reply_of(answer(&query_packet(&name, RecordType::A), &ips()));
+        assert_eq!(m.answers.len(), 1);
+        assert_eq!(m.answers[0].data, RData::A(A(IP)));
     }
 
     #[test]

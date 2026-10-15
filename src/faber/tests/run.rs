@@ -1226,7 +1226,7 @@ fn workload_list_body() -> Value {
     let summary = |name: &str, scale: Value, expose: &str, revision: u64, up: u32, want: u32| {
         json!({
             "project": "shop", "environment": "staging", "name": name,
-            "fqdn": format!("{name}.staging.shop.faber.internal"),
+            "fqdn": format!("{name}.staging.shop.faber.local"),
             "scale": scale, "expose": expose, "revision": revision,
             "available": up, "desired": want,
         })
@@ -1262,9 +1262,9 @@ async fn app_ls_text_and_json() {
     assert_eq!(
         run_ok(&server, &args).await,
         "NAME  PROJECT  ENVIRONMENT  SCALE       AVAILABLE  EXPOSE       FQDN
-db    shop     staging      1 (spread)  1/1        environment  db.staging.shop.faber.internal
-logs  shop     staging      daemon      1/3        environment  logs.staging.shop.faber.internal
-web   shop     staging      3 (pack)    2/3        cluster      web.staging.shop.faber.internal
+db    shop     staging      1 (spread)  1/1        environment  db.staging.shop.faber.local
+logs  shop     staging      daemon      1/3        environment  logs.staging.shop.faber.local
+web   shop     staging      3 (pack)    2/3        cluster      web.staging.shop.faber.local
 "
     );
 
@@ -1310,7 +1310,7 @@ const WORKLOAD_ROUTE: &str = "/api/v1/projects/shop/environments/staging/workloa
 fn workload_body() -> Value {
     json!({
         "project": "shop", "environment": "staging", "name": "web",
-        "fqdn": "web.staging.shop.faber.internal", "revision": 7, "generation": 9,
+        "fqdn": "web.staging.shop.faber.local", "revision": 7, "generation": 9,
         "spec": {
             "scale": "daemon",
             "restart": "on_failure",
@@ -1377,7 +1377,7 @@ fn workload_body() -> Value {
 
 const WORKLOAD_TEXT: &str = "\
 name:        web
-fqdn:        web.staging.shop.faber.internal
+fqdn:        web.staging.shop.faber.local
 project:     shop
 environment: staging
 revision:    7
@@ -1502,7 +1502,7 @@ async fn app_show_of_an_unknown_workload_is_readable() {
 async fn text_output_escapes_control_characters_from_the_api() {
     let server = MockServer::start().await;
     let mut workload = workload_body();
-    workload["fqdn"] = json!("web\u{1b}[2J.faber.internal");
+    workload["fqdn"] = json!("web\u{1b}[2J.faber.local");
     workload["spec"]["placement"]["nodes"] = json!(["node\r\n1"]);
     let web = &mut workload["spec"]["containers"][0];
     web["image"] = json!("nginx\u{1b}]0;owned\u{7}");
@@ -1569,7 +1569,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
 
     let (out, _) = run_fx(&server, &show).await.ok();
     for want in [
-        "fqdn:        web\\x1b[2J.faber.internal\n",
+        "fqdn:        web\\x1b[2J.faber.local\n",
         "nodes:       node\\x0d\\x0a1\n",
         "image:             nginx\\x1b]0;owned\\x07\n",
         "args:              a\\x09b c\\u{9b}d\n",
@@ -1634,7 +1634,7 @@ async fn app_rm_deletes_each_workload_and_prints_its_fqdn() {
     let (out, err) = run_split(&server, &args).await;
     assert_eq!(
         out,
-        "removed web.staging.shop.faber.internal\nremoved db.staging.shop.faber.internal\n"
+        "removed web.staging.shop.faber.local\nremoved db.staging.shop.faber.local\n"
     );
     assert_eq!(err, "");
 
@@ -1643,8 +1643,8 @@ async fn app_rm_deletes_each_workload_and_prints_its_fqdn() {
     assert_eq!(
         v,
         json!({"removed": [
-            "web.staging.shop.faber.internal",
-            "db.staging.shop.faber.internal",
+            "web.staging.shop.faber.local",
+            "db.staging.shop.faber.local",
         ]})
     );
 }
@@ -1679,12 +1679,12 @@ async fn app_rm_stops_at_the_first_failure() {
     let args = with_target(&["app", "rm", "web", "gone", "db"], &[]);
     let (err, out) = run_err(&server, &args).await;
     assert_eq!(err, "not_found: no workload named gone");
-    assert_eq!(out, "removed web.staging.shop.faber.internal\n");
+    assert_eq!(out, "removed web.staging.shop.faber.local\n");
 
     let (err, out) = run_err(&server, &[&["-o", "json"][..], &args].concat()).await;
     assert_eq!(err, "not_found: no workload named gone");
     let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v, json!({"removed": ["web.staging.shop.faber.internal"]}));
+    assert_eq!(v, json!({"removed": ["web.staging.shop.faber.local"]}));
 }
 
 #[tokio::test]

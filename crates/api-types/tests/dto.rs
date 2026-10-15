@@ -316,11 +316,11 @@ fn invite_response_debug_redacts_token() {
 
 #[test]
 fn workload_constants() {
-    assert_eq!(DNS_SUFFIX, "faber.internal");
+    assert_eq!(DNS_SUFFIX, "faber.local");
     assert_eq!(DEFAULT_ENVIRONMENTS, ["staging", "production"]);
     assert_eq!(
         fqdn("web", "staging", "shop"),
-        "web.staging.shop.faber.internal"
+        "web.staging.shop.faber.local"
     );
     assert_eq!(faber_api_types::name::MAX_DNS_LABEL_LEN, 63);
 }
@@ -853,7 +853,7 @@ fn workload_route_shapes() {
     };
     let summary_json = json!({
         "project": "shop", "environment": "staging", "name": "web",
-        "fqdn": "web.staging.shop.faber.internal",
+        "fqdn": "web.staging.shop.faber.local",
         "scale": {"replicas": {"count": 3, "strategy": "spread"}},
         "expose": "cluster", "revision": 7, "available": 2, "desired": 3
     });
@@ -902,7 +902,7 @@ fn workload_route_shapes() {
         },
         json!({
             "project": "shop", "environment": "staging", "name": "a",
-            "fqdn": "a.staging.shop.faber.internal", "revision": 7, "generation": 9,
+            "fqdn": "a.staging.shop.faber.local", "revision": 7, "generation": 9,
             "spec": minimal_spec_json(),
             "replicas": [
                 {"node": 2, "replica_index": 0, "revision": 7, "state": "available",
@@ -916,7 +916,7 @@ fn workload_route_shapes() {
     // A response from before replicas were reported still reads.
     let old: WorkloadResponse = serde_json::from_value(json!({
         "project": "shop", "environment": "staging", "name": "a",
-        "fqdn": "a.staging.shop.faber.internal", "revision": 7, "generation": 9,
+        "fqdn": "a.staging.shop.faber.local", "revision": 7, "generation": 9,
         "spec": minimal_spec_json()
     }))
     .unwrap();

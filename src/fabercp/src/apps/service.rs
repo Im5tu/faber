@@ -1532,7 +1532,7 @@ mod tests {
 
         let all = svc.list_workloads(query(None, None)).await.unwrap();
         let api = &all.workloads[2];
-        assert_eq!(api.fqdn, "api.staging.shop.faber.internal");
+        assert_eq!(api.fqdn, "api.staging.shop.faber.local");
         assert_eq!(api.scale, exposed.scale);
         assert_eq!(api.expose, exposed.expose);
         assert_eq!(api.revision, staging.generation);
@@ -1543,7 +1543,7 @@ mod tests {
                 project: "shop".into(),
                 environment: "staging".into(),
                 name: "api".into(),
-                fqdn: "api.staging.shop.faber.internal".into(),
+                fqdn: "api.staging.shop.faber.local".into(),
                 revision: staging.generation,
                 generation: staging.generation,
                 spec: exposed,

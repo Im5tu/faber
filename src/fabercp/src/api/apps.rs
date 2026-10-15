@@ -395,7 +395,7 @@ mod tests {
             call(&node, Method::GET, "/api/v1/workloads", None).await;
         assert_eq!(status, 200);
         let api = &list.workloads[0];
-        assert_eq!(api.fqdn, "api.staging.shop.faber.internal");
+        assert_eq!(api.fqdn, "api.staging.shop.faber.local");
         assert_eq!(
             api.scale,
             Scale::Replicas {
@@ -432,7 +432,7 @@ mod tests {
             ("shop", "staging")
         );
         assert_eq!(api.name, "api");
-        assert_eq!(api.fqdn, "api.staging.shop.faber.internal");
+        assert_eq!(api.fqdn, "api.staging.shop.faber.local");
         assert_eq!(
             (api.revision, api.generation),
             (first.generation, first.generation)

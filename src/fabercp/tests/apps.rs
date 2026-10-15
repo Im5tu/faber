@@ -201,7 +201,7 @@ async fn projects_and_workloads_replicate_through_followers() {
         .unwrap();
     assert_eq!(masked.spec.containers[0].env["MODE"], "***");
     assert_eq!((read.revision, read.generation), (g1, g1));
-    assert_eq!(read.fqdn, "web.staging.shop.faber.internal");
+    assert_eq!(read.fqdn, "web.staging.shop.faber.local");
     assert_eq!(read.fqdn, fqdn("web", "staging", "shop"));
 
     // All three nodes hold the same environment record at that generation.
@@ -300,7 +300,7 @@ async fn projects_and_workloads_replicate_through_followers() {
         rows,
         [
             (
-                "api.staging.shop.faber.internal",
+                "api.staging.shop.faber.local",
                 Scale::Replicas {
                     count: 1,
                     strategy: Strategy::Spread
@@ -309,7 +309,7 @@ async fn projects_and_workloads_replicate_through_followers() {
                 g1
             ),
             (
-                "web.staging.shop.faber.internal",
+                "web.staging.shop.faber.local",
                 Scale::Replicas {
                     count: 3,
                     strategy: Strategy::Spread

@@ -2,7 +2,7 @@
 //!
 //! A workload is pod-shaped: replicas of one or more containers that share
 //! a network namespace. It lives in one environment of one project and is
-//! named `<workload>.<environment>.<project>.faber.internal` ([`fqdn`]).
+//! named `<workload>.<environment>.<project>.faber.local` ([`fqdn`]).
 //!
 //! Every type refuses unknown fields. A field with a default may be left
 //! out on input and is always written on output, so a default that changes
@@ -21,7 +21,7 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 
 /// Suffix of every workload name in DNS.
-pub const DNS_SUFFIX: &str = "faber.internal";
+pub const DNS_SUFFIX: &str = "faber.local";
 
 /// The environments a project gets when its creation names none.
 pub const DEFAULT_ENVIRONMENTS: [&str; 2] = ["staging", "production"];
@@ -157,7 +157,7 @@ pub const CAPABILITIES: &[&str] = &[
 ];
 
 /// The DNS name of a workload:
-/// `<workload>.<environment>.<project>.faber.internal`.
+/// `<workload>.<environment>.<project>.faber.local`.
 pub fn fqdn(workload: &str, environment: &str, project: &str) -> String {
     format!("{workload}.{environment}.{project}.{DNS_SUFFIX}")
 }
@@ -1381,7 +1381,7 @@ pub struct WorkloadSummary {
     pub project: String,
     pub environment: String,
     pub name: String,
-    /// `<name>.<environment>.<project>.faber.internal`.
+    /// `<name>.<environment>.<project>.faber.local`.
     pub fqdn: String,
     pub scale: Scale,
     pub expose: Exposure,
@@ -1403,7 +1403,7 @@ pub struct WorkloadResponse {
     pub project: String,
     pub environment: String,
     pub name: String,
-    /// `<name>.<environment>.<project>.faber.internal`.
+    /// `<name>.<environment>.<project>.faber.local`.
     pub fqdn: String,
     /// See [`WorkloadSummary::revision`].
     pub revision: u64,
@@ -1458,7 +1458,7 @@ mod tests {
     fn fqdn_is_workload_environment_project_suffix() {
         assert_eq!(
             fqdn("web", "staging", "shop"),
-            "web.staging.shop.faber.internal"
+            "web.staging.shop.faber.local"
         );
     }
 
@@ -3609,14 +3609,14 @@ mod tests {
             .unwrap(),
             json!({"workloads": [{
                 "project": "shop", "environment": "staging", "name": "web",
-                "fqdn": "web.staging.shop.faber.internal",
+                "fqdn": "web.staging.shop.faber.local",
                 "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7,
                 "available": 2, "desired": 3,
             }]})
         );
         let one: WorkloadResponse = serde_json::from_value(json!({
             "project": "shop", "environment": "staging", "name": "web",
-            "fqdn": "web.staging.shop.faber.internal", "revision": 7, "generation": 9,
+            "fqdn": "web.staging.shop.faber.local", "revision": 7, "generation": 9,
             "spec": {"containers": [{"name": "web", "image": "nginx"}]},
         }))
         .unwrap();

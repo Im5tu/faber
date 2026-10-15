@@ -481,7 +481,7 @@ fn project_body() -> Value {
 fn workload_body() -> Value {
     json!({
         "project": "shop", "environment": "staging", "name": "web",
-        "fqdn": "web.staging.shop.faber.internal", "revision": 7, "generation": 9,
+        "fqdn": "web.staging.shop.faber.local", "revision": 7, "generation": 9,
         "spec": {"containers": [{"name": "web", "image": "nginx", "env": {"MODE": "prod"}}]}
     })
 }
@@ -886,7 +886,7 @@ async fn workload_list_sends_the_filters_that_are_set() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"workloads": [{
                 "project": "shop", "environment": "staging", "name": "web",
-                "fqdn": "web.staging.shop.faber.internal",
+                "fqdn": "web.staging.shop.faber.local",
                 "scale": {"replicas": {"count": 3, "strategy": "spread"}}, "expose": "cluster", "revision": 7,
                 "available": 2, "desired": 3
             }]})),
@@ -901,7 +901,7 @@ async fn workload_list_sends_the_filters_that_are_set() {
         .await
         .unwrap();
     assert_eq!(got.workloads.len(), 1);
-    assert_eq!(got.workloads[0].fqdn, "web.staging.shop.faber.internal");
+    assert_eq!(got.workloads[0].fqdn, "web.staging.shop.faber.local");
     assert_eq!(
         (got.workloads[0].available, got.workloads[0].desired),
         (2, 3)
@@ -980,7 +980,7 @@ async fn workload_get_returns_the_workload() {
     assert_eq!(got.project, "shop");
     assert_eq!(got.environment, "staging");
     assert_eq!(got.name, "web");
-    assert_eq!(got.fqdn, "web.staging.shop.faber.internal");
+    assert_eq!(got.fqdn, "web.staging.shop.faber.local");
     assert_eq!(got.revision, 7);
     assert_eq!(got.generation, 9);
     assert_eq!(got.spec.containers[0].image, "nginx");
