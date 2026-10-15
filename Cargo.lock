@@ -696,6 +696,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "faber-api-types",
+ "faber-crypto",
  "serde",
  "serde_json",
  "tempfile",

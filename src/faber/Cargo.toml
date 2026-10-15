@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 faber-api-types = { workspace = true, features = ["client"] }
+faber-crypto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

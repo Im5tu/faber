@@ -398,34 +398,8 @@ fn exposure(expose: Exposure) -> &'static str {
     }
 }
 
-/// How many replicas are available and how many are wanted: the replica
-/// count, or for a daemon the nodes that hold a replica.
-pub fn availability(w: &WorkloadResponse) -> (usize, usize) {
-    let available = w
-        .replicas
-        .iter()
-        .filter(|r| r.state == ReplicaState::Available)
-        .count();
-    let desired = match w.spec.scale {
-        Scale::Replicas { count, .. } => count as usize,
-        Scale::Daemon => {
-            let mut nodes: Vec<u64> = w.replicas.iter().filter_map(|r| r.node).collect();
-            nodes.sort_unstable();
-            nodes.dedup();
-            nodes.len()
-        }
-    };
-    (available, desired)
-}
-
-/// `app ls`. `available` holds [`availability`] for each listed workload in
-/// order, `None` when it could not be read; text mode shows `-` for a missing
-/// entry.
-pub fn workloads(
-    format: OutputFormat,
-    list: &WorkloadListResponse,
-    available: &[Option<(usize, usize)>],
-) -> Result<String> {
+/// `app ls`. The AVAILABLE column is the list's own `available/desired`.
+pub fn workloads(format: OutputFormat, list: &WorkloadListResponse) -> Result<String> {
     if format == OutputFormat::Json {
         return pretty(list);
     }
@@ -439,18 +413,13 @@ pub fn workloads(
         "FQDN",
     ]
     .map(String::from);
-    let workloads = list.workloads.iter().enumerate().map(|(i, w)| {
-        let available = available
-            .get(i)
-            .copied()
-            .flatten()
-            .map_or_else(none, |(up, want)| format!("{up}/{want}"));
+    let workloads = list.workloads.iter().map(|w| {
         [
             esc(&w.name),
             esc(&w.project),
             esc(&w.environment),
             scale(w.scale),
-            available,
+            format!("{}/{}", w.available, w.desired),
             exposure(w.expose).to_string(),
             esc(&w.fqdn),
         ]

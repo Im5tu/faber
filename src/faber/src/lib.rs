@@ -467,29 +467,7 @@ pub async fn run_with_inputs(
                 environment,
             };
             let list = client.workload_list(&query, false).await.map_err(api)?;
-            // The list carries no replica status, so text mode reads each
-            // workload for its AVAILABLE column. JSON is the list as it came.
-            let mut available = Vec::new();
-            if format == OutputFormat::Text {
-                for w in &list.workloads {
-                    let found = client
-                        .workload_get(&w.project, &w.environment, &w.name, false)
-                        .await;
-                    available.push(match found {
-                        Ok(found) => Some(output::availability(&found)),
-                        // Gone since the list, or a name the client refuses
-                        // to put in a URL: no count to show.
-                        Err(ClientError::Invalid(_)) => None,
-                        Err(ClientError::Api { body, .. })
-                            if body.error == faber_api_types::error_code::NOT_FOUND =>
-                        {
-                            None
-                        }
-                        Err(e) => return Err(api(e)),
-                    });
-                }
-            }
-            output::workloads(format, &list, &available)?
+            output::workloads(format, &list)?
         }
         Command::App(AppCommand::Show { workload, target }) => {
             // Env values are always shown, so they are always asked for.
@@ -528,20 +506,68 @@ pub async fn run_with_inputs(
     Ok(())
 }
 
-/// The key in `path`, without its surrounding whitespace. No error here
-/// carries any of the file's content.
+/// The most a key file may hold: a base64 key is 44 bytes.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+/// Whether both are the same file on disk. Where the platform gives no file
+/// identity, this cannot tell and says yes.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        true
+    }
+}
+
+/// The key in `path` as canonical base64. The path must be a regular file
+/// and not a symlink, at most [`MAX_KEY_FILE_BYTES`] long, and hold the
+/// base64 of a whole key. No error here carries any of the file's content.
 async fn read_key(path: &std::path::Path) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+
     let shown = output::esc(&path.display().to_string());
-    let text = tokio::fs::read_to_string(path).await.map_err(|e| {
+    let unreadable = |e: std::io::Error| {
         anyhow!(
             "cannot read the cluster key file {shown}: {e} (run as root or faber, or pass --file)"
         )
-    })?;
-    let key = text.trim();
-    if key.is_empty() {
+    };
+    // The link itself is looked at, never what it points to.
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(unreadable)?;
+    if !meta.is_file() {
+        bail!("the cluster key file {shown} is not a regular file");
+    }
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    // The path may have been swapped since the check above: what was opened
+    // must be the file that was looked at.
+    let opened = file.metadata().await.map_err(unreadable)?;
+    if !opened.is_file() || !same_file(&meta, &opened) {
+        bail!("the cluster key file {shown} is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    // One byte over the cap tells a long file from one of exactly the cap.
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        bail!("the cluster key file {shown} is too large (over {MAX_KEY_FILE_BYTES} bytes)");
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow!("the cluster key file {shown} does not hold a valid cluster key"))?
+        .trim();
+    if text.is_empty() {
         bail!("the cluster key file {shown} is empty");
     }
-    Ok(key.to_string())
+    let key = faber_crypto::ClusterKey::from_base64(text)
+        .map_err(|_| anyhow!("the cluster key file {shown} does not hold a valid cluster key"))?;
+    Ok(key.to_base64().to_string())
 }
 
 /// Turns a client error into a message a person can act on.

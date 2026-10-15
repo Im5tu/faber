@@ -9,7 +9,9 @@ use faber::deploy::Inputs;
 use faber::{Cli, run};
 use faber_api_types::workload::WorkloadSpec;
 use serde_json::{Value, json};
-use wiremock::matchers::{any, body_json, method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{
+    any, body_json, method, path, path_regex, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cli(server: &MockServer, args: &[&str]) -> Cli {
@@ -1201,7 +1203,7 @@ async fn cluster_key_export_of_an_unreadable_path_holds_no_key() {
         dir.path().to_str().unwrap(),
     ];
     let (err, out) = run_err(&server, &args).await;
-    assert!(err.contains("root or faber"), "{err}");
+    assert!(err.contains("not a regular file"), "{err}");
     assert!(out.is_empty());
 }
 
@@ -1221,58 +1223,31 @@ async fn cluster_key_export_of_an_empty_file_is_an_error() {
 // ---- app ls ----
 
 fn workload_list_body() -> Value {
-    let summary = |name: &str, scale: Value, expose: &str, revision: u64| {
+    let summary = |name: &str, scale: Value, expose: &str, revision: u64, up: u32, want: u32| {
         json!({
             "project": "shop", "environment": "staging", "name": name,
             "fqdn": format!("{name}.staging.shop.faber.internal"),
             "scale": scale, "expose": expose, "revision": revision,
+            "available": up, "desired": want,
         })
     };
     json!({"workloads": [
-        summary("db", json!({"replicas": {"count": 1, "strategy": "spread"}}), "environment", 4),
-        summary("logs", json!("daemon"), "environment", 5),
-        summary("web", json!({"replicas": {"count": 3, "strategy": "pack"}}), "cluster", 7),
+        summary("db", json!({"replicas": {"count": 1, "strategy": "spread"}}), "environment", 4, 1, 1),
+        summary("logs", json!("daemon"), "environment", 5, 1, 3),
+        summary("web", json!({"replicas": {"count": 3, "strategy": "pack"}}), "cluster", 7, 2, 3),
     ]})
-}
-
-/// Mounts the `app show` route of `name` with the given scale and replica
-/// reports. It fails the test when asked for the env values.
-async fn mount_replicas(server: &MockServer, name: &str, scale: Value, replicas: Value) {
-    let mut body = workload_body();
-    body["name"] = json!(name);
-    body["spec"]["scale"] = scale;
-    body["replicas"] = replicas;
-    Mock::given(method("GET"))
-        .and(path(workload_route(name)))
-        .and(query_param_is_missing("reveal"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .mount(server)
-        .await;
-}
-
-fn replica(node: u64, index: u32, state: &str) -> Value {
-    json!({"node": node, "replica_index": index, "revision": 7, "state": state})
-}
-
-async fn mount_list_replicas(server: &MockServer) {
-    let count = |count: u32| json!({"replicas": {"count": count, "strategy": "spread"}});
-    mount_replicas(server, "db", count(1), json!([replica(1, 0, "available")])).await;
-    // Daemon: desired is the nodes that hold a replica.
-    let logs = json!([
-        replica(1, 0, "available"),
-        replica(2, 1, "deploying"),
-        replica(3, 2, "unavailable"),
-    ]);
-    mount_replicas(server, "logs", json!("daemon"), logs).await;
-    // Fewer reports than replicas wanted: the rest are not available.
-    let web = json!([replica(1, 0, "available"), replica(2, 1, "available")]);
-    mount_replicas(server, "web", count(3), web).await;
 }
 
 #[tokio::test]
 async fn app_ls_text_and_json() {
     let server = MockServer::start().await;
-    mount_list_replicas(&server).await;
+    // The list says it all: no workload is read on its own.
+    Mock::given(method("GET"))
+        .and(path_regex("^/api/v1/projects/.*/workloads/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workloads"))
         .and(query_param("project", "shop"))
@@ -1293,7 +1268,7 @@ web   shop     staging      3 (pack)    2/3        cluster      web.staging.shop
 "
     );
 
-    // JSON is the list as it came, so it needs no per-workload reads.
+    // JSON is the list as it came.
     let out = run_ok(&server, &[&["-o", "json"][..], &args].concat()).await;
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v, workload_list_body());
@@ -1302,7 +1277,6 @@ web   shop     staging      3 (pack)    2/3        cluster      web.staging.shop
 #[tokio::test]
 async fn app_ls_sends_only_the_filters_it_was_given() {
     let server = MockServer::start().await;
-    mount_list_replicas(&server).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/workloads"))
         .and(query_param_is_missing("project"))
@@ -1546,8 +1520,6 @@ async fn text_output_escapes_control_characters_from_the_api() {
     list["workloads"][0]["environment"] = json!("stag\u{8}ing");
     list["workloads"][0]["fqdn"] = json!("db\u{1b}c");
     mount_json(&server, "GET", "/api/v1/workloads", 200, list).await;
-    // The first entry's name is no DNS label, so it is never read.
-    mount_replicas(&server, "logs", json!("daemon"), json!([])).await;
 
     let mut project = project_body();
     project["name"] = json!("sh\u{1b}op");
@@ -1614,7 +1586,7 @@ async fn text_output_escapes_control_characters_from_the_api() {
     let (out, _) = run_fx(&server, &["app", "ls"]).await.ok();
     assert!(
         out.contains(
-            "d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1 (spread)  -          environment  db\\x1bc\n"
+            "d\\x1b[31mb  sh\\x0aop  stag\\x08ing  1 (spread)  1/1        environment  db\\x1bc\n"
         ),
         "{out}"
     );
