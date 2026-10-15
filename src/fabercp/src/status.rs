@@ -33,6 +33,12 @@ use crate::service::{FaberService, ServiceError, ServiceResult};
 /// next tick sends fresh state anyway.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Least real time between two reports. The wait is the interval in lease
+/// seconds, which a test runs a thousand times faster than real time; every
+/// report is a raft write, so it has a floor. The shortest interval an admin
+/// can set is one second, so production never reaches it.
+const MIN_REPORT_WAIT: Duration = Duration::from_secs(1);
+
 /// What this node's runner knows about its replicas.
 pub trait ReplicaSource: Send + Sync {
     /// Every replica on this node, in any order.
@@ -220,7 +226,9 @@ impl<S: ReportSink> Reporter<S> {
                     }
                 }
             }
-            let wait = second.saturating_mul(u32::try_from(interval()).unwrap_or(u32::MAX));
+            let wait = second
+                .saturating_mul(u32::try_from(interval()).unwrap_or(u32::MAX))
+                .max(MIN_REPORT_WAIT);
             tokio::select! {
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
@@ -548,6 +556,36 @@ mod tests {
             .map(|w| (w[1].0 - w[0].0).as_secs())
             .collect();
         assert_eq!(gaps, vec![5, 5, 5, 20]);
+    }
+
+    /// Tests run the lease clock a thousand times faster; reports must not
+    /// follow it down to milliseconds and flood raft.
+    #[tokio::test(start_paused = true)]
+    async fn reports_are_never_closer_together_than_the_floor() {
+        let recorder = Recorder::default();
+        let reporter = Reporter::new(
+            1,
+            String::new(),
+            recorder.clone(),
+            Arc::new(NoReplicas),
+            Arc::new(FixedCapacity(Capacity::default())),
+        );
+        let cancel = CancellationToken::new();
+        let task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                reporter.run(|| 5, Duration::from_millis(1), &cancel).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        cancel.cancel();
+        task.await.unwrap();
+        let sent = recorder.sent.lock().unwrap();
+        assert!(sent.len() <= 11, "{} reports in ten seconds", sent.len());
+        assert!(
+            sent.windows(2).all(|w| w[1].0 - w[0].0 >= MIN_REPORT_WAIT),
+            "reports closer than {MIN_REPORT_WAIT:?}"
+        );
     }
 
     /// Fails twice, then works.
