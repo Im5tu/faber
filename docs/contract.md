@@ -1,20 +1,25 @@
 # Mesh and workload contract
 
-Shared names and formats for the WireGuard mesh, the container network, node leases, the containerd config, and projects, environments and workloads. Code is the source of truth for types; this file pins everything that crosses a process, file or script boundary.
+Shared names and formats for the WireGuard mesh, the container network, node leases, the containerd config, projects, environments and workloads, and the services that run them: encryption, placement, status, virtual IPs, DNS and the runner. Code is the source of truth for types; this file pins everything that crosses a process, file or script boundary.
 
-All nodes in a cluster must run the same fabercp version. The raft log carries the mesh commands and the project and workload commands, and older builds cannot decode them.
+All nodes in a cluster must run the same fabercp and faber-node version. The raft log carries the mesh, project, workload, key, placement, status and service commands, and other builds cannot decode them. There is no data migration: a cluster whose records have another shape is created again.
 
-fabercp stores workloads and does not run them yet. Nothing in this version starts a container from a workload record.
+fabercp stores workloads and runs them as containers, through faber-node, on the nodes that placement chooses. Each service has a virtual IP behind a `.faber.local` DNS name. Container logs and registry authentication are not done.
 
 ## Crate layout
 
 | Crate | Path | Holds |
 |---|---|---|
 | `fabercp` | `src/fabercp` | raft, API, mesh state, node leases, project and workload state, and the reconcile loop |
-| `faber` | `src/faber` | CLI. Depends on `faber-api-types` and `faber-workload-import` |
+| `faber-node` | `src/faber-node` | the root helper: CRI calls, volumes, mounts and the containerd and CNI config, from typed requests (see "faber-node") |
+| `faber` | `src/faber` | CLI. Depends on `faber-api-types` and `faber-crypto` |
 | `faber-api-types` | `crates/api-types` | DTOs, the workload model and its validation, error codes, HTTP client |
 | `faber-network-management` | `crates/network-management` | WireGuard (`ip`, `wg`) and nftables (`nft`) |
-| `faber-container-runtime` | `crates/container-runtime` | the runtime spec, the containerd drop-in writer and the CNI network config writer |
+| `faber-container-runtime` | `crates/container-runtime` | the runtime spec, the containerd drop-in writer and the CNI network config writer. faber-node uses the writers |
+| `faber-node-protocol` | `crates/node-protocol` | the typed frames between fabercp and faber-node, the pod bridge name and the shared container subnet rule |
+| `faber-cri` | `crates/cri` | the CRI v1 client trait, a gRPC client over containerd's socket (unix only), and an in-memory fake. The generated code is checked in from the vendored `cri-api` proto, so builds need no `protoc` |
+| `faber-image` | `crates/image` | image pulls through the CRI client, anonymous only, with a hook for registry auth |
+| `faber-crypto` | `crates/crypto` | envelope encryption: cluster key, data keys, sealed values and env digests |
 
 fabercp does not know how WireGuard, nftables or containerd are driven. It builds two serde shapes from raft state and passes each to a `reconcile` call that applies it idempotently.
 
@@ -22,11 +27,9 @@ fabercp does not know how WireGuard, nftables or containerd are driven. It build
   - `WireGuardSpec { private_key, listen_port, address, peers, routes }`. `routes` lists the networks that `ip route replace` sends into the interface. It defaults to empty when absent.
   - `WireGuardPeer { public_key, endpoint?, allowed_ips, keepalive }`. `allowed_ips` is a list of IPv4 networks, rendered as one `AllowedIPs = <net>, <net>` line in list order. A peer with an empty list gets no `AllowedIPs` line.
   - `FirewallSpec { wg_port, peer_port, peer_endpoint_ips, peer_mesh_ips, containers? }`. `containers` is `ContainerFirewall { cidr, local_subnet?, node_mesh_ips, bridge }`: the container range, this node's subnet once it has one, the mesh IPs of the other registered nodes, and the name of the container bridge (`faberbr0`). The bridge name goes into the nft script as it is, so `apply` refuses one that is not a valid interface name, and one that equals the mesh interface name. Without `containers` the table has no `node_mesh_ips` set and a forward chain that only drops.
-- `NodeRuntimeSpec { settings: ContainerRuntimeSpec, pod_network: PodNetworkSpec? }` goes to `ContainerRuntime::reconcile`, which returns whether the host changed. `settings` is `ContainerRuntimeSpec { systemd_cgroup, sandbox_image, cni_bin_dir, cni_conf_dir }`, replicated as it is. `pod_network` is `PodNetworkSpec { bridge, subnet, mtu }` and is absent until raft has given the node a subnet. `Containerd { conf_dir, cni_conf_dir }` is the one implementation: `conf_dir` is where it writes the drop-in, `cni_conf_dir` where it writes the CNI network config. The trait has a second method, `remove_pod_network`, for a node that is leaving the mesh. It removes the CNI network config and nothing else, needs no settings, does not read or write the drop-in, and returns whether it removed a file. Another runtime is another implementation of the trait, with no change to fabercp.
+- `NodeRuntimeSpec { pod_network: PodNetworkSpec? }` goes to `ContainerRuntime::reconcile`, which returns whether the host changed. `pod_network` is `PodNetworkSpec { subnet, mtu }` and is absent until raft has given the node a subnet. In fabercp the implementation sends `configure_runtime` to faber-node, which writes the files (see "containerd and CNI config"). The trait has a second method, `remove_pod_network`, for a node that is leaving the mesh. It sends `remove_cni_config` and returns whether a file was removed. `Containerd { conf_dir, cni_conf_dir, cni_bin_dir, sandbox_image, bridge }` is the implementation faber-node writes the files with.
 
-`Containerd.cni_conf_dir` comes from `FABER_CNI_CONF_DIR` and is the directory this host writes to. `ContainerRuntimeSpec.cni_conf_dir` is replicated and is the directory containerd is told to read. fabercp logs a warning when the two differ, because containerd would then never see the file.
-
-`fabercp::reconcile` holds the mapping (`desired_network`, `desired_runtime`) and one loop. The loop runs after a state change, once changes have been quiet for 1s or 5s after the first one, and every `FABER_RECONCILE_INTERVAL_SECS`. It also wakes when the earliest live invite expires, so an expired invite leaves the wg peer list and the nft sets within a second or so. Each run calls `network.reconcile` and then `runtime.reconcile`. A failure in one does not skip the other. Startup makes the same two calls before the peer listener binds, and there a failure exits. The loop starts from the state startup applied, so startup applies it once.
+`fabercp::reconcile` holds the mapping (`desired_network`, `desired_runtime`) and one loop. The loop runs after a state change, once changes have been quiet for 1s or 5s after the first one, and every `FABER_RECONCILE_INTERVAL_SECS`. It also wakes when the earliest live invite expires, so an expired invite leaves the wg peer list and the nft sets within a second or so. The loop is a list of steps, run in order: network, runtime, services, containers. Each step has its own desired value, computed from the replicated state, and applies only when that value changes or on the periodic resync, so a status write re-runs only the steps whose desired state it changed. A failure in one step is logged, the later steps still run, and the loop backs off from 1 s to 30 s. Startup applies the steps that are required then, the network and services steps, before the peer listener binds, and a failure there exits. The runtime and containers steps are left to the loop's first pass, since faber-node may start later.
 
 `faber-network-management` owns `CommandRunner`, `SystemRunner` and the recording fake that tests inject.
 
@@ -43,15 +46,22 @@ fabercp does not know how WireGuard, nftables or containerd are driven. It build
 | `/var/lib/faber/join-failed` | faber:faber | 0644 | fabercp, after a rejected invite or a removal from the mesh. `install.sh --join <token> --reset`, staged in a root-only directory and renamed into place with `mv -fT` | empty marker: the identity and raft data are to be removed at the next start, see "Rejected invite" |
 | `/var/lib/faber/bootstrap-error` | faber:faber | 0600 | fabercp, temp file + rename | why this node is not in its mesh: one fixed code and a newline, see "bootstrap-error" |
 | `/var/lib/faber/data/` | faber:faber | 0700 | fabercp | RocksDB (`FABER_DATA_DIR`) |
+| `/var/lib/faber/cluster.key` | faber:faber | 0600 | fabercp, temp file + rename: at `cluster init`, or from the register reply on a joiner | the cluster key, base64 and a newline. Removed when the node leaves the cluster (`FABER_CLUSTER_KEY_FILE`) |
+| `/etc/faber/faber-node.env` | root:root | 0640 | install.sh | faber-node's settings (see "faber-node") |
+| `/usr/local/sbin/faber-node` | root:root | 0755 | install.sh | the binary (`FABER_NODE_INSTALL_DIR`). Never under `$FABER_HOME`, which the faber user owns |
+| `/run/faber/` | root:root | 0755 | systemd `RuntimeDirectory=faber` | socket directory |
+| `/run/faber/node.sock` | root:faber | 0660 | faber-node | its socket |
+| `/var/lib/faber-node/` | root:root | 0755 | systemd `StateDirectory=faber-node` | faber-node's state |
+| `/var/lib/faber-node/volumes/` | root:root | 0755 | faber-node | block volumes and ramdisks (see "Volumes") |
 | `/etc/containerd/config.toml` | root:root | 0644 | install.sh | root config |
-| `/etc/containerd/conf.d/` | faber:faber | 0755 | install.sh | drop-in dir |
-| `/etc/containerd/conf.d/faber.toml` | faber:faber | 0644 | fabercp, temp file + rename, only on change | drop-in |
-| `/etc/cni/net.d/` | faber:faber | 0755 | install.sh, which refuses a symlink or a non-directory at that path and touches nothing inside | CNI config dir (`CNI_CONF_DIR` for install.sh, `FABER_CNI_CONF_DIR` for fabercp) |
-| `/etc/cni/net.d/10-faber.conflist` | faber:faber | 0644 | fabercp, temp file + rename, only on change. fabercp removes it while the node has no container subnet | CNI network config, see "Container network" |
+| `/etc/containerd/conf.d/` | root:root | 0755 | install.sh; faber-node if missing | drop-in dir |
+| `/etc/containerd/conf.d/faber.toml` | root:root | 0644 | faber-node, temp file + rename, only on change | drop-in |
+| `/etc/cni/net.d/` | root:root | 0755 | install.sh, which refuses a symlink or a non-directory at that path and touches nothing inside; faber-node if missing | CNI config dir (`CNI_CONF_DIR` for install.sh, `FABER_NODE_CNI_CONF_DIR` for faber-node) |
+| `/etc/cni/net.d/10-faber.conflist` | root:root | 0644 | faber-node, temp file + rename, only on change. faber-node removes it while the node has no container subnet | CNI network config, see "Container network" |
 
 containerd loads the lexically first config in `/etc/cni/net.d`. install.sh warns and names every `.conf`, `.conflist` or `.json` file there that is not `10-faber.conflist`.
 
-"Bootstrapped" means `/var/lib/faber/identity.json` is a regular file and `fabercp.env` has no pending bootstrap line (`FABER_JOIN_TOKEN_FILE`, `FABER_NEW_MESH`, `FABER_MESH_CIDR`, `FABER_NODE_NAME`, `FABER_CONTAINER_CIDR`). install.sh strips those lines and removes `join.token` only after the cluster was created or joined. Until then a restart still carries them, and fabercp ignores them because an existing identity wins. The one exception is a join that is still pending when the token file holds a different invite (see "Replacing a pending join").
+"Bootstrapped" means `/var/lib/faber/identity.json` is a regular file and `fabercp.env` has no pending bootstrap line (`FABER_JOIN_TOKEN_FILE`, `FABER_NEW_MESH`, `FABER_MESH_CIDR`, `FABER_NODE_NAME`, `FABER_CONTAINER_CIDR`, `FABER_SERVICE_CIDR`). install.sh strips those lines and removes `join.token` only after the cluster was created or joined. Until then a restart still carries them, and fabercp ignores them because an existing identity wins. The one exception is a join that is still pending when the token file holds a different invite (see "Replacing a pending join").
 
 fabercp writes `identity.json` before it serves the API, so a node that answers `faber health` without an `identity.json` has had its invite rejected.
 
