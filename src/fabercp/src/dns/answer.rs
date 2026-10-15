@@ -8,7 +8,7 @@ use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode}
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 
-use super::ServiceIps;
+use super::{LookupFailed, ServiceIps};
 
 /// Seconds a client may cache a service address.
 const ANSWER_TTL: u32 = 30;
@@ -60,8 +60,11 @@ pub fn answer(packet: &[u8], ips: &dyn ServiceIps) -> Outcome {
     if query.query_class() != DNSClass::IN {
         return reply(&request, ResponseCode::Refused, None);
     }
-    let Some(ip) = service_ip(&labels, ips) else {
-        return reply(&request, ResponseCode::NXDomain, None);
+    let ip = match service_ip(&labels, ips) {
+        Ok(Some(ip)) => ip,
+        Ok(None) => return reply(&request, ResponseCode::NXDomain, None),
+        // Not knowing is not the same as there being no such service.
+        Err(LookupFailed) => return reply(&request, ResponseCode::ServFail, None),
     };
     let record = (query.query_type() == RecordType::A).then(|| a_record(query, ip));
     reply(&request, ResponseCode::NoError, record)
@@ -128,17 +131,21 @@ fn in_zone(labels: &[&[u8]]) -> bool {
 }
 
 /// The virtual IP of the service `labels` names, if it is a well-formed
-/// service name that has one.
-fn service_ip(labels: &[&[u8]], ips: &dyn ServiceIps) -> Option<Ipv4Addr> {
+/// service name that has one. `Ok(None)` for a name that is not a service
+/// name, or names a service without an address.
+fn service_ip(labels: &[&[u8]], ips: &dyn ServiceIps) -> Result<Option<Ipv4Addr>, LookupFailed> {
     if labels.len() != SERVICE_NAME_LABELS {
-        return None;
+        return Ok(None);
     }
     let label = |i: usize| -> Option<String> {
         let name = std::str::from_utf8(labels[i]).ok()?.to_ascii_lowercase();
         validate_dns_label(&name).ok()?;
         Some(name)
     };
-    ips.lookup(&label(2)?, &label(1)?, &label(0)?)
+    let (Some(project), Some(env), Some(svc)) = (label(2), label(1), label(0)) else {
+        return Ok(None);
+    };
+    ips.lookup(&project, &env, &svc)
 }
 
 fn a_record(query: &Query, ip: Ipv4Addr) -> Record {
@@ -268,6 +275,24 @@ mod tests {
         assert_eq!(m.metadata.id, 9);
         assert_eq!(m.metadata.response_code, ResponseCode::FormErr);
         assert_eq!(answer(&[1, 2, 3], &ips()), Outcome::Drop);
+    }
+
+    #[test]
+    fn dns_failed_lookup_is_servfail_not_nxdomain() {
+        let ips = ips();
+        ips.set_failing(true);
+        let m = reply_of(answer(
+            &query_packet("web.prod.shop.faber.local.", RecordType::A),
+            &ips,
+        ));
+        assert_eq!(m.metadata.response_code, ResponseCode::ServFail);
+        assert!(m.answers.is_empty());
+        // A name that is no service name never reaches the store.
+        let m = reply_of(answer(
+            &query_packet("bad_name.prod.shop.faber.local.", RecordType::A),
+            &ips,
+        ));
+        assert_eq!(m.metadata.response_code, ResponseCode::NXDomain);
     }
 
     #[test]
