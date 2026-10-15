@@ -14,7 +14,7 @@
 //! in real time. The limit is three intervals plus one tick, so a node that
 //! reports on time never reads `unavailable`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -326,6 +326,17 @@ impl StatusView {
             }
         }
         view
+    }
+
+    /// The revisions of one workload that some node reported a replica of,
+    /// whether or not the replica is placed on that node.
+    pub fn revisions(&self, project: &str, environment: &str, workload: &str) -> BTreeSet<u64> {
+        self.replicas
+            .iter()
+            .map(|(_, r)| r)
+            .filter(|r| r.project == project && r.environment == environment && r.workload == workload)
+            .map(|r| r.revision)
+            .collect()
     }
 
     /// The replicas of one workload at `revision`, one per replica in

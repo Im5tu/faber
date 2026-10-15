@@ -94,6 +94,7 @@ fn is_reserved(key: &str) -> bool {
         || keys::is_reserved_key(key)
         || status::is_reserved_key(key)
         || place::is_reserved_key(key)
+        || services::is_reserved_key(key)
 }
 
 fn reject(code: &str, message: impl Into<String>) -> Response {
@@ -112,6 +113,8 @@ pub struct PlacementView {
     pub statuses: BTreeMap<u64, NodeStatus>,
     /// The stored plans by `(project, environment)`.
     pub records: BTreeMap<(String, String), place::PlacementRecord>,
+    /// The virtual IP of each service.
+    pub service_ips: services::ServiceIps,
 }
 
 /// Builds snapshots from a point-in-time RocksDB snapshot, so it can run while
@@ -259,10 +262,10 @@ impl StateMachineStore {
                 }
             }
             EntryPayload::Normal(Request::AllocateServiceIp(cmd)) => {
-                services::apply_allocate_service_ip(cmd)
+                self.apply_allocate_service_ip(pending, cmd)?
             }
             EntryPayload::Normal(Request::ReleaseServiceIp(cmd)) => {
-                services::apply_release_service_ip(cmd)
+                self.apply_release_service_ip(pending, cmd)?
             }
             EntryPayload::Normal(req) => self.apply_mesh(pending, req)?,
             EntryPayload::Membership(m) => {
@@ -307,6 +310,59 @@ impl StateMachineStore {
             Ok(None) => Response::None,
             Err(rejection) => rejection.into(),
         })
+    }
+
+    /// Applies `AllocateServiceIp`: the workload gets the next free address
+    /// of the service range, once.
+    fn apply_allocate_service_ip(
+        &self,
+        pending: &mut Pending<'_>,
+        cmd: services::AllocateServiceIp,
+    ) -> Result<Response, StorageError> {
+        // A name that is no label has no record: the command refuses it.
+        let environment: Option<EnvironmentRecord> =
+            self.typed(pending, &env_key(&cmd.project, &cmd.environment))?;
+        let mesh = self.mesh(pending)?;
+        let stored: services::ServiceIps =
+            self.typed(pending, services::KEY_IPS)?.unwrap_or_default();
+        Ok(
+            match services::apply_allocate_service_ip(
+                mesh.as_ref(),
+                environment.as_ref(),
+                &stored,
+                cmd,
+            ) {
+                Ok(Some(next)) => {
+                    pending.put(services::KEY_IPS, &next)?;
+                    Response::None
+                }
+                Ok(None) => Response::None,
+                Err(rejection) => rejection.into(),
+            },
+        )
+    }
+
+    /// Applies `ReleaseServiceIp`: the address of a workload that is gone
+    /// is free again.
+    fn apply_release_service_ip(
+        &self,
+        pending: &mut Pending<'_>,
+        cmd: services::ReleaseServiceIp,
+    ) -> Result<Response, StorageError> {
+        let environment: Option<EnvironmentRecord> =
+            self.typed(pending, &env_key(&cmd.project, &cmd.environment))?;
+        let stored: services::ServiceIps =
+            self.typed(pending, services::KEY_IPS)?.unwrap_or_default();
+        Ok(
+            match services::apply_release_service_ip(environment.as_ref(), &stored, cmd) {
+                Ok(Some(next)) => {
+                    pending.put(services::KEY_IPS, &next)?;
+                    Response::None
+                }
+                Ok(None) => Response::None,
+                Err(rejection) => rejection.into(),
+            },
+        )
     }
 
     /// Applies `PlaceReplicas`: the plan of one environment is stored with
@@ -1008,13 +1064,35 @@ impl StateReader {
                 serde_json::from_slice(&value).map_err(|e| storage(&e))?,
             );
         }
+        let service_ips = view
+            .get_cf(data, services::KEY_IPS.as_bytes())
+            .map_err(|e| storage(&e))?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| storage(&e)))
+            .transpose()?
+            .unwrap_or_default();
         Ok(PlacementView {
             applied,
             mesh,
             environments,
             statuses,
             records,
+            service_ips,
         })
+    }
+
+    /// The virtual IP of every service. Empty before the first allocation.
+    pub fn service_ips(&self) -> Result<services::ServiceIps, ReadError> {
+        Ok(self.typed(services::KEY_IPS)?.unwrap_or_default())
+    }
+
+    /// The virtual IP of one service (a workload), `None` while it has none.
+    pub fn service_ip(
+        &self,
+        project: &str,
+        environment: &str,
+        workload: &str,
+    ) -> Result<Option<std::net::Ipv4Addr>, ReadError> {
+        Ok(self.service_ips()?.get(project, environment, workload))
     }
 
     /// The data key stored for `scope` (`cluster` or `<project>/<environment>`).
@@ -3454,38 +3532,276 @@ mod tests {
         drop(s);
     }
 
-    #[tokio::test]
-    async fn scaffold_commands_are_rejected_and_write_nothing() {
+    fn init_cluster_with_services(range: &str) -> Request {
+        Request::InitCluster {
+            mesh: MeshConfig {
+                service_cidr: Some(range.parse().unwrap()),
+                ..MeshConfig::default()
+            },
+            founder: founder(),
+            containerd: ContainerRuntimeSpec::default(),
+        }
+    }
+
+    fn allocate(project: &str, workload: &str) -> Request {
+        Request::AllocateServiceIp(services::AllocateServiceIp {
+            project: project.into(),
+            environment: "staging".into(),
+            workload: workload.into(),
+        })
+    }
+
+    fn release(project: &str, workload: &str) -> Request {
+        Request::ReleaseServiceIp(services::ReleaseServiceIp {
+            project: project.into(),
+            environment: "staging".into(),
+            workload: workload.into(),
+        })
+    }
+
+    fn vip(s: &Storage, workload: &str) -> Option<std::net::Ipv4Addr> {
+        s.reader.service_ip("shop", "staging", workload).unwrap()
+    }
+
+    /// A mesh with the service range, and `shop/staging` with `web` and `db`.
+    async fn services_cluster(range: &str) -> (tempfile::TempDir, Storage) {
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path()).unwrap();
         s.state_machine
-            .apply([normal(1, create_project("shop"))])
+            .apply([
+                normal(1, init_cluster_with_services(range)),
+                normal(2, create_project("shop")),
+                normal(3, deploy("shop", &[("db", "pg"), ("web", "nginx")], false)),
+            ])
             .await
             .unwrap();
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn a_service_gets_its_address_once_and_keeps_it_across_revisions() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        assert_eq!(s.reader.service_ips().unwrap(), Default::default());
+
+        assert_eq!(
+            apply_one(&mut s, 4, allocate("shop", "web")).await,
+            Response::None
+        );
+        assert_eq!(
+            apply_one(&mut s, 5, allocate("shop", "db")).await,
+            Response::None
+        );
+        let (web, db) = (vip(&s, "web").unwrap(), vip(&s, "db").unwrap());
+        assert_eq!(web.to_string(), "10.201.0.1");
+        assert_eq!(db.to_string(), "10.201.0.2");
         let before = dump(&s);
 
-        let commands = [
-            Request::AllocateServiceIp(services::AllocateServiceIp {
-                project: "shop".into(),
-                environment: "staging".into(),
-                workload: "web".into(),
-            }),
-            Request::ReleaseServiceIp(services::ReleaseServiceIp {
-                project: "shop".into(),
-                environment: "staging".into(),
-                workload: "web".into(),
-            }),
-        ];
-        let entries: Vec<Entry> = commands
-            .into_iter()
-            .enumerate()
-            .map(|(n, req)| normal(2 + n as u64, req))
-            .collect();
-        let replies = s.state_machine.apply(entries).await.unwrap();
-        assert_eq!(replies.len(), 2);
-        assert!(replies.iter().all(rejected("internal")), "{replies:?}");
+        // Asking again changes nothing, not even the record.
+        assert_eq!(
+            apply_one(&mut s, 6, allocate("shop", "web")).await,
+            Response::None
+        );
         assert_eq!(dump(&s), before);
+
+        // A new revision of the workload keeps the address.
+        let revision = |s: &Storage| {
+            s.reader
+                .environment("shop", "staging")
+                .unwrap()
+                .unwrap()
+                .workloads["web"]
+                .revision
+        };
+        let old = revision(&s);
+        apply_one(&mut s, 7, deploy("shop", &[("web", "nginx:2")], false)).await;
+        assert_ne!(revision(&s), old);
+        assert_eq!(vip(&s, "web"), Some(web));
+        apply_one(&mut s, 8, allocate("shop", "web")).await;
+        assert_eq!(vip(&s, "web"), Some(web));
+        assert_eq!(vip(&s, "db"), Some(db));
+    }
+
+    #[tokio::test]
+    async fn a_removed_workload_frees_its_address_and_a_held_one_is_not_reused() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        apply_one(&mut s, 4, allocate("shop", "web")).await;
+        apply_one(&mut s, 5, allocate("shop", "db")).await;
+        let (web, db) = (vip(&s, "web").unwrap(), vip(&s, "db").unwrap());
+
+        // Released while the workload exists: a stale leader. Nothing moves.
+        let before = dump(&s);
+        assert_eq!(
+            apply_one(&mut s, 6, release("shop", "web")).await,
+            Response::None
+        );
+        assert_eq!(dump(&s), before);
+        assert_eq!(vip(&s, "web"), Some(web));
+
+        // Removed, then released.
+        apply_one(&mut s, 7, remove_workloads("shop", &["web"])).await;
+        assert_eq!(vip(&s, "web"), Some(web), "removal alone does not release");
+        assert_eq!(
+            apply_one(&mut s, 8, release("shop", "web")).await,
+            Response::None
+        );
+        assert_eq!(vip(&s, "web"), None);
+        assert_eq!(vip(&s, "db"), Some(db));
+
+        // Releasing again, or something that never had an address, is fine.
+        let before = dump(&s);
+        assert_eq!(
+            apply_one(&mut s, 9, release("shop", "web")).await,
+            Response::None
+        );
+        assert_eq!(
+            apply_one(&mut s, 10, release("shop", "nope")).await,
+            Response::None
+        );
+        assert_eq!(dump(&s), before);
+
+        // A new workload gets neither a held address nor the freed one: the
+        // ring has not gone round.
+        apply_one(&mut s, 11, deploy("shop", &[("cache", "redis")], false)).await;
+        apply_one(&mut s, 12, allocate("shop", "cache")).await;
+        let cache = vip(&s, "cache").unwrap();
+        assert_ne!(cache, db);
+        assert_ne!(cache, web);
+        assert_eq!(cache.to_string(), "10.201.0.3");
+    }
+
+    #[tokio::test]
+    async fn the_address_of_a_removed_environment_is_released_by_name() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        apply_one(&mut s, 4, allocate("shop", "web")).await;
+        apply_one(&mut s, 5, remove_environment("shop", "staging")).await;
+        assert!(vip(&s, "web").is_some());
+        // With no environment the workload is gone: the release goes through.
+        assert_eq!(
+            apply_one(&mut s, 6, release("shop", "web")).await,
+            Response::None
+        );
+        assert_eq!(vip(&s, "web"), None);
+        // And an address cannot be asked for a workload that does not exist.
+        let reply = apply_one(&mut s, 7, allocate("shop", "web")).await;
+        assert!(rejected(ec::NOT_FOUND)(&reply), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn the_service_range_runs_out() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/30").await;
+        apply_one(&mut s, 4, deploy("shop", &[("cache", "redis")], false)).await;
+        apply_one(&mut s, 5, allocate("shop", "db")).await;
+        apply_one(&mut s, 6, allocate("shop", "web")).await;
+        let before = dump(&s);
+        let reply = apply_one(&mut s, 7, allocate("shop", "cache")).await;
+        assert!(rejected(ec::MESH_EXHAUSTED)(&reply), "{reply:?}");
+        assert_eq!(dump(&s), before);
+        assert_eq!(vip(&s, "cache"), None);
+        // Freeing one makes room.
+        apply_one(&mut s, 8, remove_workloads("shop", &["web"])).await;
+        apply_one(&mut s, 9, release("shop", "web")).await;
+        apply_one(&mut s, 10, allocate("shop", "cache")).await;
+        assert!(vip(&s, "cache").is_some());
+    }
+
+    #[tokio::test]
+    async fn service_ips_are_refused_without_a_mesh_a_range_or_a_workload() {
+        // No mesh.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let reply = apply_one(&mut s, 1, allocate("shop", "web")).await;
+        assert!(rejected(ec::MESH_NOT_CONFIGURED)(&reply), "{reply:?}");
+
+        // A mesh without a range.
+        s.state_machine
+            .apply([
+                normal(2, init_cluster()),
+                normal(3, create_project("shop")),
+                normal(4, deploy("shop", &[("web", "nginx")], false)),
+            ])
+            .await
+            .unwrap();
+        let reply = apply_one(&mut s, 5, allocate("shop", "web")).await;
+        assert!(rejected(ec::BAD_REQUEST)(&reply), "{reply:?}");
         drop(s);
+
+        // A range, but a workload the environment does not have, or a name
+        // that is no label.
+        let (_dir2, mut s) = services_cluster("10.201.0.0/16").await;
+        let before = dump(&s);
+        for req in [
+            allocate("shop", "nope"),
+            allocate("other", "web"),
+            allocate("shop", "Web"),
+            release("shop", "Web"),
+        ] {
+            let reply = apply_one(&mut s, 4, req.clone()).await;
+            assert!(
+                rejected(ec::NOT_FOUND)(&reply) || rejected(ec::BAD_REQUEST)(&reply),
+                "{req:?}: {reply:?}"
+            );
+        }
+        assert_eq!(dump(&s), before);
+    }
+
+    #[tokio::test]
+    async fn service_ips_cannot_be_written_with_set() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        let before = dump(&s);
+        let replies = s
+            .state_machine
+            .apply([
+                set(1, 4, "services/ips", json!({})),
+                set(1, 5, "services/other", json!(1)),
+            ])
+            .await
+            .unwrap();
+        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
+        assert_eq!(dump(&s), before);
+    }
+
+    /// Entries of one batch see each other, and the same entries give the
+    /// same addresses however they are batched.
+    #[tokio::test]
+    async fn allocation_is_deterministic() {
+        let entries = || {
+            vec![
+                normal(1, init_cluster_with_services("10.201.0.0/16")),
+                normal(2, create_project("shop")),
+                normal(3, deploy("shop", &[("db", "pg"), ("web", "nginx")], false)),
+                normal(4, allocate("shop", "web")),
+                normal(5, allocate("shop", "db")),
+                normal(6, remove_workloads("shop", &["web"])),
+                normal(7, release("shop", "web")),
+                normal(8, deploy("shop", &[("web", "nginx")], false)),
+                normal(9, allocate("shop", "web")),
+            ]
+        };
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut a = open(dir_a.path()).unwrap();
+        let mut b = open(dir_b.path()).unwrap();
+        a.state_machine.apply(entries()).await.unwrap();
+        for entry in entries() {
+            b.state_machine.apply([entry]).await.unwrap();
+        }
+        assert_eq!(dump(&a), dump(&b));
+        assert_eq!(vip(&a, "db").unwrap().to_string(), "10.201.0.2");
+        assert_eq!(vip(&a, "web").unwrap().to_string(), "10.201.0.3");
+        assert_eq!(vip(&a, "web"), vip(&b, "web"));
+        drop((a, b));
+    }
+
+    #[tokio::test]
+    async fn the_placement_view_has_the_service_ips() {
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        apply_one(&mut s, 4, allocate("shop", "web")).await;
+        let view = s.reader.placement_view().unwrap();
+        assert_eq!(view.service_ips, s.reader.service_ips().unwrap());
+        assert_eq!(
+            view.service_ips.get("shop", "staging", "web"),
+            vip(&s, "web")
+        );
     }
 
     #[tokio::test]

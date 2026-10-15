@@ -52,6 +52,7 @@ use self::step::{
     Planned, ReconcileStep, ReplicatedStateView, StepFuture, StepRunner, StepValue, spawn_steps,
 };
 use crate::config::DEFAULT_RECONCILE_INTERVAL_SECS;
+use crate::lease::LeaseTiming;
 use crate::mesh::state::{MeshConfig, MeshState, WG_KEEPALIVE_SECS};
 use crate::mesh::token::TokenPeer;
 use crate::mesh::{Identity, JoinPending, validate_public_key};
@@ -452,6 +453,9 @@ pub struct HostReconciler {
     /// (`--cni-conf-dir`). Only compared with the replicated setting, see
     /// [`cni_dir_warning`].
     pub cni_conf_dir: PathBuf,
+    /// The clocks of the lease task: how stale a node's report can look
+    /// though the node is on time ([`LeaseTiming::tick_clock_secs`]).
+    pub lease_timing: LeaseTiming,
     pub reader: StateReader,
 }
 
@@ -1163,6 +1167,7 @@ mod tests {
             join_pending: JoinPending::new(true),
             peer_port: 7401,
             cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
+            lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
         };
         let keys = |host: &HostReconciler| -> Vec<String> {
@@ -1836,6 +1841,7 @@ mod tests {
             join_pending: JoinPending::new(false),
             peer_port: 7401,
             cni_conf_dir: PathBuf::from(cni_conf_dir),
+            lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
         };
         let (replicated, elsewhere) = (host("/etc/cni/net.d"), host("/var/tmp/cni"));

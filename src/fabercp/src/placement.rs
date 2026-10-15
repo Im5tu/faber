@@ -25,16 +25,21 @@
 //!   `memory_bytes` against the capacity a node reported. Disk is not
 //!   reserved.
 //!
+//! The same pass gives every workload its virtual IP and takes back the
+//! address of a workload that is gone ([`service_ip_proposals`]).
+//!
 //! The leader runs the planner from [`spawn_placement_task`] on every change
 //! of the replicated state, which includes node reports and the lease
 //! clock's ticks.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use faber_api_types::workload::limits::MAX_REPLICAS;
 use faber_api_types::workload::{Scale, Strategy, VolumeSource};
+use ipnet::Ipv4Net;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +48,9 @@ use crate::apps::EnvironmentRecord;
 use crate::mesh::MeshState;
 use crate::raft::store::place::{
     MAX_REASON_BYTES, PlaceReplicas, PlacementRecord, ReplicaPlacement, reason,
+};
+use crate::raft::store::services::{
+    AllocateServiceIp, ReleaseServiceIp, ServiceIps, split_service_key,
 };
 use crate::raft::store::status::{Capacity, NodeStatus};
 use crate::raft::types::Request;
@@ -560,6 +568,72 @@ pub fn proposals(
     commands
 }
 
+/// What [`service_ip_proposals`] decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ServiceIpProposals {
+    pub commands: Vec<Request>,
+    /// Workloads without an address that wait because every address of the
+    /// range is held.
+    pub unserved: usize,
+}
+
+/// The commands that give every workload a virtual IP and take back the
+/// address of every service whose workload is gone. A workload gets its
+/// address here, where the planner first sees it, and keeps it for as long as
+/// it exists, whatever its revision.
+///
+/// At most as many allocations as there are free addresses are proposed, so
+/// that a full range does not make every change of the state propose
+/// commands that apply refuses (a refused entry still wakes the planner).
+/// Those that do not fit are counted as `unserved`. Without a service range
+/// nothing is allocated.
+pub fn service_ip_proposals(
+    environments: &[(String, String, EnvironmentRecord)],
+    ips: &ServiceIps,
+    range: Option<Ipv4Net>,
+) -> ServiceIpProposals {
+    let mut out = ServiceIpProposals::default();
+    let mut free = range.map_or(0, |range| ips.free(range));
+    for (project, environment, record) in environments {
+        for workload in record.workloads.keys() {
+            if ips.get(project, environment, workload).is_some() || range.is_none() {
+                continue;
+            }
+            if free == 0 {
+                out.unserved += 1;
+                continue;
+            }
+            free -= 1;
+            out.commands
+                .push(Request::AllocateServiceIp(AllocateServiceIp {
+                    project: project.clone(),
+                    environment: environment.clone(),
+                    workload: workload.clone(),
+                }));
+        }
+    }
+    let exists = |project: &str, environment: &str, workload: &str| {
+        environments
+            .iter()
+            .find(|(p, e, _)| p == project && e == environment)
+            .is_some_and(|(_, _, record)| record.workloads.contains_key(workload))
+    };
+    for key in ips.ips.keys() {
+        let Some((project, environment, workload)) = split_service_key(key) else {
+            continue;
+        };
+        if !exists(project, environment, workload) {
+            out.commands
+                .push(Request::ReleaseServiceIp(ReleaseServiceIp {
+                    project: project.to_string(),
+                    environment: environment.to_string(),
+                    workload: workload.to_string(),
+                }));
+        }
+    }
+    out
+}
+
 /// Longest wait for one proposal.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The planner runs at least this often while the node leads, in case no
@@ -601,6 +675,29 @@ impl FaberService {
                 }
                 Err(_) => {
                     tracing::debug!(%project, %environment, "placement timed out");
+                    return Ok(accepted);
+                }
+            }
+        }
+        // Virtual IPs from the same view: a workload gets its address in the
+        // pass that first sees it.
+        let range = mesh.config.service_cidr;
+        let services = service_ip_proposals(&view.environments, &view.service_ips, range);
+        if services.unserved > 0 {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    workloads = services.unserved,
+                    "the service range is full; workloads without a virtual IP wait for a free address"
+                );
+            }
+        }
+        for request in services.commands {
+            match tokio::time::timeout(WRITE_TIMEOUT, self.propose(request)).await {
+                Ok(Ok(_)) => accepted += 1,
+                Ok(Err(e)) => tracing::debug!(error = %e, "a virtual IP was not accepted"),
+                Err(_) => {
+                    tracing::debug!("a virtual IP timed out");
                     break;
                 }
             }
@@ -1441,5 +1538,119 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].environment, "gone");
         assert!(got[0].workloads.is_empty());
+    }
+
+    // ---- virtual IPs ----
+
+    fn two_workloads() -> Vec<(String, String, EnvironmentRecord)> {
+        let spec = serde_json::json!({"containers": [{"name": "app", "image": "nginx"}]});
+        vec![(
+            "shop".to_string(),
+            "staging".to_string(),
+            environment(5, &[("db", spec.clone()), ("web", spec)]),
+        )]
+    }
+
+    fn range(text: &str) -> Option<Ipv4Net> {
+        Some(text.parse().unwrap())
+    }
+
+    fn allocation(workload: &str) -> Request {
+        Request::AllocateServiceIp(AllocateServiceIp {
+            project: "shop".into(),
+            environment: "staging".into(),
+            workload: workload.into(),
+        })
+    }
+
+    #[test]
+    fn a_workload_without_an_address_is_allocated_one() {
+        let got = service_ip_proposals(
+            &two_workloads(),
+            &ServiceIps::default(),
+            range("10.201.0.0/16"),
+        );
+        assert_eq!(got.commands, [allocation("db"), allocation("web")]);
+        assert_eq!(got.unserved, 0);
+    }
+
+    #[test]
+    fn a_workload_with_an_address_proposes_nothing() {
+        let mut ips = ServiceIps::default();
+        let r = range("10.201.0.0/16").unwrap();
+        ips.allocate(r, "shop/staging/db");
+        ips.allocate(r, "shop/staging/web");
+        assert_eq!(
+            service_ip_proposals(&two_workloads(), &ips, Some(r)),
+            ServiceIpProposals::default()
+        );
+    }
+
+    #[test]
+    fn an_address_whose_workload_is_gone_is_released() {
+        let mut ips = ServiceIps::default();
+        let r = range("10.201.0.0/16").unwrap();
+        for key in [
+            "shop/staging/db",
+            "shop/staging/old",
+            "shop/production/web",
+            "gone/staging/web",
+        ] {
+            ips.allocate(r, key);
+        }
+        let got = service_ip_proposals(&two_workloads(), &ips, Some(r));
+        let released: Vec<String> = got
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Request::ReleaseServiceIp(r) => {
+                    Some(format!("{}/{}/{}", r.project, r.environment, r.workload))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released,
+            [
+                "gone/staging/web",
+                "shop/production/web",
+                "shop/staging/old"
+            ]
+        );
+        // `web` has no address yet and the range has room.
+        assert_eq!(got.commands[0], allocation("web"));
+        assert_eq!(got.unserved, 0);
+    }
+
+    #[test]
+    fn a_full_range_proposes_no_more_than_fits_and_counts_the_rest() {
+        let r = range("10.201.0.0/30").unwrap();
+        let mut ips = ServiceIps::default();
+        ips.allocate(r, "other/staging/a");
+        // One address left for two workloads.
+        let got = service_ip_proposals(&two_workloads(), &ips, Some(r));
+        let allocations = |commands: &[Request]| {
+            commands
+                .iter()
+                .filter(|c| matches!(c, Request::AllocateServiceIp(_)))
+                .count()
+        };
+        assert_eq!(allocations(&got.commands), 1);
+        assert_eq!(got.unserved, 1);
+        ips.allocate(r, "other/staging/b");
+        let got = service_ip_proposals(&two_workloads(), &ips, Some(r));
+        assert_eq!(got.unserved, 2);
+        // Only the releases of the two orphans remain.
+        assert!(
+            got.commands
+                .iter()
+                .all(|c| matches!(c, Request::ReleaseServiceIp(_)))
+        );
+    }
+
+    #[test]
+    fn without_a_service_range_nothing_is_allocated() {
+        let got = service_ip_proposals(&two_workloads(), &ServiceIps::default(), None);
+        assert_eq!(got, ServiceIpProposals::default());
     }
 }

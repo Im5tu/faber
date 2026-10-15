@@ -73,6 +73,7 @@ use crate::raft::store::StateReader;
 use crate::raft::types::{Node, NodeId, Raft};
 use crate::raft::{rpc, store};
 use crate::reconcile::step::{StepList, StepRunner, StepValue};
+use crate::reconcile::services::ServicesStep;
 use crate::reconcile::{HostReconciler, NetworkStep, ReconcileTiming, RuntimeStep};
 use crate::secrets::KeyDeliveryError;
 use crate::secrets::delivery::{KeyStep, key_step};
@@ -423,6 +424,7 @@ pub async fn start_with(
             join_pending: join_pending.clone(),
             peer_port: config.peer_port,
             cni_conf_dir: config.cni_conf_dir.clone(),
+            lease_timing: config.lease_timing,
             reader: reader.clone(),
         });
     let started = match &host {
@@ -464,6 +466,7 @@ pub async fn start_with(
                 // fixed there, and raft hands out the subnets.
                 container_cidr: Some(config.container_cidr),
                 container_subnet_prefix: DEFAULT_CONTAINER_SUBNET_PREFIX,
+                service_cidr: Some(config.service_cidr),
             },
             record: NodeRecord {
                 node_id,
@@ -820,8 +823,8 @@ async fn stored_member(data_dir: &Path, node_id: u64) -> anyhow::Result<bool> {
     Ok(member)
 }
 
-/// The host reconcile steps, in the order they run: network, then runtime
-/// configuration. Later steps are added here.
+/// The host reconcile steps, in the order they run: network, runtime
+/// configuration, then services. Later steps are added here.
 pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
     StepRunner::new(
         StepList::default()
@@ -836,6 +839,10 @@ pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
                 host.backends.runtime.clone(),
                 host.identity.node_id,
                 host.cni_conf_dir.clone(),
+            ))
+            .with(ServicesStep::new(
+                host.backends.network.clone(),
+                host.lease_timing,
             )),
     )
 }

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ReconcileTiming, next_invite_expiry, run_loop};
 use crate::mesh::state::MeshState;
-use crate::raft::store::{ReadError, StateReader};
+use crate::raft::store::{PlacementView, ReadError, StateReader};
 
 /// The future of [`ReconcileStep::apply`].
 pub type StepFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
@@ -35,6 +35,12 @@ pub struct ReplicatedStateView {
     pub mesh: Option<MeshState>,
     /// The replicated container runtime settings, `None` before `InitCluster`.
     pub containerd: Option<ContainerRuntimeSpec>,
+    /// The workloads, where they are placed, what the nodes reported and the
+    /// virtual IPs, from one read. `None` where a test has no cluster.
+    pub placement: Option<PlacementView>,
+    /// Seconds between two status reports, as the staleness of a report is
+    /// judged ([`crate::raft::store::status::IntervalSetting::effective`]).
+    pub status_interval_secs: u64,
     /// Unix seconds when the view was read.
     pub now: u64,
 }
@@ -42,9 +48,13 @@ pub struct ReplicatedStateView {
 impl ReplicatedStateView {
     /// Reads the view from `reader`.
     pub fn read(reader: &StateReader, now: u64) -> Result<Self, ReadError> {
+        let placement = reader.placement_view()?;
+        let clock = placement.mesh.as_ref().map_or(0, |m| m.clock);
         Ok(Self {
             mesh: reader.mesh()?,
             containerd: reader.containerd()?,
+            status_interval_secs: reader.status_setting()?.effective(clock),
+            placement: Some(placement),
             now,
         })
     }
@@ -450,6 +460,8 @@ mod tests {
 
     fn view() -> ReplicatedStateView {
         ReplicatedStateView {
+            placement: None,
+            status_interval_secs: 5,
             mesh: None,
             containerd: None,
             now: 0,
