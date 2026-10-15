@@ -32,6 +32,8 @@ base64 = { workspace = true }
 ipnet = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+hickory-proto = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
