@@ -774,7 +774,7 @@ const NOTE_CAPABILITIES: &str = "note: containers get no Linux capabilities unle
     them; images that expect Docker's default set may fail to start\n";
 
 const NOTE_SECRETS: &str = "note: an env variable name looks like a secret; env values are \
-    stored unencrypted in cluster state and are readable by local users on every node\n";
+    encrypted at rest, but the CLI always shows them\n";
 
 // ---- project ----
 
@@ -1759,7 +1759,6 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         json!({
             "result": deploy_body(),
             "notes": [NOTE_CAPABILITIES.trim_start_matches("note: ").trim_end()],
-            "variables": [],
         })
     );
 
@@ -1772,7 +1771,6 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         json!({
             "result": deploy_body(),
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
-            "variables": [],
         })
     );
 }
@@ -1825,7 +1823,6 @@ async fn deploy_dry_run_prints_the_spec_and_sends_nothing() {
             "environment": "staging",
             "spec": fixture_workloads("volume.json"),
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
-            "variables": [],
             "files": ["volume.json"],
         })
     );
@@ -2085,8 +2082,7 @@ async fn deploy_refused_by_the_api_is_readable() {
                 v,
                 json!({
                     "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
-                    "variables": [],
-                })
+                        })
             );
         }
     }
@@ -2324,7 +2320,7 @@ async fn deploy_json_that_cannot_connect_keeps_its_details_on_stderr() {
     let err = run("json").await;
     assert_eq!(err.matches('\n').count(), 1, "{err}");
     let v: Value = serde_json::from_str(&err).unwrap();
-    assert_eq!(v["variables"], json!([]));
+    assert!(v.get("variables").is_none());
     assert_eq!(
         v["notes"],
         json!([NOTE_CAPABILITIES.trim_start_matches("note: ").trim_end()])

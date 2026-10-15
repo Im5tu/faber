@@ -682,8 +682,6 @@ pub fn failure_text(errors: &[Diagnostic]) -> String {
 
 /// What a deploy says about itself, apart from its result.
 pub struct DeployDetails<'a> {
-    /// Names of the caller's variables whose value went into the workloads.
-    pub variables: &'a [String],
     /// The files read. Only a dry run lists them.
     pub files: Option<&'a [String]>,
     pub notes: &'a [String],
@@ -691,16 +689,12 @@ pub struct DeployDetails<'a> {
 
 impl DeployDetails<'_> {
     /// The stderr lines of text mode, which are written before anything is
-    /// sent: `uses variable: NAME`, `read: <path>` and
-    /// `note: ...`, one each. JSON mode has them in its document.
+    /// sent: `read: <path>` and `note: ...`, one each. JSON mode has them in its document.
     pub fn text(&self, format: OutputFormat) -> String {
         if format == OutputFormat::Json {
             return String::new();
         }
         let mut s = String::new();
-        for name in self.variables {
-            let _ = writeln!(s, "uses variable: {}", esc(name));
-        }
         for file in self.files.unwrap_or_default() {
             let _ = writeln!(s, "read: {}", esc(file));
         }
@@ -718,14 +712,12 @@ impl DeployDetails<'_> {
         #[derive(Serialize)]
         struct Details<'a> {
             notes: &'a [String],
-            variables: &'a [String],
         }
         if format != OutputFormat::Json {
             return Ok(String::new());
         }
         let mut line = serde_json::to_string(&Details {
             notes: self.notes,
-            variables: self.variables,
         })?;
         line.push('\n');
         Ok(line)
@@ -745,13 +737,11 @@ pub fn deployed(
     struct Deployed<'a> {
         result: &'a DeployResponse,
         notes: &'a [String],
-        variables: &'a [String],
     }
     if format == OutputFormat::Json {
         return pretty(&Deployed {
             result,
             notes: details.notes,
-            variables: details.variables,
         });
     }
     Ok(aligned(&[
@@ -781,7 +771,6 @@ pub fn dry_run(
         environment: &'a str,
         spec: &'a BTreeMap<String, WorkloadSpec>,
         notes: &'a [String],
-        variables: &'a [String],
         files: &'a [String],
     }
     if format == OutputFormat::Json {
@@ -790,7 +779,6 @@ pub fn dry_run(
             environment,
             spec,
             notes: details.notes,
-            variables: details.variables,
             files: details.files.unwrap_or_default(),
         });
     }
@@ -905,14 +893,12 @@ mod tests {
         let error = Diagnostic::new("f", "", "bad \x1b]0;title\x07");
         assert_eq!(failure_text(&[error]), "error: f: bad \\x1b]0;title\\x07\n");
         let details = DeployDetails {
-            variables: &["HO\u{202e}ME".to_string()],
             files: Some(&["a\nb.env".to_string()]),
             notes: &["note\x1b".to_string()],
         };
         assert_eq!(
             details.text(OutputFormat::Text),
-            "uses variable: HO\\u{202e}ME\n\
-             read: a\\x0ab.env\n\
+            "read: a\\x0ab.env\n\
              note: note\\x1b\n"
         );
         assert_eq!(details.text(OutputFormat::Json), "");

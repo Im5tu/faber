@@ -429,7 +429,6 @@ pub async fn run_with_inputs(
                 }
             };
             let details = output::DeployDetails {
-                variables: &[],
                 files: options.dry_run.then_some(&plan.files[..]),
                 notes: &plan.notes,
             };
