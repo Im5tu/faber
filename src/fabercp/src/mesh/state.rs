@@ -680,7 +680,7 @@ impl MeshState {
                 format!("the lease of node {node_id} has expired"),
             ));
         }
-        self.claim_instance(node_id, instance_id)?;
+        let _ = self.claim_instance(node_id, instance_id)?;
         let clock = self.clock;
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.lease_renewed_at = clock;
@@ -693,8 +693,9 @@ impl MeshState {
     /// accepts only that one (`forbidden` otherwise). A record without one
     /// (the founder's is created without one) adopts the one given, unless
     /// that is empty. Nothing changes when it fails. A node that is not in
-    /// the mesh is `mesh_node_removed`.
-    pub fn claim_instance(&mut self, node_id: u64, instance_id: &str) -> Result<(), Rejection> {
+    /// the mesh is `mesh_node_removed`. Answers whether it recorded an
+    /// instance id, that is whether the record changed.
+    pub fn claim_instance(&mut self, node_id: u64, instance_id: &str) -> Result<bool, Rejection> {
         let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
             Rejection::new(
                 error_code::MESH_NODE_REMOVED,
@@ -706,12 +707,11 @@ impl MeshState {
                 error_code::FORBIDDEN,
                 format!("node {node_id} is registered to another machine"),
             )),
-            Some(_) => Ok(()),
+            Some(_) => Ok(false),
+            None if instance_id.is_empty() => Ok(false),
             None => {
-                if !instance_id.is_empty() {
-                    node.instance_id = Some(instance_id.to_string());
-                }
-                Ok(())
+                node.instance_id = Some(instance_id.to_string());
+                Ok(true)
             }
         }
     }

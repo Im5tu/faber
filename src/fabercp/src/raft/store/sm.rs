@@ -215,15 +215,14 @@ impl StateMachineStore {
             // A report reads the mesh and writes only its own node's record:
             // it never goes through `apply_mesh`, which writes `mesh` back.
             EntryPayload::Normal(Request::ReportNode(cmd)) => {
-                let stored = self.mesh(pending)?;
-                let mut mesh = stored.clone();
+                let mut mesh = self.mesh(pending)?;
                 let key = status::node_key(cmd.node_id);
                 match status::apply_report_node(mesh.as_mut(), cmd) {
-                    Ok(record) => {
+                    Ok((record, mesh_changed)) => {
                         pending.put(&key, &record)?;
                         // Only a node's first report, which sets its
                         // instance id as a renewal does, changes the mesh.
-                        if let Some(mesh) = mesh.filter(|m| Some(m) != stored.as_ref()) {
+                        if let Some(mesh) = mesh.filter(|_| mesh_changed) {
                             pending.put(KEY_MESH, &mesh)?;
                         }
                         Response::None
@@ -232,9 +231,11 @@ impl StateMachineStore {
                 }
             }
             EntryPayload::Normal(Request::SetStatusInterval(cmd)) => {
-                match status::apply_set_status_interval(&cmd) {
-                    Ok(secs) => {
-                        pending.put(status::KEY_INTERVAL, &secs)?;
+                let current = self.typed(pending, status::KEY_INTERVAL)?;
+                let clock = self.mesh(pending)?.map_or(0, |m| m.clock);
+                match status::apply_set_status_interval(&cmd, current, clock) {
+                    Ok(setting) => {
+                        pending.put(status::KEY_INTERVAL, &setting)?;
                         Response::None
                     }
                     Err(r) => r.into(),
@@ -472,6 +473,7 @@ impl StateMachineStore {
                 "the cluster has no mesh",
             ));
         };
+        let mut gone = None;
         let result = match req {
             Request::CreateInvite {
                 invite_id,
@@ -509,9 +511,11 @@ impl StateMachineStore {
                 .map(|()| Response::None),
             Request::RemoveNode { node_id } => {
                 let members = self.member_ids(pending)?;
-                state
-                    .remove_node(node_id, &members)
-                    .map(|()| Response::None)
+                state.remove_node(node_id, &members).map(|()| {
+                    // A removed node has no status.
+                    gone = Some(node_id);
+                    Response::None
+                })
             }
             Request::SetLease { secs } => state.set_lease(secs).map(|()| Response::None),
             // Handled by the caller and above; kept total rather than panicking
@@ -538,6 +542,9 @@ impl StateMachineStore {
         Ok(match result {
             Ok(resp) => {
                 pending.put(KEY_MESH, &state)?;
+                if let Some(node_id) = gone {
+                    pending.delete(&status::node_key(node_id));
+                }
                 resp
             }
             // Discard `state`: a rejection leaves the stored record untouched.
@@ -853,7 +860,9 @@ impl StateReader {
     }
 
     /// Every node's status record by node id. All are read from one view of
-    /// the database. A node that never reported has none.
+    /// the database. A node that never reported has none. A record that
+    /// cannot be read is left out, and the first one is logged: one corrupt
+    /// record must not make every read of a workload fail.
     pub fn statuses(&self) -> Result<BTreeMap<u64, NodeStatus>, ReadError> {
         let storage = |e: &dyn std::fmt::Display| ReadError::Storage(e.to_string());
         let db = self.db.upgrade().ok_or(ReadError::Closed)?;
@@ -867,18 +876,35 @@ impl StateReader {
             };
             let id = std::str::from_utf8(id)
                 .ok()
-                .and_then(|id| id.parse::<u64>().ok())
-                .ok_or_else(|| storage(&"a status key is not status/<node id>"))?;
-            found.insert(id, serde_json::from_slice(&value).map_err(|e| storage(&e))?);
+                .and_then(|id| id.parse::<u64>().ok());
+            let record = serde_json::from_slice(&value).ok();
+            match (id, record) {
+                (Some(id), Some(record)) => {
+                    found.insert(id, record);
+                }
+                _ => {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            key = %String::from_utf8_lossy(&key),
+                            "a status record cannot be read and is ignored"
+                        );
+                    }
+                }
+            }
         }
         Ok(found)
     }
 
+    /// The status report interval with the one it replaced.
+    pub fn status_setting(&self) -> Result<status::IntervalSetting, ReadError> {
+        Ok(self.typed(status::KEY_INTERVAL)?.unwrap_or_default())
+    }
+
     /// Seconds between two status reports of a node.
     pub fn status_interval(&self) -> Result<u64, ReadError> {
-        Ok(self
-            .typed(status::KEY_INTERVAL)?
-            .unwrap_or(status::DEFAULT_INTERVAL_SECS))
+        Ok(self.status_setting()?.secs)
     }
 
     fn typed<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, ReadError> {
@@ -2340,7 +2366,7 @@ mod tests {
             revision: 3,
             replica_index: index,
             state,
-            pod_ip: Some("10.200.1.2".parse().unwrap()),
+            pod_ip: None,
             detail: None,
         }
     }
@@ -2543,6 +2569,77 @@ mod tests {
         );
         assert!(dump(&bare).is_empty());
         drop((s, bare));
+    }
+
+    #[tokio::test]
+    async fn an_expired_node_cannot_report_and_a_removed_node_loses_its_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let machine = "cd".repeat(16);
+        let mut entries = two_nodes();
+        entries.push(normal(
+            4,
+            report(
+                2,
+                &machine,
+                vec![replica("web", 0, ReplicaState::Available)],
+            ),
+        ));
+        entries.extend(expire_all_but_founder(5));
+        s.state_machine.apply(entries).await.unwrap();
+        assert_eq!(s.reader.statuses().unwrap().len(), 1);
+
+        // As for a renewal, once the lease has run out.
+        let replies = s
+            .state_machine
+            .apply([
+                normal(17, report(2, &machine, vec![])),
+                normal(18, Request::RemoveNode { node_id: 2 }),
+            ])
+            .await
+            .unwrap();
+        assert!(rejected(ec::MESH_LEASE_EXPIRED)(&replies[0]), "{replies:?}");
+        assert!(matches!(replies[1], Response::None), "{replies:?}");
+        assert!(s.reader.statuses().unwrap().is_empty());
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_status_record_that_cannot_be_read_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let mut entries = two_nodes();
+        entries.push(normal(
+            4,
+            report(
+                2,
+                &"cd".repeat(16),
+                vec![replica("web", 0, ReplicaState::Available)],
+            ),
+        ));
+        s.state_machine.apply(entries).await.unwrap();
+        let db = &s.state_machine.db;
+        db.put_cf(cf(db, CF_SM_DATA), b"status/7", b"{not json")
+            .unwrap();
+        db.put_cf(cf(db, CF_SM_DATA), b"status/x", b"{}").unwrap();
+        let got = s.reader.statuses().unwrap();
+        assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![2]);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_changed_interval_remembers_the_previous_one_on_the_lease_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path()).unwrap();
+        let set = |secs| Request::SetStatusInterval(status::SetStatusInterval { secs });
+        let mut entries = vec![normal(1, init_cluster())];
+        entries.push(normal(2, Request::AdvanceClock { elapsed_secs: 40 }));
+        entries.push(normal(3, set(30)));
+        s.state_machine.apply(entries).await.unwrap();
+        let got = s.reader.status_setting().unwrap();
+        assert_eq!((got.secs, got.previous_secs, got.changed_at), (30, 5, 40));
+        assert_eq!(got.effective(41), 30);
+        drop(s);
     }
 
     #[tokio::test]
