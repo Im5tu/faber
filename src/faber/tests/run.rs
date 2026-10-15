@@ -1225,6 +1225,11 @@ fn workload_body() -> Value {
                 },
             ],
         },
+        "replicas": [
+            {"node": 2, "replica_index": 0, "revision": 7, "state": "available",
+             "pod_ip": "10.200.2.5"},
+            {"node": 3, "replica_index": 1, "revision": 7, "state": "unavailable"},
+        ],
     })
 }
 
