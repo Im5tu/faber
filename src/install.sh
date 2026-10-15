@@ -37,11 +37,15 @@
 #     continue: in preflight, or right after the packages are installed when
 #     the ip command was missing until then.
 #   - containerd root config (root 0644, '# managed by faber'), which only
-#     imports $CONTAINERD_CONF_DIR/*.toml (faber:faber 0755; fabercp writes
-#     the drop-in). A config without the marker is backed up first to
+#     imports $CONTAINERD_CONF_DIR/*.toml (root:root 0755; faber-node writes
+#     the drop-in, faber.toml, 0644). A config without the marker is backed up first to
 #     config.toml.faber-bak.<epoch>.
-#   - $CNI_CONF_DIR (faber:faber 0755; fabercp writes 10-faber.conflist
-#     there). containerd loads the lexically first config in that directory,
+#   - $CNI_CONF_DIR (root:root 0755; faber-node writes 10-faber.conflist
+#     there, 0644). On upgrade both directories and files are handed to root.
+#     Preflight refuses both, $CNI_BIN_DIR and every parent of the three
+#     unless root owns them and neither group nor others can write them, and
+#     a plugin file in $CNI_BIN_DIR that is not root's or is group/world
+#     writable: faber-node refuses to start otherwise. containerd loads the lexically first config in that directory,
 #     so the script warns when it holds a config faber did not write.
 #   - Container subnets come from --container-cidr (new mesh only; fabercp
 #     has the default), which must not overlap the mesh CIDR. Container
@@ -231,6 +235,8 @@ readonly MIN_KERNEL_MAJOR=6
 readonly MIN_KERNEL_MINOR=3
 readonly CONTAINER_BRIDGE="faberbr0"
 readonly CNI_CONFLIST="10-faber.conflist"
+readonly CONTAINERD_DROPIN="faber.toml"
+readonly SANDBOX_IMAGE="registry.k8s.io/pause:3.10"
 # fabercp's marker for "remove the identity and the raft data at the next
 # start" (JOIN_FAILED_FILE in src/fabercp/src/mesh/identity.rs).
 readonly JOIN_FAILED_MARKER="join-failed"
@@ -339,8 +345,8 @@ Installs:
   \$FABER_ETC/fabercp.env                 root:faber 0640
   \$FABER_ETC/faber-node.env              root:root 0640
   containerd root config                 imports \$CONTAINERD_CONF_DIR/*.toml
-  \$CNI_CONF_DIR                          faber:faber 0755 (fabercp writes the
-                                         CNI network config there)
+  \$CONTAINERD_CONF_DIR, \$CNI_CONF_DIR   root:root 0755 (faber-node writes the
+                                         containerd drop-in and CNI config)
   systemd units                          ${FABERCP_UNIT}, ${FABER_NODE_UNIT},
                                          ${RELOAD_PATH_UNIT}, ${RELOAD_SERVICE_UNIT}
 fabercp, faber and faber-node must be next to this script (or in
@@ -508,7 +514,7 @@ validate_args() {
     usage_error "--mesh-cidr must be an IPv4 CIDR such as $DEFAULT_MESH_CIDR"
   fi
   if [[ -n "$CONTAINER_CIDR_ARG" ]] && ! valid_container_cidr "$CONTAINER_CIDR_ARG"; then
-    usage_error "--container-cidr must be an IPv4 CIDR that is a network address (no host bits set) with a prefix length of at most /$CONTAINER_CIDR_MAX_PREFIX, such as $DEFAULT_CONTAINER_CIDR"
+    usage_error "--container-cidr must be an IPv4 CIDR that is a network address (no host bits set) with a prefix length of at most /$CONTAINER_CIDR_MAX_PREFIX, that overlaps none of 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4 and 240.0.0.0/4, such as $DEFAULT_CONTAINER_CIDR"
   fi
   if [[ -n "$SERVICE_CIDR_ARG" ]] && ! valid_service_cidr "$SERVICE_CIDR_ARG"; then
     usage_error "--service-cidr must be an IPv4 CIDR that is a network address (no host bits set) with a prefix length of at most /$SERVICE_CIDR_MAX_PREFIX, such as $DEFAULT_SERVICE_CIDR"
@@ -591,11 +597,27 @@ valid_mesh_cidr() {
 
 # valid_container_cidr VALUE: IPv4 address/prefix with a prefix length of at
 # most $CONTAINER_CIDR_MAX_PREFIX (every node takes a /24 out of the range)
-# whose address is the network address. fabercp rejects a range with host
-# bits at cluster creation, and by then the env file is written.
+# whose address is the network address and that overlaps none of the reserved
+# blocks (check_container_subnet in crates/node-protocol/src/subnet.rs).
+# fabercp rejects the rest at cluster creation, and by then the env file is
+# written.
 valid_container_cidr() {
   valid_mesh_cidr "$1" && ((10#${1#*/} <= CONTAINER_CIDR_MAX_PREFIX)) &&
-    cidr_is_network "$1"
+    cidr_is_network "$1" && ! cidr_overlaps_reserved "$1"
+}
+
+# cidr_overlaps_reserved CIDR: a (valid) IPv4 CIDR shares an address with
+# 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4 or 240.0.0.0/4.
+cidr_overlaps_reserved() {
+  local start end block rstart rend
+  start="$(ipv4_to_int "${1%/*}")"
+  end=$((start | (0xFFFFFFFF >> 10#${1#*/})))
+  for block in 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+    rstart="$(ipv4_to_int "${block%/*}")"
+    rend=$((rstart | (0xFFFFFFFF >> ${block#*/})))
+    ((start <= rend && rstart <= end)) && return 0
+  done
+  return 1
 }
 
 # valid_service_cidr VALUE: like valid_container_cidr, with the longest prefix
@@ -953,7 +975,7 @@ install_cni() {
     verify_sha256 "$dir/$tgz" "$dir/$tgz.sha256" || die "checksum verification failed for $tgz"
   fi
   run_cmd install -d -m 0755 "$CNI_BIN_DIR"
-  run_cmd tar -C "$CNI_BIN_DIR" -xzf "$dir/$tgz"
+  run_cmd tar -C "$CNI_BIN_DIR" -xzf "$dir/$tgz" --no-same-owner
   if [[ "$DRY_RUN" == 1 ]]; then
     printf '+ echo %s > %s\n' "$ver" "$CNI_BIN_DIR/.version"
   else
@@ -1523,8 +1545,6 @@ render_env() {
   fi
   printf 'FABER_WG_PORT=%s\n' "$WG_PORT"
   printf 'FABER_MANAGE_HOST=1\n'
-  printf 'FABER_CONTAINERD_CONF_DIR=%s\n' "$CONTAINERD_CONF_DIR"
-  printf 'FABER_CNI_CONF_DIR=%s\n' "$CNI_CONF_DIR"
   if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
     printf 'FABER_NODE_SOCKET=%s\n' "$FABER_NODE_SOCKET"
   fi
@@ -1571,8 +1591,6 @@ NoNewPrivileges=yes
 StateDirectory=faber
 StateDirectoryMode=0700
 ProtectSystem=strict
-ReadWritePaths=$CONTAINERD_CONF_DIR
-ReadWritePaths=$CNI_CONF_DIR
 ProtectHome=yes
 PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
@@ -1609,7 +1627,9 @@ resolve_faber_ids() {
 # --env-file, not the process environment; call resolve_faber_ids first). The uid range must match the one
 # fabercp's placement hands out. Optional keys (SOCKET, VOLUME_ROOT,
 # CONTAINERD_SOCKET, RUNTIME_HANDLER) appear only when this run changes them
-# from faber-node's defaults; the volume root is faber-node's default.
+# from faber-node's defaults; the volume root is faber-node's default. The
+# config and plugin directories, the pause image and the mesh interface are
+# always written; the interface is fabercp's FABER_WG_INTERFACE.
 render_node_env() {
   printf '%s\n' "$MANAGED_MARKER"
   printf 'FABER_NODE_UID_MIN=%s\n' "$NODE_UID_MIN"
@@ -1618,6 +1638,11 @@ render_node_env() {
   printf 'FABER_NODE_FABER_GID=%s\n' "$FABER_ACCOUNT_GID"
   printf 'FABER_NODE_BIN_DIR=%s\n' "$FABER_NODE_BIN_DIR"
   printf 'FABER_NODE_SBIN_DIR=%s\n' "$FABER_NODE_SBIN_DIR"
+  printf 'FABER_NODE_CONTAINERD_CONF_DIR=%s\n' "$CONTAINERD_CONF_DIR"
+  printf 'FABER_NODE_CNI_CONF_DIR=%s\n' "$CNI_CONF_DIR"
+  printf 'FABER_NODE_CNI_BIN_DIR=%s\n' "$CNI_BIN_DIR"
+  printf 'FABER_NODE_SANDBOX_IMAGE=%s\n' "$SANDBOX_IMAGE"
+  printf 'FABER_NODE_MESH_INTERFACE=%s\n' "$WG_INTERFACE"
   if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
     printf 'FABER_NODE_SOCKET=%s\n' "$FABER_NODE_SOCKET"
   fi
@@ -1738,14 +1763,25 @@ is_managed_file() {
   [[ -f "$1" && ! -L "$1" ]] && grep -Fxq -- "$MANAGED_MARKER" "$1" 2>/dev/null
 }
 
+# hand_to_root FILE: an older install let the faber user own the files
+# faber-node now writes; make a regular FILE root:root 0644. A missing file is
+# left alone (faber-node creates it) and so is a symlink (faber-node replaces
+# it).
+hand_to_root() {
+  [[ -f "$1" && ! -L "$1" ]] || return 0
+  run_cmd chown root:root "$1"
+  run_cmd chmod 0644 "$1"
+}
+
 # configure_containerd_root: containerd's root config only imports the
-# drop-in directory, which fabercp fills. A config without the faber marker is
+# drop-in directory, which faber-node fills as root. A config without the faber marker is
 # backed up first. Sets ROOT_CONFIG_CHANGED.
 configure_containerd_root() {
   local conf="$CONTAINERD_ROOT_CONFIG" dir bak n=0
   dir="$(dirname "$conf")"
   [[ -d "$dir" ]] || run_cmd install -d -m 0755 "$dir"
-  run_cmd install -d -o "$FABER_USER" -g "$FABER_USER" -m 0755 "$CONTAINERD_CONF_DIR"
+  run_cmd install -d -o root -g root -m 0755 "$CONTAINERD_CONF_DIR"
+  hand_to_root "$CONTAINERD_CONF_DIR/$CONTAINERD_DROPIN"
   if [[ -e "$conf" || -L "$conf" ]] && ! is_managed_file "$conf"; then
     bak="$conf.faber-bak.$(date +%s)"
     while [[ -e "$bak" || -L "$bak" ]]; do
@@ -1762,7 +1798,7 @@ configure_containerd_root() {
 # foreign_cni_configs: names of the network configs in $CNI_CONF_DIR that
 # faber did not write, one per line in glob (sorted) order. Only the files
 # containerd would load count: regular files and symlinks ending in .conf,
-# .conflist or .json, dot files included (fabercp's own temp file ends in
+# .conflist or .json, dot files included (faber-node's own temp file ends in
 # .tmp).
 foreign_cni_configs() {
   local f name d="$CNI_CONF_DIR"
@@ -1785,16 +1821,18 @@ quote_names() {
   printf '%s\n' "$out"
 }
 
-# configure_cni_conf_dir: $CNI_CONF_DIR belongs to the faber user, because
-# fabercp writes $CNI_CONFLIST there (preflight has already refused a symlink
-# or non-directory). Nothing in it is touched. containerd loads the lexically
+# configure_cni_conf_dir: $CNI_CONF_DIR belongs to root, because faber-node
+# writes $CNI_CONFLIST there (preflight has already refused a symlink or
+# non-directory). Only $CNI_CONFLIST is touched, to hand an older install's
+# copy to root. containerd loads the lexically
 # first config in the directory, so a config from someone else can win over
 # faber's: warn and name it.
 configure_cni_conf_dir() {
   local parent foreign
   parent="$(dirname "$CNI_CONF_DIR")"
   [[ -d "$parent" ]] || run_cmd install -d -m 0755 "$parent"
-  run_cmd install -d -o "$FABER_USER" -g "$FABER_USER" -m 0755 "$CNI_CONF_DIR"
+  run_cmd install -d -o root -g root -m 0755 "$CNI_CONF_DIR"
+  hand_to_root "$CNI_CONF_DIR/$CNI_CONFLIST"
   foreign="$(foreign_cni_configs)"
   if [[ -n "$foreign" ]]; then
     warn "$CNI_CONF_DIR holds CNI configs that faber did not write: $(quote_names <<<"$foreign")"
@@ -2192,18 +2230,19 @@ check_faber_account() {
   done
 }
 
-# check_root_only_path PATH NAME: PATH, as far as it exists, and every ancestor
+# check_root_only_path PATH NAME [REASON]: PATH, as far as it exists, and every ancestor
 # must belong to root and not be writable by group or others (a sticky
 # directory such as /tmp is let through: others cannot replace root's entries
-# in it). Only checked as root; a non-root dry-run cannot tell.
+# in it; faber-node itself has no such exception). Only checked as root; a
+# non-root dry-run cannot tell.
 check_root_only_path() {
-  local dir="$1" name="$2" uid mode
+  local dir="$1" name="$2" reason="${3:-faber-node runs as root from there}" uid mode
   [[ "$EUID" == 0 ]] || return 0
   while [[ -n "$dir" && "$dir" != / ]]; do
     if [[ -e "$dir" || -L "$dir" ]]; then
       read -r uid mode < <(stat -L -c '%u %a' "$dir")
       if [[ "$uid" != 0 ]] || { (((8#$mode & 8#022) != 0)) && (((8#$mode & 8#1000) == 0)); }; then
-        die "$name: $dir must be owned by root and not group/world-writable (faber-node runs as root from there)"
+        die "$name: $dir must be owned by root and not group/world-writable (${reason})"
       fi
     fi
     dir="$(dirname "$dir")"
@@ -2239,6 +2278,29 @@ check_node_paths() {
   if [[ -e "$sock_dir" || -L "$sock_dir" ]]; then
     check_root_only_path "$sock_dir" FABER_NODE_SOCKET
   fi
+}
+
+# check_cfg_paths: faber-node, as root, writes into the containerd drop-in
+# and CNI config directories and runs the plugins in the CNI bin dir, and
+# refuses to start unless each of them and every directory above is root's
+# and not group/world-writable. The two config directories themselves are
+# made root's by configure_*, so an older install's faber-owned copy passes
+# here; only their parents are checked. A plugin file in the bin dir must pass
+# the same test (symlinks are followed, as faber-node does).
+check_cfg_paths() {
+  local f uid mode
+  local why="faber-node refuses to start otherwise"
+  check_root_only_path "$(dirname "$CONTAINERD_CONF_DIR")" CONTAINERD_CONF_DIR "$why"
+  check_root_only_path "$(dirname "$CNI_CONF_DIR")" CNI_CONF_DIR "$why"
+  check_root_only_path "$CNI_BIN_DIR" CNI_BIN_DIR "$why"
+  [[ "$EUID" == 0 && -d "$CNI_BIN_DIR" ]] || return 0
+  for f in "$CNI_BIN_DIR"/* "$CNI_BIN_DIR"/.[!.]*; do
+    [[ -f "$f" ]] || continue
+    read -r uid mode < <(stat -L -c '%u %a' "$f")
+    if [[ "$uid" != 0 ]] || (((8#$mode & 8#022) != 0)); then
+      die "CNI_BIN_DIR: $f must be owned by root and not group/world-writable (${why})"
+    fi
+  done
 }
 
 # kernel_release: what `uname -r` prints, unless FABER_KERNEL_RELEASE is set.
@@ -2319,6 +2381,7 @@ preflight() {
   check_config_paths
   check_stage_parents
   check_node_paths
+  check_cfg_paths
   resolve_mode
   check_wg_interface
   resolve_endpoint

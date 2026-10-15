@@ -306,7 +306,7 @@ teardown() {
   PATH="$TMP/bin:$PATH" run install_cni v1.9.1 amd64
   [ "$status" -eq 0 ]
   [[ "$output" == *"+ curl -fsSL --retry 3"*"cni-plugins-linux-amd64-v1.9.1.tgz"* ]]
-  [[ "$output" == *"+ tar -C $CNI_BIN_DIR -xzf"* ]]
+  [[ "$output" == *"+ tar -C $CNI_BIN_DIR -xzf"*" --no-same-owner"* ]]
   [ ! -e "$TMP/curl-called" ]
   [ ! -e "$CNI_BIN_DIR" ]
 }
@@ -1468,8 +1468,6 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     'FABER_WG_ENDPOINT=203.0.113.7:51820' \
     'FABER_WG_PORT=51820' \
     'FABER_MANAGE_HOST=1' \
-    "FABER_CONTAINERD_CONF_DIR=$CONTAINERD_CONF_DIR" \
-    "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" \
     'FABER_NEW_MESH=1' \
     'FABER_MESH_CIDR=10.99.0.0/16' \
     'FABER_SERVICE_CIDR=10.201.0.0/16')"
@@ -1497,8 +1495,6 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     'FABER_WG_ENDPOINT=203.0.113.7:51820' \
     'FABER_WG_PORT=51820' \
     'FABER_MANAGE_HOST=1' \
-    "FABER_CONTAINERD_CONF_DIR=$CONTAINERD_CONF_DIR" \
-    "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" \
     'FABER_NEW_MESH=1' \
     'FABER_MESH_CIDR=10.99.0.0/16' \
     'FABER_CONTAINER_CIDR=10.210.0.0/16' \
@@ -1516,7 +1512,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [[ "$output" != *"FABER_SERVICE_CIDR"* ]]
   [[ "$output" != *"FABER_WG_ENDPOINT"* ]]
   [[ "$output" != *"$TOKEN"* ]]
-  grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" <<<"$output"
+  [[ "$output" != *"CONF_DIR"* ]]
   WG_ENDPOINT="198.51.100.2:51820"
   run render_env 1
   [[ "$output" == *"FABER_WG_ENDPOINT=198.51.100.2:51820"* ]]
@@ -1533,7 +1529,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     [[ "$output" != *"FABER_SERVICE_CIDR"* ]]
     [[ "$output" != *"FABER_JOIN_TOKEN_FILE"* ]]
     [[ "$output" == *"FABER_MANAGE_HOST=1"* ]]
-    grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" <<<"$output"
+    [[ "$output" != *"CONF_DIR"* ]]
   done
   MODE=existing
   run render_env 1
@@ -1558,20 +1554,19 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     'Restart=always' 'RestartSec=2' 'AmbientCapabilities=CAP_NET_ADMIN' \
     'CapabilityBoundingSet=CAP_NET_ADMIN' 'NoNewPrivileges=yes' \
     'StateDirectory=faber' 'StateDirectoryMode=0700' 'ProtectSystem=strict' \
-    "ReadWritePaths=$CONTAINERD_CONF_DIR" 'ProtectHome=yes' 'PrivateTmp=yes' \
+    'ProtectHome=yes' 'PrivateTmp=yes' \
     'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
     '[Install]' 'WantedBy=multi-user.target'; do
     grep -qxF -- "$line" <<<"$output"
   done
 }
 
-@test "render_fabercp_unit: a second ReadWritePaths line for the CNI conf dir" {
+@test "render_fabercp_unit: no ReadWritePaths, faber-node owns the conf dirs" {
   run render_fabercp_unit
-  [ "$(grep -c '^ReadWritePaths=' <<<"$output")" = 2 ]
-  [ "$(grep '^ReadWritePaths=' <<<"$output")" = "$(printf '%s\n' \
-    "ReadWritePaths=$CONTAINERD_CONF_DIR" "ReadWritePaths=$CNI_CONF_DIR")" ]
-  # still inside [Service]
-  [ "$(grep -A1 -xF "ReadWritePaths=$CNI_CONF_DIR" <<<"$output" | tail -n 1)" = 'ProtectHome=yes' ]
+  [[ "$output" != *"ReadWritePaths"* ]]
+  [[ "$output" != *"$CONTAINERD_CONF_DIR"* ]]
+  [[ "$output" != *"$CNI_CONF_DIR"* ]]
+  [ "$(grep -A1 -xF 'ProtectSystem=strict' <<<"$output" | tail -n 1)" = 'ProtectHome=yes' ]
 }
 
 @test "render_reload units: path and oneshot service" {
@@ -1630,10 +1625,39 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ "$ROOT_CONFIG_CHANGED" = 1 ]
   [ "$(cat "$CONTAINERD_ROOT_CONFIG")" = "$(render_containerd_root_config)" ]
   [ "$(stat -c '%U:%G %a' "$CONTAINERD_ROOT_CONFIG")" = "root:root 644" ]
-  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "faber:faber 755" ]
+  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "root:root 755" ]
   ! ls "$TMP/etc/containerd" | grep -q faber-bak
   configure_containerd_root
   [ "$ROOT_CONFIG_CHANGED" = 0 ]
+}
+
+@test "configure_containerd_root: an upgrade hands the faber-owned conf dir and faber.toml to root" {
+  need_root_faber_account
+  mkdir -p "$CONTAINERD_CONF_DIR"
+  printf 'x\n' > "$CONTAINERD_CONF_DIR/faber.toml"
+  chown faber:faber "$CONTAINERD_CONF_DIR" "$CONTAINERD_CONF_DIR/faber.toml"
+  chmod 0664 "$CONTAINERD_CONF_DIR/faber.toml"
+  configure_containerd_root
+  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "root:root 755" ]
+  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR/faber.toml")" = "root:root 644" ]
+  [ "$(cat "$CONTAINERD_CONF_DIR/faber.toml")" = x ]
+}
+
+@test "configure_cni_conf_dir: an upgrade hands the faber-owned dir and conflist to root" {
+  need_root_faber_account
+  mkdir -p "$CNI_CONF_DIR"
+  printf 'x\n' > "$CNI_CONF_DIR/$CNI_CONFLIST"
+  chown faber:faber "$CNI_CONF_DIR" "$CNI_CONF_DIR/$CNI_CONFLIST"
+  chmod 0664 "$CNI_CONF_DIR/$CNI_CONFLIST"
+  configure_cni_conf_dir
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR/$CNI_CONFLIST")" = "root:root 644" ]
+}
+
+@test "configure_cni_conf_dir: fresh dir is root:root 0755 and stays empty" {
+  configure_cni_conf_dir
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
+  [ -z "$(ls -A "$CNI_CONF_DIR")" ]
 }
 
 @test "configure_containerd_root: foreign config is backed up first" {
@@ -1667,7 +1691,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ "$status" -eq 0 ]
   [[ "$output" == *"+ cp -pP -- $CONTAINERD_ROOT_CONFIG $CONTAINERD_ROOT_CONFIG.faber-bak."* ]]
   [[ "$output" == *"+ write $CONTAINERD_ROOT_CONFIG"* ]]
-  [[ "$output" == *"+ install -d -o faber -g faber -m 0755 $CONTAINERD_CONF_DIR"* ]]
+  [[ "$output" == *"+ install -d -o root -g root -m 0755 $CONTAINERD_CONF_DIR"* ]]
   [ "$(cat "$CONTAINERD_ROOT_CONFIG")" = foreign ]
 }
 
@@ -1684,12 +1708,14 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   grep -qxF 'FABER_WG_ENDPOINT=203.0.113.7:51820' "$FABER_ETC/fabercp.env"
   ! grep -q 'FABER_NEW_MESH\|FABER_MESH_CIDR' "$FABER_ETC/fabercp.env"
   [ "$(stat -c '%U:%G %a' "$CONTAINERD_ROOT_CONFIG")" = "root:root 644" ]
-  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "faber:faber 755" ]
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "faber:faber 755" ]
+  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "root:root 755" ]
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
   [ -z "$(ls -A "$CNI_CONF_DIR")" ]
   [ "$(ls -A "$TMP/etc/cni")" = net.d ]
-  grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" "$FABER_ETC/fabercp.env"
-  grep -qxF "ReadWritePaths=$CNI_CONF_DIR" "$SYSTEMD_UNIT_DIR/fabercp.service"
+  ! grep -q 'CONF_DIR' "$FABER_ETC/fabercp.env"
+  ! grep -q 'ReadWritePaths' "$SYSTEMD_UNIT_DIR/fabercp.service"
+  grep -qxF "FABER_NODE_CNI_CONF_DIR=$CNI_CONF_DIR" "$FABER_ETC/faber-node.env"
+  grep -qxF "FABER_NODE_MESH_INTERFACE=faber0" "$FABER_ETC/faber-node.env"
   [[ "$output" != *"WARN"* ]]
   [[ "$(cat "$FABER_ETC/fabercp.env")" != *"FABER_CONTAINER_CIDR"* ]]
   local u
@@ -1891,7 +1917,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [[ "$output" == *"203.0.113.7:51820"* ]]
   [[ "$output" == *"+ $FABER_CLI_DIR/faber cluster init"* ]]
   [[ "$output" == *"+ write $CONTAINERD_ROOT_CONFIG"* ]]
-  [[ "$output" == *"+ install -d -o faber -g faber -m 0755 $CNI_CONF_DIR"* ]]
+  [[ "$output" == *"+ install -d -o root -g root -m 0755 $CNI_CONF_DIR"* ]]
   [[ "$output" == *"cluster: would-create"* ]]
   [ ! -e "$TMP/executed" ]
   [ ! -e "$TMP/etc/cni" ]
@@ -2122,7 +2148,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ "$(pending_bootstrap)" = new ]
   printf 'FABER_NODE_NAME=web-01\n' > "$FABER_ETC/fabercp.env"
   [ "$(pending_bootstrap)" = new ]
-  printf 'FABER_CNI_CONF_DIR=/etc/cni/net.d\n' > "$FABER_ETC/fabercp.env"
+  printf 'FABER_WG_PORT=51820\n' > "$FABER_ETC/fabercp.env"
   [ "$(pending_bootstrap)" = none ]
   printf 'FABER_JOIN_TOKEN_FILE=/etc/faber/join.token\n' > "$FABER_ETC/fabercp.env"
   [ "$(pending_bootstrap)" = join ]
@@ -2866,6 +2892,29 @@ write_identity() {
   [ "$status" -eq 2 ]
 }
 
+@test "valid_container_cidr: refuses ranges overlapping reserved blocks" {
+  local bad ok
+  for bad in 0.0.0.0/8 0.1.0.0/16 127.0.0.0/8 127.1.0.0/16 169.254.0.0/16 169.254.1.0/24 \
+    224.0.0.0/4 230.0.0.0/8 239.0.0.0/24 240.0.0.0/4 250.0.0.0/8 255.255.255.0/24; do
+    run valid_container_cidr "$bad"
+    [ "$status" -ne 0 ]
+  done
+  # a range that holds a reserved block is refused too
+  run valid_container_cidr 128.0.0.0/1
+  [ "$status" -ne 0 ]
+  run valid_container_cidr 0.0.0.0/0
+  [ "$status" -ne 0 ]
+  for ok in 126.0.0.0/8 128.0.0.0/8 169.253.0.0/16 169.255.0.0/16 223.0.0.0/8 8.8.8.0/24 172.16.0.0/12; do
+    valid_container_cidr "$ok"
+  done
+}
+
+@test "script: --container-cidr in a reserved range exits 2" {
+  run bash "$SCRIPT" --dry-run --container-cidr 127.0.0.0/8
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--container-cidr must be"* ]]
+}
+
 @test "valid_container_cidr: IPv4 CIDRs with a prefix of at most 24" {
   valid_container_cidr 10.200.0.0/16
   valid_container_cidr 10.200.0.0/24
@@ -3028,7 +3077,7 @@ write_identity() {
   [ "$(count_calls 'try-restart fabercp')" = 0 ]
   run grep -q 'FABER_NEW_MESH\|FABER_MESH_CIDR\|FABER_CONTAINER_CIDR\|FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
   [ "$status" -eq 1 ]
-  grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" "$FABER_ETC/fabercp.env"
+  ! grep -q "CONF_DIR" "$FABER_ETC/fabercp.env"
   install_run --container-cidr 10.210.0.0/16
   [ "$status" -eq 1 ]
   [[ "$output" == *"--container-cidr only applies to a new mesh"* ]]
@@ -3053,14 +3102,14 @@ write_identity() {
   [[ "$output" == *"cluster: created"* ]]
 }
 
-@test "real run (join): no FABER_CONTAINER_CIDR, but FABER_CNI_CONF_DIR and the CNI dir" {
+@test "real run (join): no FABER_CONTAINER_CIDR, no conf dirs in fabercp.env, root-owned CNI dir" {
   setup_full_run
   install_run --join "$TOKEN"
   [ "$status" -eq 0 ]
   run grep -q 'FABER_CONTAINER_CIDR' "$FABER_ETC/fabercp.env"
   [ "$status" -eq 1 ]
-  grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" "$FABER_ETC/fabercp.env"
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "faber:faber 755" ]
+  ! grep -q "CONF_DIR" "$FABER_ETC/fabercp.env"
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
 }
 
 @test "real run (join): unfinished join refuses --container-cidr" {
@@ -3075,25 +3124,25 @@ write_identity() {
 
 # --- CNI conf dir ---------------------------------------------------------
 
-@test "configure_cni_conf_dir: creates the directory as faber:faber 0755, repairs owner and mode" {
+@test "configure_cni_conf_dir: creates the directory as root:root 0755, repairs owner and mode" {
   need_root_faber_account
   run configure_cni_conf_dir
   [ "$status" -eq 0 ]
   [[ "$output" != *"WARN"* ]]
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "faber:faber 755" ]
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
   [ "$(stat -c '%U:%G' "$TMP/etc/cni")" = "root:root" ]
   chown root:root "$CNI_CONF_DIR"
   chmod 0700 "$CNI_CONF_DIR"
   run configure_cni_conf_dir
   [ "$status" -eq 0 ]
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "faber:faber 755" ]
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
 }
 
 @test "configure_cni_conf_dir: dry-run prints install -d and creates nothing" {
   DRY_RUN=1
   run configure_cni_conf_dir
   [ "$status" -eq 0 ]
-  [[ "$output" == *"+ install -d -o faber -g faber -m 0755 $CNI_CONF_DIR"* ]]
+  [[ "$output" == *"+ install -d -o root -g root -m 0755 $CNI_CONF_DIR"* ]]
   [ ! -e "$TMP/etc/cni" ]
 }
 
@@ -3321,7 +3370,7 @@ EOF
   valid_container_cidr 10.200.0.0/16
   valid_container_cidr 10.128.0.0/9
   valid_container_cidr 10.200.4.0/22
-  valid_container_cidr 0.0.0.0/0
+  valid_container_cidr 128.0.0.0/3
   for bad in 10.200.1.5/16 10.200.1.0/16 10.200.0.1/24 10.200.5.0/22 10.0.0.0/0 010.200.000.000/16 010.200.001.000/16; do
     run valid_container_cidr "$bad"
     [ "$status" -ne 0 ]
@@ -4302,7 +4351,19 @@ removed_node() {
     'FABER_NODE_FABER_UID=990' \
     'FABER_NODE_FABER_GID=989' \
     'FABER_NODE_BIN_DIR=/usr/bin' \
-    'FABER_NODE_SBIN_DIR=/usr/sbin')" ]
+    'FABER_NODE_SBIN_DIR=/usr/sbin' \
+    "FABER_NODE_CONTAINERD_CONF_DIR=$CONTAINERD_CONF_DIR" \
+    "FABER_NODE_CNI_CONF_DIR=$CNI_CONF_DIR" \
+    "FABER_NODE_CNI_BIN_DIR=$CNI_BIN_DIR" \
+    'FABER_NODE_SANDBOX_IMAGE=registry.k8s.io/pause:3.10' \
+    'FABER_NODE_MESH_INTERFACE=faber0')" ]
+}
+
+@test "render_node_env: the mesh interface is the one fabercp is given" {
+  FABER_ACCOUNT_UID=990 FABER_ACCOUNT_GID=989 run render_node_env
+  grep -qxF "FABER_NODE_MESH_INTERFACE=$WG_INTERFACE" <<<"$output"
+  MODE=existing run render_env 0
+  grep -qxF "FABER_WG_INTERFACE=$WG_INTERFACE" <<<"$output"
 }
 
 @test "render_node_env: the uid range is the one placement allocates from" {
@@ -4604,6 +4665,66 @@ removed_node() {
   grep -qxF 'ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /srv/faber' <<<"$output"
   run render_faber_node_unit
   [[ "$output" != *"ExecStartPre"* ]]
+}
+
+@test "check_cfg_paths: the conf dirs, the bin dir and their parents must be root's alone" {
+  need_root_faber_account
+  local name
+  for name in CONTAINERD_CONF_DIR CNI_CONF_DIR CNI_BIN_DIR; do
+    mkdir -p "$TMP/loose/$name/leaf"
+    chmod 0777 "$TMP/loose/$name"
+    printf -v "$name" '%s' "$TMP/loose/$name/leaf"
+    run check_cfg_paths
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$TMP/loose/$name must be owned by root and not group/world-writable"* ]]
+    [[ "$output" == *"faber-node refuses to start"* ]]
+    chmod 0755 "$TMP/loose/$name"
+    chown 1234 "$TMP/loose/$name"
+    run check_cfg_paths
+    [ "$status" -eq 1 ]
+    chown 0 "$TMP/loose/$name"
+    run check_cfg_paths
+    [ "$status" -eq 0 ]
+  done
+}
+
+@test "check_cfg_paths: a faber-owned conf dir from an older install passes, a writable bin dir does not" {
+  need_root_faber_account
+  mkdir -p "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR" "$CNI_BIN_DIR"
+  chown faber:faber "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR"
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
+  chmod 0775 "$CNI_BIN_DIR"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CNI_BIN_DIR must be owned by root"* ]]
+}
+
+@test "check_cfg_paths: plugin files in the bin dir must be root's and not group/world-writable" {
+  need_root_faber_account
+  mkdir -p "$CNI_BIN_DIR"
+  printf 'v1.9.1\n' > "$CNI_BIN_DIR/.version"
+  printf '#!/bin/sh\n' > "$CNI_BIN_DIR/bridge"
+  chmod 0755 "$CNI_BIN_DIR/bridge"
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
+  chmod 0775 "$CNI_BIN_DIR/bridge"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CNI_BIN_DIR/bridge must be owned by root and not group/world-writable"* ]]
+  chmod 0755 "$CNI_BIN_DIR/bridge"
+  chown faber "$CNI_BIN_DIR/bridge"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  chown root "$CNI_BIN_DIR/bridge"
+  chmod 0666 "$CNI_BIN_DIR/.version"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+}
+
+@test "check_cfg_paths: missing directories pass" {
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
 }
 
 @test "check_node_paths: plain absolute paths only" {
