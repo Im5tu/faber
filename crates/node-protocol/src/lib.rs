@@ -14,7 +14,7 @@ mod replica;
 pub use frame::{FrameError, MAX_FRAME_BYTES, encode_frame, read_frame, write_frame};
 pub use message::{
     ContainerInfo, ContainerState, DnsConfig, ErrorCode, NodeError, ReplicaInfo, Request, Response,
-    SandboxState, SecretEnv, VolumeKind,
+    SandboxState, SecretEnv, VolumeInfo, VolumeKind,
 };
 pub use replica::{
     LABEL_CONTAINER, LABEL_ENV, LABEL_MANAGED, LABEL_PROJECT, LABEL_REPLICA, LABEL_REVISION,

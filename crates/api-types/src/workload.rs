@@ -888,8 +888,9 @@ fn check_probe(at: &str, probe: &Probe, out: &mut Vec<Violation>) {
     }
 }
 
-/// Headers the runner sets itself; a probe cannot override them.
-const RESERVED_PROBE_HEADERS: [&str; 4] =
+/// Headers the runner sets itself; a probe cannot override them. The runner
+/// skips them too, for a spec stored before this rule was checked.
+pub const RESERVED_PROBE_HEADERS: [&str; 4] =
     ["Host", "Content-Length", "Transfer-Encoding", "Connection"];
 
 /// `name`, `name:port`, `[v6]` or `[v6]:port`. A name is dot-separated DNS

@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 /// Largest frame body either side accepts: 4 MiB.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -17,7 +18,13 @@ pub enum FrameError {
 
 /// The length prefix and JSON body of `msg`.
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
-    let body = serde_json::to_vec(msg)?;
+    encode_zeroizing(msg).map(|bytes| bytes.to_vec())
+}
+
+/// [`encode_frame`] into buffers that are wiped when dropped: a frame may
+/// carry an env with secrets in it.
+fn encode_zeroizing<T: Serialize>(msg: &T) -> Result<Zeroizing<Vec<u8>>, FrameError> {
+    let body = Zeroizing::new(serde_json::to_vec(msg)?);
     if body.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge {
             len: body.len(),
@@ -28,7 +35,7 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
         len: body.len(),
         max: MAX_FRAME_BYTES,
     })?;
-    let mut out = Vec::with_capacity(4 + body.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(4 + body.len()));
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&body);
     Ok(out)
@@ -39,7 +46,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let bytes = encode_frame(msg)?;
+    let bytes = encode_zeroizing(msg)?;
     writer.write_all(&bytes).await?;
     writer.flush().await?;
     Ok(())
@@ -70,7 +77,7 @@ where
     if len > max {
         return Err(FrameError::TooLarge { len, max });
     }
-    let mut body = vec![0u8; len];
+    let mut body = Zeroizing::new(vec![0u8; len]);
     reader.read_exact(&mut body).await?;
     Ok(Some(serde_json::from_slice(&body)?))
 }

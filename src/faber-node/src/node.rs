@@ -330,6 +330,9 @@ impl<C: CriClient + Clone> Node<C> {
                 Ok(Response::Done)
             }
             Request::ListReplicas => self.list_replicas().await,
+            Request::ListVolumes => Ok(Response::Volumes {
+                volumes: self.volumes.list().await?,
+            }),
         }
     }
 

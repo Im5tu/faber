@@ -4,14 +4,24 @@ use std::net::Ipv4Addr;
 
 use faber_api_types::workload::{ContainerSpec, PortSpec};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::replica::ReplicaRef;
 
 /// Plaintext environment of a container. It may hold secrets, so `Debug`
-/// prints the variable names only.
+/// prints the variable names only, and the values are wiped when it is
+/// dropped.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretEnv(pub BTreeMap<String, String>);
+
+impl Drop for SecretEnv {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
+    }
+}
 
 impl fmt::Debug for SecretEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,6 +101,9 @@ pub enum Request {
         volume_name: String,
     },
     ListReplicas,
+    /// Every volume under faber-node's volume root, found on disk. Takes no
+    /// argument: no path is ever sent.
+    ListVolumes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +163,17 @@ pub struct ReplicaInfo {
     pub containers: Vec<ContainerInfo>,
 }
 
+/// One volume on the node: what `RemoveVolume` needs to name it, and its kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeInfo {
+    pub project: String,
+    pub env: String,
+    pub workload: String,
+    pub replica_index: u32,
+    pub volume: String,
+    pub kind: VolumeKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
@@ -170,6 +194,9 @@ pub enum Response {
     Done,
     Replicas {
         replicas: Vec<ReplicaInfo>,
+    },
+    Volumes {
+        volumes: Vec<VolumeInfo>,
     },
     Error {
         code: ErrorCode,
@@ -268,6 +295,7 @@ mod tests {
                 volume_name: "data".into(),
             },
             Request::ListReplicas,
+            Request::ListVolumes,
         ]
     }
 
@@ -317,6 +345,16 @@ mod tests {
                     }],
                 }],
             },
+            Response::Volumes {
+                volumes: vec![VolumeInfo {
+                    project: "shop".into(),
+                    env: "prod".into(),
+                    workload: "redis".into(),
+                    replica_index: 0,
+                    volume: "data".into(),
+                    kind: VolumeKind::Ramdisk,
+                }],
+            },
             Response::error(ErrorCode::Forbidden, "no"),
         ];
         for response in all {
@@ -333,6 +371,7 @@ mod tests {
                 .is_err()
         );
         assert!(serde_json::from_str::<Request>(r#"{"type":"list_replicas"}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"type":"list_volumes"}"#).is_ok());
     }
 
     #[test]

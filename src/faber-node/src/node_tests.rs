@@ -632,3 +632,51 @@ async fn a_failure_never_echoes_the_env() {
     assert!(error_code(&reply).is_some());
     assert!(!format!("{reply:?}").contains("hunter2"));
 }
+
+#[tokio::test]
+async fn list_volumes_answers_with_the_volumes_that_exist() {
+    let rig = rig();
+    for (name, kind) in [
+        ("scratch", VolumeKind::Ramdisk),
+        ("data", VolumeKind::Block),
+    ] {
+        let reply = rig
+            .node
+            .handle(Request::EnsureVolume {
+                replica: replica(),
+                volume_name: name.into(),
+                kind,
+                size_bytes: 1 << 20,
+                uid_base: BASE,
+            })
+            .await;
+        assert_eq!(reply, Response::Done);
+    }
+    let Response::Volumes { volumes } = rig.node.handle(Request::ListVolumes).await else {
+        panic!("volumes expected");
+    };
+    let got: Vec<_> = volumes
+        .iter()
+        .map(|v| (v.volume.as_str(), v.kind))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("data", VolumeKind::Block),
+            ("scratch", VolumeKind::Ramdisk)
+        ]
+    );
+
+    let gone = rig
+        .node
+        .handle(Request::RemoveVolume {
+            replica: replica(),
+            volume_name: "scratch".into(),
+        })
+        .await;
+    assert_eq!(gone, Response::Done);
+    let Response::Volumes { volumes } = rig.node.handle(Request::ListVolumes).await else {
+        panic!("volumes expected");
+    };
+    assert_eq!(volumes.len(), 1);
+}

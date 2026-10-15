@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use faber_cri::BoxFuture;
 use faber_network_management::CommandRunner;
-use faber_node_protocol::{ReplicaRef, VolumeKind};
+use faber_node_protocol::{ReplicaRef, VolumeInfo, VolumeKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
@@ -140,6 +140,10 @@ pub trait VolumeManager: Send + Sync {
         &'a self,
         volume: &'a VolumeRef,
     ) -> BoxFuture<'a, Result<PathBuf, VolumeError>>;
+
+    /// Every volume under the root, sorted. Reads the layout, never a path
+    /// from a request, and follows no symlink.
+    fn list(&self) -> BoxFuture<'_, Result<Vec<VolumeInfo>, VolumeError>>;
 }
 
 /// Host mounts. Every one is `nosuid,nodev`.
@@ -359,6 +363,88 @@ fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
+}
+
+/// The names in `dir` that are directories of their own, not symlinks, and
+/// whose name `accept`s. Sorted. A missing `dir` has none.
+fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> io::Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        // `DirEntry::file_type` describes the entry itself: a symlink to a
+        // directory is a symlink here, and is skipped.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if accept(&name) {
+            found.push((name, entry.path()));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The marker of the volume at `dir`, if it is a plain file with a valid
+/// content. A symlink, a damaged marker or none: not a volume of ours.
+fn plain_marker(marker: &Path) -> Option<Marker> {
+    let meta = std::fs::symlink_metadata(marker).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    read_marker(marker).ok().flatten()
+}
+
+/// A replica index as `VolumeRef` writes it: `0`, `7`, not `+0`, `00` or `1_0`.
+fn is_canonical_index(name: &str) -> bool {
+    name.parse::<u32>().is_ok_and(|n| n.to_string() == name)
+}
+
+fn is_label(name: &str) -> bool {
+    faber_api_types::name::validate_dns_label(name).is_ok()
+}
+
+/// Walks `root/<project>/<env>/<workload>/<index>/<volume>/`.
+fn scan_volumes(root: &Path) -> io::Result<Vec<VolumeInfo>> {
+    let mut out = Vec::new();
+    for (project, p) in child_dirs(root, is_label)? {
+        for (env, e) in child_dirs(&p, is_label)? {
+            for (workload, w) in child_dirs(&e, is_label)? {
+                for (index, i) in child_dirs(&w, is_canonical_index)? {
+                    for (volume, v) in child_dirs(&i, is_label)? {
+                        let Some(marker) = plain_marker(&v.join("volume")) else {
+                            continue;
+                        };
+                        out.push(VolumeInfo {
+                            project: project.clone(),
+                            env: env.clone(),
+                            workload: workload.clone(),
+                            replica_index: index.parse().unwrap_or_default(),
+                            volume,
+                            kind: marker.kind,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.project, &a.env, &a.workload, a.replica_index, &a.volume).cmp(&(
+            &b.project,
+            &b.env,
+            &b.workload,
+            b.replica_index,
+            &b.volume,
+        ))
+    });
+    Ok(out)
 }
 
 /// What a volume was first created as. Kept beside the volume, outside the
@@ -677,6 +763,13 @@ impl VolumeManager for HostVolumes {
             }
         })
     }
+
+    fn list(&self) -> BoxFuture<'_, Result<Vec<VolumeInfo>, VolumeError>> {
+        Box::pin(async move {
+            let root = self.root.clone();
+            blocking("listing the volumes", move || scan_volumes(&root)).await
+        })
+    }
 }
 
 /// In-memory [`VolumeManager`] for tests.
@@ -735,6 +828,32 @@ pub mod fake {
             Box::pin(async move {
                 self.volumes.lock().unwrap().remove(&Self::key(volume));
                 Ok(())
+            })
+        }
+
+        fn list(&self) -> BoxFuture<'_, Result<Vec<VolumeInfo>, VolumeError>> {
+            Box::pin(async move {
+                let found = self.volumes.lock().unwrap();
+                Ok(found
+                    .iter()
+                    .filter_map(|(dir, (kind, _, _))| {
+                        // The key is `<project>/<env>/<workload>/<index>/<volume>`.
+                        let mut parts = dir.replace('\\', "/");
+                        parts.retain(|c| c != '\0');
+                        let parts: Vec<&str> = parts.split('/').filter(|p| !p.is_empty()).collect();
+                        let [project, env, workload, index, volume] = parts.as_slice() else {
+                            return None;
+                        };
+                        Some(VolumeInfo {
+                            project: (*project).to_owned(),
+                            env: (*env).to_owned(),
+                            workload: (*workload).to_owned(),
+                            replica_index: index.parse().ok()?,
+                            volume: (*volume).to_owned(),
+                            kind: *kind,
+                        })
+                    })
+                    .collect())
             })
         }
 
@@ -1234,5 +1353,128 @@ mod tests {
             h.volumes.mount_path(&r.volume).await.unwrap(),
             h.root.join("shop/prod/redis/1/data/mnt")
         );
+    }
+
+    fn write_volume(root: &Path, rel: &str, marker: Option<&str>) {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = marker {
+            std::fs::write(dir.join("volume"), text).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_finds_volumes_by_the_layout_and_their_marker() {
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/1/data",
+            Some("kind=block\nuid_base=65536\n"),
+        );
+        write_volume(
+            &h.root,
+            "shop/prod/redis/0/scratch",
+            Some("kind=ramdisk\nuid_base=65536\n"),
+        );
+        write_volume(
+            &h.root,
+            "blog/dev/web/0/tmp",
+            Some("kind=ramdisk\nuid_base=131072\n"),
+        );
+        let got = h.volumes.list().await.unwrap();
+        let names: Vec<_> = got
+            .iter()
+            .map(|v| {
+                (
+                    v.project.as_str(),
+                    v.workload.as_str(),
+                    v.replica_index,
+                    v.volume.as_str(),
+                    v.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("blog", "web", 0, "tmp", VolumeKind::Ramdisk),
+                ("shop", "redis", 0, "scratch", VolumeKind::Ramdisk),
+                ("shop", "redis", 1, "data", VolumeKind::Block),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_skips_what_is_not_a_volume() {
+        let h = harness();
+        // No marker, a damaged marker, bad names, a stray file.
+        write_volume(&h.root, "shop/prod/redis/0/nomarker", None);
+        write_volume(&h.root, "shop/prod/redis/0/damaged", Some("rubbish"));
+        write_volume(
+            &h.root,
+            "shop/prod/redis/x/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        write_volume(
+            &h.root,
+            "Shop/prod/redis/0/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        write_volume(
+            &h.root,
+            "shop/prod/redis/0/ok",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        std::fs::write(h.root.join("shop/stray"), "x").unwrap();
+        let got = h.volumes.list().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].volume, "ok");
+        // A root that does not exist yet has no volumes.
+        let missing = HostVolumes::new(
+            h.root.join("absent"),
+            989,
+            ToolPaths::default(),
+            h.runner.clone(),
+            Arc::new(CommandMounter::new(ToolPaths::default(), h.runner.clone())),
+        );
+        assert!(missing.list().await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_never_follows_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/0/real",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        // Somewhere else, with a complete volume layout inside.
+        let outside = tempfile::tempdir().unwrap();
+        write_volume(
+            outside.path(),
+            "evil/prod/redis/0/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        write_volume(outside.path(), "vol", Some("kind=block\nuid_base=1\n"));
+        // A symlinked project, a symlinked volume directory, and a volume
+        // whose marker is a symlink to a good marker.
+        symlink(outside.path().join("evil"), h.root.join("evil")).unwrap();
+        symlink(
+            outside.path().join("vol"),
+            h.root.join("shop/prod/redis/0/linked"),
+        )
+        .unwrap();
+        write_volume(&h.root, "shop/prod/redis/0/markerlink", None);
+        symlink(
+            outside.path().join("vol/volume"),
+            h.root.join("shop/prod/redis/0/markerlink/volume"),
+        )
+        .unwrap();
+        let got = h.volumes.list().await.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].volume, "real");
     }
 }
