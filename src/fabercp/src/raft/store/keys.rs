@@ -202,7 +202,15 @@ mod tests {
         for scope in ["shop/staging", "a-b/c-d"] {
             assert!(create_data_key(None, command(scope).0).unwrap().is_some());
         }
-        for scope in ["", "cluster", "shop", "shop/", "/staging", "Shop/staging", "a/b/c"] {
+        for scope in [
+            "",
+            "cluster",
+            "shop",
+            "shop/",
+            "/staging",
+            "Shop/staging",
+            "a/b/c",
+        ] {
             let rejected = create_data_key(None, command(scope).0).unwrap_err();
             assert_eq!(rejected.code, error_code::BAD_REQUEST, "{scope:?}");
         }

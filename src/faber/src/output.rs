@@ -716,9 +716,7 @@ impl DeployDetails<'_> {
         if format != OutputFormat::Json {
             return Ok(String::new());
         }
-        let mut line = serde_json::to_string(&Details {
-            notes: self.notes,
-        })?;
+        let mut line = serde_json::to_string(&Details { notes: self.notes })?;
         line.push('\n');
         Ok(line)
     }

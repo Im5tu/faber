@@ -2081,8 +2081,8 @@ async fn deploy_refused_by_the_api_is_readable() {
             assert_eq!(
                 v,
                 json!({
-                    "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
-                        })
+                "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
+                    })
             );
         }
     }
