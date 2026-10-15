@@ -1717,7 +1717,7 @@ mod tests {
         .unwrap();
         // Nothing reported: no replicas, and no mesh to read a clock from.
         assert!(
-            svc.workload("shop", "staging", "web")
+            svc.workload("shop", "staging", "web", false)
                 .await
                 .unwrap()
                 .replicas
@@ -1772,13 +1772,13 @@ mod tests {
                 },
             ]
         };
-        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
         assert_eq!(got.replicas, want(true));
         // Another workload of the environment shows none of them.
         let other = deploy_req(&[("db", spec("pg"))], false);
         svc.deploy("shop", "staging", other).await.unwrap();
         assert!(
-            svc.workload("shop", "staging", "db")
+            svc.workload("shop", "staging", "db", false)
                 .await
                 .unwrap()
                 .replicas
@@ -1790,12 +1790,12 @@ mod tests {
         svc.propose(Request::AdvanceClock { elapsed_secs: 75 })
             .await
             .unwrap();
-        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
         assert_eq!(got.replicas, want(true));
         svc.propose(Request::AdvanceClock { elapsed_secs: 1 })
             .await
             .unwrap();
-        let got = svc.workload("shop", "staging", "web").await.unwrap();
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
         assert_eq!(got.replicas, want(false));
         node.shutdown().await;
     }

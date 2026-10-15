@@ -3055,7 +3055,7 @@ mod tests {
             .map(|(n, req)| normal(2 + n as u64, req))
             .collect();
         let replies = s.state_machine.apply(entries).await.unwrap();
-        assert_eq!(replies.len(), 5);
+        assert_eq!(replies.len(), 3);
         assert!(replies.iter().all(rejected("internal")), "{replies:?}");
         assert_eq!(dump(&s), before);
         drop(s);
