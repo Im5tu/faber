@@ -569,7 +569,7 @@ pub fn proposals(
 }
 
 /// What [`service_ip_proposals`] decided.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct ServiceIpProposals {
     pub commands: Vec<Request>,
     /// Workloads without an address that wait because every address of the

@@ -3673,7 +3673,8 @@ mod tests {
     async fn the_address_of_a_removed_environment_is_released_by_name() {
         let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
         apply_one(&mut s, 4, allocate("shop", "web")).await;
-        apply_one(&mut s, 5, remove_environment("shop", "staging")).await;
+        apply_one(&mut s, 5, remove_workloads("shop", &["web", "db"])).await;
+        apply_one(&mut s, 51, remove_environment("shop", "staging")).await;
         assert!(vip(&s, "web").is_some());
         // With no environment the workload is gone: the release goes through.
         assert_eq!(

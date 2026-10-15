@@ -206,8 +206,8 @@ mod tests {
 
     use super::*;
     use crate::apps::{EnvironmentRecord, WorkloadRecord};
-    use crate::mesh::state::{MeshConfig, NodeRecord};
     use crate::mesh::MeshState;
+    use crate::mesh::state::{MeshConfig, NodeRecord};
     use crate::raft::store::place::{
         PlacementRecord, ReplicaPlacement, UID_RANGE_START, WorkloadPlacement,
     };
@@ -392,12 +392,20 @@ mod tests {
     fn a_node_that_has_gone_quiet_serves_nothing() {
         let c = Cluster::new(1, HTTP, &[1, 2])
             .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])
-            .reported(2, 100 - 3 * INTERVAL - 1, vec![report(1, 1, Available, "10.200.2.2")]);
+            .reported(
+                2,
+                100 - 3 * INTERVAL - 1,
+                vec![report(1, 1, Available, "10.200.2.2")],
+            );
         assert_eq!(c.ips(), ["10.200.1.2"]);
         // On the edge it still counts.
         let c = Cluster::new(1, HTTP, &[1, 2])
             .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])
-            .reported(2, 100 - 3 * INTERVAL, vec![report(1, 1, Available, "10.200.2.2")]);
+            .reported(
+                2,
+                100 - 3 * INTERVAL,
+                vec![report(1, 1, Available, "10.200.2.2")],
+            );
         assert_eq!(c.ips(), ["10.200.1.2", "10.200.2.2"]);
         // A removed node's last report is not shown.
         let mut c = c;
@@ -434,8 +442,12 @@ mod tests {
 
     #[test]
     fn every_declared_port_and_protocol_is_served_by_every_backend() {
-        let c = Cluster::new(1, &[(53, "udp"), (80, "tcp"), (53, "tcp"), (80, "tcp")], &[1])
-            .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")]);
+        let c = Cluster::new(
+            1,
+            &[(53, "udp"), (80, "tcp"), (53, "tcp"), (80, "tcp")],
+            &[1],
+        )
+        .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")]);
         let got: Vec<_> = c.desired()[0]
             .backends
             .iter()
@@ -488,10 +500,7 @@ mod tests {
 
     #[test]
     fn the_map_switches_when_the_new_revision_qualifies() {
-        assert_eq!(
-            deploy(3).ips(),
-            ["10.200.1.2", "10.200.2.2", "10.200.3.2"]
-        );
+        assert_eq!(deploy(3).ips(), ["10.200.1.2", "10.200.2.2", "10.200.3.2"]);
     }
 
     #[test]
@@ -548,8 +557,15 @@ mod tests {
         assert_eq!(c.ips(), ["10.200.1.2", "10.200.2.2", "10.200.3.2"]);
         // Take the new replicas down: the old revision serves.
         let mut c = Cluster::new(2, HTTP, &[1, 2, 3, 1]);
-        c.view.records.values_mut().next().unwrap().workloads.get_mut("web").unwrap().replicas[3] =
-            ReplicaPlacement::unplaced(3, "insufficient_capacity");
+        c.view
+            .records
+            .values_mut()
+            .next()
+            .unwrap()
+            .workloads
+            .get_mut("web")
+            .unwrap()
+            .replicas[3] = ReplicaPlacement::unplaced(3, "insufficient_capacity");
         let c = c
             .reported(1, 100, vec![report(1, 0, Available, "10.200.1.1")])
             .reported(2, 100, vec![report(1, 1, Available, "10.200.2.1")]);
@@ -558,15 +574,14 @@ mod tests {
 
     #[test]
     fn a_report_of_a_newer_revision_than_the_stored_one_is_ignored() {
-        let c = Cluster::new(1, HTTP, &[1])
-            .reported(
-                1,
-                100,
-                vec![
-                    report(1, 0, Available, "10.200.1.1"),
-                    report(5, 0, Available, "10.200.1.5"),
-                ],
-            );
+        let c = Cluster::new(1, HTTP, &[1]).reported(
+            1,
+            100,
+            vec![
+                report(1, 0, Available, "10.200.1.1"),
+                report(5, 0, Available, "10.200.1.5"),
+            ],
+        );
         assert_eq!(c.ips(), ["10.200.1.1"]);
     }
 
@@ -577,7 +592,7 @@ mod tests {
         let first = deploy(3);
         let mut again = deploy(3);
         // Every node reports again: later, with other details.
-        for (_, status) in again.view.statuses.iter_mut() {
+        for status in again.view.statuses.values_mut() {
             status.reported_at += 3;
             for r in &mut status.replicas {
                 r.detail = Some("probe ok".into());

@@ -851,7 +851,7 @@ table inet faber {
     #[test]
     fn the_dns_port_is_not_the_mdns_port() {
         assert_ne!(DNS_REDIRECT_PORT, 5353);
-        assert!(DNS_REDIRECT_PORT > 1024);
+        const { assert!(DNS_REDIRECT_PORT > 1024) };
     }
 
     /// The container rules never touch the input chain: a container must not

@@ -334,7 +334,9 @@ impl StatusView {
         self.replicas
             .iter()
             .map(|(_, r)| r)
-            .filter(|r| r.project == project && r.environment == environment && r.workload == workload)
+            .filter(|r| {
+                r.project == project && r.environment == environment && r.workload == workload
+            })
             .map(|r| r.revision)
             .collect()
     }
