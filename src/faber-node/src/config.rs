@@ -12,6 +12,9 @@ use faber_node_protocol::USERNS_LENGTH;
 pub const DEFAULT_SOCKET: &str = "/run/faber/node.sock";
 pub const DEFAULT_VOLUME_ROOT: &str = "/var/lib/faber-node/volumes";
 pub const DEFAULT_ENV_FILE: &str = "/etc/faber/faber-node.env";
+pub const DEFAULT_CONTAINERD_CONF_DIR: &str = "/etc/containerd/conf.d";
+pub const DEFAULT_CNI_CONF_DIR: &str = "/etc/cni/net.d";
+pub const DEFAULT_CNI_BIN_DIR: &str = "/opt/cni/bin";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -92,6 +95,13 @@ impl UidRange {
 pub struct NodeConfig {
     pub socket: PathBuf,
     pub volume_root: PathBuf,
+    /// Where the containerd drop-in `faber.toml` is written. Root-owned.
+    pub containerd_conf_dir: PathBuf,
+    /// Where the CNI network config is written, and where containerd is
+    /// told to read it. Root-owned.
+    pub cni_conf_dir: PathBuf,
+    /// Where containerd is told to find the CNI plugins it runs as root.
+    pub cni_bin_dir: PathBuf,
     pub containerd_socket: PathBuf,
     /// Directories of the host tools, run by absolute path.
     pub bin_dir: PathBuf,
@@ -175,6 +185,12 @@ impl NodeConfig {
         Ok(Self {
             socket: path("FABER_NODE_SOCKET", DEFAULT_SOCKET)?,
             volume_root: path("FABER_NODE_VOLUME_ROOT", DEFAULT_VOLUME_ROOT)?,
+            containerd_conf_dir: path(
+                "FABER_NODE_CONTAINERD_CONF_DIR",
+                DEFAULT_CONTAINERD_CONF_DIR,
+            )?,
+            cni_conf_dir: path("FABER_NODE_CNI_CONF_DIR", DEFAULT_CNI_CONF_DIR)?,
+            cni_bin_dir: path("FABER_NODE_CNI_BIN_DIR", DEFAULT_CNI_BIN_DIR)?,
             containerd_socket: path("FABER_NODE_CONTAINERD_SOCKET", faber_cri::DEFAULT_SOCKET)?,
             bin_dir: path("FABER_NODE_BIN_DIR", "/usr/bin")?,
             sbin_dir: path("FABER_NODE_SBIN_DIR", "/usr/sbin")?,
@@ -211,6 +227,12 @@ FABER_NODE_FABER_GID=989
             cfg.volume_root,
             PathBuf::from("/var/lib/faber-node/volumes")
         );
+        assert_eq!(
+            cfg.containerd_conf_dir,
+            PathBuf::from("/etc/containerd/conf.d")
+        );
+        assert_eq!(cfg.cni_conf_dir, PathBuf::from("/etc/cni/net.d"));
+        assert_eq!(cfg.cni_bin_dir, PathBuf::from("/opt/cni/bin"));
         assert_eq!((cfg.faber_uid, cfg.faber_gid), (990, 989));
         assert_eq!(cfg.bin_dir, PathBuf::from("/usr/bin"));
         assert_eq!(cfg.sbin_dir, PathBuf::from("/usr/sbin"));
@@ -234,6 +256,34 @@ FABER_NODE_FABER_GID=989
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_runtime_directories_come_from_the_file() {
+        let text = format!(
+            "{GOOD}FABER_NODE_CONTAINERD_CONF_DIR=/c\nFABER_NODE_CNI_CONF_DIR=/n\n\
+             FABER_NODE_CNI_BIN_DIR=/b\n"
+        );
+        let cfg = NodeConfig::parse(&text).unwrap();
+        assert_eq!(cfg.containerd_conf_dir, PathBuf::from("/c"));
+        assert_eq!(cfg.cni_conf_dir, PathBuf::from("/n"));
+        assert_eq!(cfg.cni_bin_dir, PathBuf::from("/b"));
+        for key in [
+            "FABER_NODE_CONTAINERD_CONF_DIR",
+            "FABER_NODE_CNI_CONF_DIR",
+            "FABER_NODE_CNI_BIN_DIR",
+        ] {
+            for bad in ["rel/dir", "/a/../b"] {
+                let text = format!("{GOOD}{key}={bad}\n");
+                assert!(
+                    matches!(
+                        NodeConfig::parse(&text),
+                        Err(ConfigError::Invalid { key: k, .. }) if k == key
+                    ),
+                    "{key}={bad}"
+                );
+            }
+        }
     }
 
     #[test]

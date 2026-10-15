@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use faber_api_types::workload::limits;
+use faber_container_runtime::RuntimeError;
 use faber_cri::{
     ContainerFilter, ContainerState as CriContainerState, CriClient, CriError, PodSandboxFilter,
     PodSandboxState,
@@ -16,6 +17,7 @@ use faber_node_protocol::{
 
 use crate::config::UidRange;
 use crate::cri_config::{self, ANNOTATION_SPEC_HASH, ANNOTATION_UID_BASE, ResolvedMount};
+use crate::runtime_config::RuntimeConfig;
 use crate::trust;
 use crate::volume::{EnsureVolume, VolumeError, VolumeManager, VolumeRef};
 
@@ -57,6 +59,15 @@ impl From<VolumeError> for Fail {
     }
 }
 
+impl From<RuntimeError> for Fail {
+    fn from(e: RuntimeError) -> Self {
+        // The message names the step; the cause (a path, an errno) stays in
+        // faber-node's log and is not sent to fabercp.
+        tracing::error!(error = ?e, "writing the runtime config failed");
+        Self::new(ErrorCode::Runtime, e.to_string())
+    }
+}
+
 fn managed_selector() -> HashMap<String, String> {
     HashMap::from([(LABEL_MANAGED.to_owned(), "true".to_owned())])
 }
@@ -93,6 +104,7 @@ pub struct Node<C> {
     cri: C,
     images: ImagePuller<C>,
     volumes: Arc<dyn VolumeManager>,
+    runtime_config: RuntimeConfig,
 }
 
 impl<C: CriClient + Clone> Node<C> {
@@ -101,8 +113,10 @@ impl<C: CriClient + Clone> Node<C> {
         runtime_handler: String,
         cri: C,
         volumes: Arc<dyn VolumeManager>,
+        runtime_config: RuntimeConfig,
     ) -> Self {
         Self {
+            runtime_config,
             sandbox_locks: ReplicaLocks::default(),
             uid_range,
             runtime_handler,
@@ -332,6 +346,24 @@ impl<C: CriClient + Clone> Node<C> {
             Request::ListReplicas => self.list_replicas().await,
             Request::ListVolumes => Ok(Response::Volumes {
                 volumes: self.volumes.list().await?,
+            }),
+            Request::ConfigureRuntime {
+                systemd_cgroup,
+                sandbox_image,
+                pod_network,
+            } => {
+                trust::check_sandbox_image(&sandbox_image)?;
+                if let Some(network) = &pod_network {
+                    trust::check_pod_network(network)?;
+                }
+                let changed = self
+                    .runtime_config
+                    .configure(systemd_cgroup, &sandbox_image, pod_network.as_ref())
+                    .await?;
+                Ok(Response::Changed { changed })
+            }
+            Request::RemoveCniConfig => Ok(Response::Changed {
+                changed: self.runtime_config.remove_cni_config().await?,
             }),
         }
     }

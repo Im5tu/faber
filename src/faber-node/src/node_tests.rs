@@ -1,18 +1,23 @@
 //! Handler tests: the trust rules, against a fake runtime and fake volumes.
 
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use faber_api_types::workload::{ContainerSpec, MountSpec};
+use faber_container_runtime::Containerd;
+use faber_container_runtime::cni::CONFLIST_FILE;
+use faber_container_runtime::containerd::DROP_IN_FILE;
 use faber_cri::fake::{Call, FakeCri};
 use faber_cri::{CriClient, PodSandboxConfig};
 use faber_node_protocol::{
-    ContainerState, DnsConfig, ErrorCode, ReplicaRef, Request, Response, SandboxState, SecretEnv,
-    VolumeKind,
+    ContainerState, DnsConfig, ErrorCode, PodNetwork, ReplicaRef, Request, Response, SandboxState,
+    SecretEnv, VolumeKind,
 };
 
 use crate::config::UidRange;
 use crate::node::Node;
+use crate::runtime_config::RuntimeConfig;
 use crate::volume::fake::FakeVolumes;
 
 const BASE: u32 = 65536 * 2;
@@ -21,20 +26,60 @@ struct Rig {
     node: Node<FakeCri>,
     cri: FakeCri,
     volumes: Arc<FakeVolumes>,
+    /// Holds the directories faber-node was configured with.
+    dirs: tempfile::TempDir,
+}
+
+impl Rig {
+    fn containerd_dir(&self) -> PathBuf {
+        self.dirs.path().join("conf.d")
+    }
+
+    fn cni_dir(&self) -> PathBuf {
+        self.dirs.path().join("net.d")
+    }
+
+    /// Every file under the two directories, as `dir/name`.
+    fn files(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for dir in ["conf.d", "net.d"] {
+            for entry in std::fs::read_dir(self.dirs.path().join(dir)).unwrap() {
+                out.push(format!(
+                    "{dir}/{}",
+                    entry.unwrap().file_name().to_string_lossy()
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 fn rig() -> Rig {
     let cri = FakeCri::new();
     let volumes = Arc::new(FakeVolumes::new("/vol"));
+    let dirs = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dirs.path().join("conf.d")).unwrap();
+    std::fs::create_dir(dirs.path().join("net.d")).unwrap();
+    let runtime = RuntimeConfig::new(
+        Arc::new(Containerd {
+            conf_dir: dirs.path().join("conf.d"),
+            cni_conf_dir: dirs.path().join("net.d"),
+        }),
+        std::path::Path::new("/opt/cni/bin"),
+        &dirs.path().join("net.d"),
+    );
     Rig {
         node: Node::new(
             UidRange::new(65536 * 2, 65536 * 8).unwrap(),
             "runc".into(),
             cri.clone(),
             volumes.clone(),
+            runtime,
         ),
         cri,
         volumes,
+        dirs,
     }
 }
 
@@ -679,4 +724,145 @@ async fn list_volumes_answers_with_the_volumes_that_exist() {
         panic!("volumes expected");
     };
     assert_eq!(volumes.len(), 1);
+}
+
+fn configure(sandbox_image: &str, pod_network: Option<PodNetwork>) -> Request {
+    Request::ConfigureRuntime {
+        systemd_cgroup: true,
+        sandbox_image: sandbox_image.into(),
+        pod_network,
+    }
+}
+
+fn pod_network(bridge: &str, subnet: &str) -> PodNetwork {
+    PodNetwork {
+        bridge: bridge.into(),
+        subnet: subnet.parse().unwrap(),
+        mtu: 1420,
+    }
+}
+
+#[tokio::test]
+async fn the_runtime_config_is_written_to_the_nodes_own_paths() {
+    let rig = rig();
+    let reply = rig
+        .node
+        .handle(configure(
+            "registry.k8s.io/pause:3.10",
+            Some(pod_network("faberbr0", "10.200.3.0/24")),
+        ))
+        .await;
+    assert_eq!(reply, Response::Changed { changed: true });
+    assert_eq!(
+        rig.files(),
+        [
+            format!("conf.d/{DROP_IN_FILE}"),
+            format!("net.d/{CONFLIST_FILE}")
+        ]
+    );
+
+    let drop_in = std::fs::read_to_string(rig.containerd_dir().join(DROP_IN_FILE)).unwrap();
+    assert!(drop_in.contains(r#"sandbox_image = "registry.k8s.io/pause:3.10""#));
+    assert!(drop_in.contains("SystemdCgroup = true"));
+    // The plugin and config directories are the node's, not a request's.
+    assert!(drop_in.contains(r#"bin_dir = "/opt/cni/bin""#));
+    let cni = rig.cni_dir();
+    assert!(drop_in.contains(&format!(r#"conf_dir = "{}""#, cni.display())));
+
+    let conflist: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rig.cni_dir().join(CONFLIST_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(conflist["plugins"][0]["bridge"], "faberbr0");
+    assert_eq!(conflist["plugins"][0]["mtu"], 1420);
+    assert_eq!(
+        conflist["plugins"][0]["ipam"]["ranges"][0][0]["subnet"],
+        "10.200.3.0/24"
+    );
+    // Nothing is left behind by the atomic write.
+    assert_eq!(rig.files().len(), 2);
+}
+
+#[tokio::test]
+async fn configuring_again_changes_nothing_and_no_network_removes_the_conflist() {
+    let rig = rig();
+    let request = configure("pause:3", Some(pod_network("faberbr0", "10.200.3.0/24")));
+    assert_eq!(
+        rig.node.handle(request.clone()).await,
+        Response::Changed { changed: true }
+    );
+    assert_eq!(
+        rig.node.handle(request).await,
+        Response::Changed { changed: false }
+    );
+    assert_eq!(
+        rig.node.handle(configure("pause:3", None)).await,
+        Response::Changed { changed: true }
+    );
+    assert_eq!(rig.files(), [format!("conf.d/{DROP_IN_FILE}")]);
+}
+
+#[tokio::test]
+async fn remove_cni_config_removes_that_file_only() {
+    let rig = rig();
+    rig.node
+        .handle(configure(
+            "pause:3",
+            Some(pod_network("faberbr0", "10.200.3.0/24")),
+        ))
+        .await;
+    assert_eq!(
+        rig.node.handle(Request::RemoveCniConfig).await,
+        Response::Changed { changed: true }
+    );
+    assert_eq!(rig.files(), [format!("conf.d/{DROP_IN_FILE}")]);
+    assert_eq!(
+        rig.node.handle(Request::RemoveCniConfig).await,
+        Response::Changed { changed: false }
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_runtime_config_is_refused_and_writes_nothing() {
+    let rig = rig();
+    let good = pod_network("faberbr0", "10.200.3.0/24");
+    let mut mtu = good.clone();
+    mtu.mtu = 10;
+    for request in [
+        configure("a b", Some(good.clone())),
+        configure("", None),
+        configure(
+            "x\"
+[evil]",
+            None,
+        ),
+        configure("pause:3", Some(pod_network("eth0", "10.200.3.0/24"))),
+        configure("pause:3", Some(pod_network("faberbr0\"x", "10.200.3.0/24"))),
+        configure("pause:3", Some(pod_network("faberbr0", "8.8.8.0/24"))),
+        configure("pause:3", Some(pod_network("faberbr0", "10.200.3.1/24"))),
+        configure("pause:3", Some(pod_network("faberbr0", "0.0.0.0/0"))),
+        configure("pause:3", Some(mtu)),
+    ] {
+        let reply = rig.node.handle(request.clone()).await;
+        assert_eq!(
+            error_code(&reply),
+            Some(ErrorCode::InvalidRequest),
+            "{request:?}"
+        );
+    }
+    assert!(rig.files().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_write_is_a_runtime_error_without_the_path() {
+    let rig = rig();
+    std::fs::remove_dir(rig.containerd_dir()).unwrap();
+    let reply = rig.node.handle(configure("pause:3", None)).await;
+    let Response::Error { code, message } = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(code, ErrorCode::Runtime);
+    assert!(
+        !message.contains(rig.dirs.path().to_str().unwrap()),
+        "{message}"
+    );
 }

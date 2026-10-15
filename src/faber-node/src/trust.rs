@@ -1,12 +1,16 @@
 //! The checks `faber-node` runs on every request, whatever fabercp sends.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use faber_api_types::name::validate_dns_label;
 use faber_api_types::workload::{
     ALLOWED_CAPABILITIES, ContainerSpec, PortSpec, VolumeSource, WorkloadSpec, limits,
 };
-use faber_node_protocol::{DnsConfig, ErrorCode, NodeError, ReplicaRef, SecretEnv, VolumeKind};
+use faber_node_protocol::{
+    DnsConfig, ErrorCode, NodeError, PodNetwork, ReplicaRef, SecretEnv, VolumeKind,
+};
+use ipnet::Ipv4Net;
 
 use crate::config::UidRange;
 
@@ -104,6 +108,68 @@ pub fn check_volume_size(kind: VolumeKind, size_bytes: u64) -> Result<(), NodeEr
         return Err(invalid(format!(
             "size_bytes: must be from {} to {most}",
             limits::MIN_VOLUME_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// Every bridge faber makes starts with this, so the CNI config can never
+/// name a host interface such as `eth0` or the WireGuard link.
+const BRIDGE_PREFIX: &str = "faber";
+/// The longest interface name Linux accepts (`IFNAMSIZ` less the NUL).
+const MAX_BRIDGE_BYTES: usize = 15;
+/// Prefix lengths a node's container subnet may have.
+const SUBNET_PREFIX: std::ops::RangeInclusive<u8> = 16..=28;
+/// Subnets a node's containers may use: the private ranges and carrier-grade
+/// NAT space, never public, loopback or link-local addresses.
+const SUBNET_RANGES: [Ipv4Net; 4] = [
+    Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
+    Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10),
+];
+/// MTUs a bridge may have: the IPv4 minimum up to jumbo frames.
+const MTU: std::ops::RangeInclusive<u16> = 576..=9000;
+
+/// The containerd drop-in settings: only the sandbox image is free text, and
+/// it goes through the rules of any image.
+pub fn check_sandbox_image(image: &str) -> Result<(), NodeError> {
+    check_image(image).map_err(|e| invalid(format!("sandbox_image: {}", e.message)))
+}
+
+/// A container network that is safe to write into the CNI config.
+pub fn check_pod_network(network: &PodNetwork) -> Result<(), NodeError> {
+    let name = &network.bridge;
+    let name_ok = name.len() <= MAX_BRIDGE_BYTES
+        && name.starts_with(BRIDGE_PREFIX)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'));
+    if !name_ok {
+        return Err(invalid(format!(
+            "bridge: must be at most {MAX_BRIDGE_BYTES} bytes of a-z, 0-9, - and _, \
+             starting with {BRIDGE_PREFIX}"
+        )));
+    }
+    let subnet = network.subnet;
+    if !SUBNET_PREFIX.contains(&subnet.prefix_len()) {
+        return Err(invalid(format!(
+            "subnet: the prefix length must be from {} to {}",
+            SUBNET_PREFIX.start(),
+            SUBNET_PREFIX.end()
+        )));
+    }
+    if subnet != subnet.trunc() {
+        return Err(invalid("subnet: host bits are set"));
+    }
+    if !SUBNET_RANGES.iter().any(|range| range.contains(&subnet)) {
+        return Err(invalid("subnet: must be a private or shared address range"));
+    }
+    if !MTU.contains(&network.mtu) {
+        return Err(invalid(format!(
+            "mtu: must be from {} to {}",
+            MTU.start(),
+            MTU.end()
         )));
     }
     Ok(())
@@ -299,5 +365,113 @@ mod tests {
             check_volume_size(VolumeKind::Ramdisk, limits::MAX_RAMDISK_VOLUME_BYTES + 1).is_err()
         );
         assert!(check_volume_size(VolumeKind::Block, limits::MAX_RAMDISK_VOLUME_BYTES + 1).is_ok());
+    }
+
+    fn network(bridge: &str, subnet: &str, mtu: u16) -> PodNetwork {
+        PodNetwork {
+            bridge: bridge.into(),
+            subnet: subnet.parse().unwrap(),
+            mtu,
+        }
+    }
+
+    #[test]
+    fn the_pod_network_fabercp_sends_today_passes() {
+        assert!(check_pod_network(&network("faberbr0", "10.200.3.0/24", 1420)).is_ok());
+    }
+
+    #[test]
+    fn pod_network_bridge_names() {
+        for ok in ["faberbr0", "faber", "faber-br_1", "faber0123456789"] {
+            assert!(
+                check_pod_network(&network(ok, "10.200.3.0/24", 1420)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "",
+            "eth0",
+            "wg0",
+            "Faberbr0",
+            "faber0123456789a", // 16 bytes
+            "faber br",
+            "faber.br",
+            "faber/br",
+            "faber\"br",
+            "faber\nbr",
+            "faberbr\u{e9}",
+            "../faber",
+        ] {
+            assert_eq!(
+                code(check_pod_network(&network(bad, "10.200.3.0/24", 1420))),
+                Some(ErrorCode::InvalidRequest),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_network_subnets() {
+        for ok in [
+            "10.200.3.0/24",
+            "10.0.0.0/16",
+            "172.16.0.0/28",
+            "172.31.255.0/24",
+            "192.168.1.0/24",
+            "100.64.0.0/16",
+        ] {
+            assert!(
+                check_pod_network(&network("faberbr0", ok, 1420)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "0.0.0.0/0",
+            "10.0.0.0/8",     // too wide
+            "10.200.3.0/15",  // too wide
+            "10.200.3.0/29",  // too narrow
+            "10.200.3.0/32",  // one host
+            "10.200.3.4/24",  // host bits set
+            "8.8.8.0/24",     // public
+            "127.0.0.0/24",   // loopback
+            "169.254.1.0/24", // link-local
+            "172.32.0.0/24",  // just outside 172.16/12
+            "100.128.0.0/24", // just outside 100.64/10
+            "224.0.0.0/24",   // multicast
+        ] {
+            assert_eq!(
+                code(check_pod_network(&network("faberbr0", bad, 1420))),
+                Some(ErrorCode::InvalidRequest),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_network_mtus() {
+        for ok in [576, 1280, 1420, 1500, 9000] {
+            assert!(
+                check_pod_network(&network("faberbr0", "10.200.3.0/24", ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [0, 575, 9001, u16::MAX] {
+            assert!(
+                check_pod_network(&network("faberbr0", "10.200.3.0/24", bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_images() {
+        assert!(check_sandbox_image("registry.k8s.io/pause:3.10").is_ok());
+        for bad in ["", "a b", "x\"\ny"] {
+            assert_eq!(
+                code(check_sandbox_image(bad)),
+                Some(ErrorCode::InvalidRequest),
+                "{bad:?}"
+            );
+        }
     }
 }

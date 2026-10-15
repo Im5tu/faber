@@ -48,6 +48,7 @@ mod linux {
     use faber_node::listener;
     use faber_node::node::Node;
     use faber_node::peer::Authorizer;
+    use faber_node::runtime_config::RuntimeConfig;
     use faber_node::volume::{CommandMounter, HostVolumes, ToolPaths};
 
     /// The env file decides what pods may map, so it must be root's alone.
@@ -86,6 +87,18 @@ mod linux {
                 config.volume_root.display()
             );
         }
+        // Root loads what is written here (containerd config, CNI config),
+        // so nobody else may be able to replace it.
+        for dir in [&config.containerd_conf_dir, &config.cni_conf_dir] {
+            let meta = std::fs::symlink_metadata(dir)
+                .with_context(|| format!("checking {}", dir.display()))?;
+            if !meta.is_dir() || !root_only_writable(meta.uid(), meta.mode()) {
+                anyhow::bail!(
+                    "{} must be a directory owned by root and not writable by group or others",
+                    dir.display()
+                );
+            }
+        }
         let volumes = HostVolumes::new(
             config.volume_root.clone(),
             config.faber_gid,
@@ -98,6 +111,7 @@ mod linux {
             config.runtime_handler.clone(),
             cri,
             Arc::new(volumes),
+            RuntimeConfig::for_host(&config),
         ));
         let listener = listener::bind(&config)?;
         tracing::info!(socket = %config.socket.display(), "faber-node listening");
