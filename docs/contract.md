@@ -350,74 +350,81 @@ A cluster holds projects. A project holds environments. An environment holds wor
 | container | DNS label | its workload |
 | volume | DNS label | its workload |
 
-A DNS label is 1 to 63 characters of `a-z`, `0-9` and `-`, with no hyphen at either end. The DNS name of a workload is `<workload>.<environment>.<project>.faber.internal`. The API returns it as `fqdn`. Nothing resolves it yet.
+A DNS label is 1 to 63 characters of `a-z`, `0-9` and `-`, with no hyphen at either end. The DNS name of a workload is `<workload>.<environment>.<project>.faber.local`. The API returns it as `fqdn`. It resolves to the workload's virtual IP (see "Virtual IPs" and "DNS").
 
 `POST /api/v1/projects` without `environments` creates `staging` and `production`. A project always has at least one environment at creation. Removing environments later can leave it with none.
 
 ### Generation and revision
 
 - An environment's `generation` is the raft log index of the entry that last changed it, starting with the entry that created it. It only grows, and it does not repeat when an environment is removed and created again under the same name.
-- A deploy that changes nothing keeps the generation and writes nothing. "Changes nothing" means every spec of the request equals the stored one and `prune` removes nothing.
-- A workload's `revision` is the log index of the entry that last changed its pod template. A deploy that changes only `scale`, `placement` or `expose` updates the workload, moves the generation and keeps the revision. The runner will restart pods when the revision moves and at no other time.
+- A deploy that changes nothing keeps the generation and writes nothing. "Changes nothing" means every spec of the request equals the stored one, every env value is unchanged, and `prune` removes nothing.
+- A workload's `revision` is the log index of the entry that last changed its pod template. The pod template is the spec with `scale`, `placement` and `expose` left out, together with the env values. A deploy that changes only `scale`, `placement` or `expose` updates the workload, moves the generation and keeps the revision. The runner starts the containers of a new revision when the revision moves and at no other time.
 - Removing a workload moves the generation.
+- A deploy with workloads needs the cluster key on the node that receives it, even when no workload has env, because the data key of the environment is made and read on the deploy path (see "Encryption").
 
 ### Workload model
 
-The types are in `faber_api_types::workload`. Every type refuses unknown fields. A field with a default may be left out of a request, and a reply always carries it. An optional field (`?`) is absent from a reply when unset. Two specs are equal when every field is equal after the defaults are filled in.
+The types are in `faber_api_types::workload`. Every type refuses unknown fields, so a spec written for an older shape, for example one with a `host_path` volume, a `liveness` probe or a `requests` resource, is refused. A field with a default may be left out of a request, and a reply always carries it. An optional field (`?`) is absent from a reply when unset. Two specs are equal when every field is equal after the defaults are filled in.
 
 `WorkloadSpec`:
 
 | Field | Default | Rule |
 |---|---|---|
-| `scale` | `{"replicas": 1}` | `{"replicas": N}` with N from 0 to 1024, or `"per_node"` for one copy on every node |
-| `restart` | `always` | `always`, `on_failure` or `never` |
+| `scale` | `{"replicas": {"count": 1, "strategy": "spread"}}` | `{"replicas": {"count": N, "strategy": S}}` with N from 0 to 1024 and S `spread` (the default) or `pack`, or `"daemon"` for one copy on every node |
+| `restart` | `always` | `always`, `on_failure` or `never`, see "The runner" |
 | `expose` | `environment` | `environment` or `cluster`, see "Exposure" |
-| `placement` | `{}` | `{node?}`. `node` is a node name, a DNS label. Not allowed with `"per_node"` |
-| `stop_grace_secs?` | none | at most 3600 |
-| `volumes` | `{}` | at most 32, by name. Each is one of the three kinds below |
+| `placement` | `{}` | `{nodes}`. `nodes` is a list of at most 64 unique node names, each a DNS label. Empty means any node. With `"daemon"` the workload runs once on each listed node |
+| `stop_grace_secs?` | none | at most 3600. The runner uses 30 when it is absent |
+| `volumes` | `{}` | at most 32, by name. A workload has no volume unless its spec declares one. Each is one of the two kinds below |
 | `containers` | required | 1 to 16, with unique names |
 
-A volume has a `type`:
+A volume has a `type` and a `size_bytes`:
 
 | `type` | Fields | Rule |
 |---|---|---|
-| `host_path` | `path`, `create` (default `false`) | `path` is absolute, normalised and ASCII, and is not `/`. `create` makes the directory when it is missing |
-| `named` | `name`, `per_replica` (default `false`) | `name` is a DNS label. The volume is a directory on the node the pod runs on. With `per_replica` each replica gets its own |
-| `ephemeral` | `memory` (default `false`), `size_bytes?` | lives as long as the pod. `memory` puts it in RAM. `size_bytes` is from 1 to 2^63 - 1 |
+| `block` | `size_bytes` | a fixed-size filesystem image on the node the replica runs on. It is local to that node and outlives the pod. `size_bytes` is from 1 MiB to 1 TiB |
+| `ramdisk` | `size_bytes` | tmpfs. It is gone when the pod stops. `size_bytes` is from 1 MiB to 64 GiB |
+
+The block volumes of one workload total at most 4 TiB and its ramdisks 256 GiB. The ramdisks that a container mounts together are at most its `memory_bytes`, because tmpfs pages count against the memory of the container's cgroup. See "Volumes" for how they are made and who owns them.
+
+> **Block volumes and downtime.** A workload with a block volume never has two revisions of one replica running, because they would share the volume. On a revision change the old replica of each slot stops, after the drain period, before the new one starts, and that slot has no running replica in between. In this version every replica of the workload is replaced at the same moment, on every node, so the whole service can be unavailable during a deploy that changes the pod template. A replica with a block volume also cannot move: if its node is removed, it stays unplaced (`volume_lost`) until the workload is removed. Run several replicas, on different nodes, so that the service survives the loss of one replica or one node, and plan a template change to such a workload as a short outage.
 
 `ContainerSpec`:
 
 | Field | Default | Rule |
 |---|---|---|
 | `name` | required | DNS label |
-| `image` | required | 1 to 512 bytes of ASCII, with no whitespace and no control character |
+| `image` | required | 1 to 512 bytes of ASCII, with no whitespace and no control character. Public images only: faber pulls anonymously |
 | `command` | `[]` | replaces the image's entrypoint. `command` and `args` together have at most 256 entries of at most 8 KiB each, with no NUL byte |
 | `args` | `[]` | replaces the image's command |
-| `env` | `{}` | at most 256 variables. A name matches `[A-Za-z_][A-Za-z0-9_.-]*` and is at most 256 bytes. A value is at most 32 KiB and has no NUL byte |
+| `env` | `{}` | at most 256 variables. A name matches `[A-Za-z_][A-Za-z0-9_.-]*` and is at most 256 bytes. A value is at most 32 KiB and has no NUL byte. Every value is encrypted at rest (see "Encryption") |
 | `working_dir?` | none | an absolute, normalised ASCII path of at most 4096 bytes |
 | `user?` | none | `uid`, `uid:gid`, or a user name matching `[a-z_][a-z0-9_-]{0,31}`. Ids are decimal without a leading zero. A group name is refused |
-| `ports` | `[]` | at most 64 of `{name?, port, protocol}`. `port` is 1 to 65535. `protocol` is `tcp` (the default) or `udp`. A `name` is a DNS label and unique in the container. A pair of port and protocol appears once |
-| `mounts` | `[]` | at most 32 of `{volume, path, read_only, sub_path?}`. `volume` names a volume of the workload. `path` is absolute, normalised, ASCII and unique in the container. It is not `/`, and it is not `/proc`, `/sys` or `/dev` or anything under them, except `/dev/shm` and what is under that. `read_only` defaults to `false`. `sub_path` is relative, ASCII, not empty and has no `..` |
-| `resources` | `{"limits": {}, "requests": {}}` | each side is `{cpu_millis?, memory_bytes?}`. `cpu_millis` is from 1 to 1000000, which is 1000 cores. `memory_bytes` is from 1 to 2^63 - 1, because a container runtime reads a larger number as "no limit". A request is not above its limit |
+| `ports` | `[]` | at most 64 of `{name?, port, protocol}`. `port` is 1 to 65535. `protocol` is `tcp` (the default) or `udp`. A `name` is a DNS label and unique in the container. A pair of port and protocol appears once. These are the ports the workload's virtual IP serves |
+| `mounts` | `[]` | at most 32 of `{volume, path, read_only}`. `volume` names a volume of the workload. `path` is absolute, normalised, ASCII and unique in the container. It is not `/`, and it is not `/proc`, `/sys` or `/dev` or anything under them, except `/dev/shm` and what is under that. No mount path lies inside another. `read_only` defaults to `false` |
+| `resources` | `{"cpu_millis": 1000, "memory_bytes": 1073741824}` | the most the container may use. `cpu_millis` is from 1 to 256000. `memory_bytes` is from 1 to 4 TiB |
 | `capabilities` | `[]` | Linux capabilities to add, see below |
 | `read_only_root_fs` | `false` | |
-| `liveness?`, `readiness?`, `startup?` | none | a `Probe` |
+| `probe?` | none | a `Probe` |
 
 A normalised path has no `.` or `..` component, no `//` and no trailing `/`.
 
+`resources` are maximums, not requests. The runner sets them as the kernel limits of the container: a CPU quota of `cpu_millis` and a memory limit of `memory_bytes` with no swap. Placement reserves the sum over the containers of a replica on the node it chooses (see "Placement").
+
 The image, every path, and the `path` and `host` of an HTTP probe hold ASCII only. No invisible or text-reordering character can then hide in a name that someone reads on a terminal. A volume mounted on `/proc`, `/sys` or `/dev` would hide or replace what the runtime puts there, which is why the model refuses those mount paths.
 
-`capabilities` takes the kernel's names in upper case without the `CAP_` prefix, each at most once. A container may add these 11 and no others: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` and `SYS_CHROOT`. The list is `ALLOWED_CAPABILITIES`. Every other capability the kernel has, `SYS_ADMIN`, `NET_ADMIN`, `NET_RAW` and `SYS_PTRACE` among them, gives its holder control of the node. The validation refuses such a name with `capability <NAME> is not allowed` and the allowed list. `ALL` is refused. A name the kernel does not have is refused as `is not a Linux capability`.
+`capabilities` takes the kernel's names in upper case without the `CAP_` prefix, each at most once. A container may add these 11 and no others: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` and `SYS_CHROOT`. The list is `ALLOWED_CAPABILITIES`. Every other capability the kernel has, `SYS_ADMIN`, `NET_ADMIN`, `NET_RAW` and `SYS_PTRACE` among them, gives its holder control of the node. The validation refuses such a name with `capability <NAME> is not allowed` and the allowed list. `ALL` is refused. A name the kernel does not have is refused as `is not a Linux capability`. faber-node checks the list again (see "faber-node").
 
-The intent is that a node can permit more. A root-owned allow-list on the node, like the one for host paths, will name the extra capabilities that node accepts. That list does not exist yet, so the 11 are all there is, on every node.
-
-`Probe` is `{action, initial_delay_secs, period_secs, timeout_secs, success_threshold, failure_threshold}`. The defaults are 0, 10, 1, 1 and 3, and every one but `initial_delay_secs` is at least 1. `action` has a `type`:
+`Probe` is `{action, interval_secs, timeout_secs}`. `interval_secs` is from 1 to 3600 and defaults to 5. It is also the delay before the first check. `timeout_secs` defaults to 1 and is at least 1 and less than `interval_secs`, so an interval of 1 is refused. One failed check takes the replica out of DNS, and 3 in a row (`PROBE_FAILURES_BEFORE_RESTART`) restart the container. A container has at most one probe. `action` has a `type`:
 
 | `type` | Fields | Rule |
 |---|---|---|
-| `exec` | `command` | not empty, with the limits of a container's command |
-| `http` | `port`, `path` (default `/`), `scheme` (default `http`), `host?`, `headers` (default `{}`) | `port` is 1 to 65535. `path` starts with `/`, is at most 4096 bytes, and is ASCII with no whitespace and no control character. `scheme` is `http` or `https`. `host` is the `Host` header, 1 to 253 bytes of ASCII with no whitespace and no control character. A header name is an HTTP token, and a value has no CR, LF or NUL |
-| `tcp` | `port` | 1 to 65535 |
+| `http` | `port`, `path` (default `/`), `scheme` (default `http`), `host?`, `headers` (default `{}`) | sends a GET to the pod. A status from 200 to 399 passes, and a redirect is not followed. `port` is 1 to 65535. `path` starts with `/`, is at most 4096 bytes, and is ASCII with no whitespace and no control character. `scheme` is `http` or `https`. `host` is the `Host` header: a host name or `host:port` of at most 253 bytes. A header name is an HTTP token and not `Host`, `Content-Length`, `Transfer-Encoding` or `Connection`, which the runner sets. A value has no CR, LF or NUL |
+| `tcp` | `port` | opens a connection to the pod. Connecting passes. `port` is 1 to 65535 |
+
+An `https` probe does a real TLS handshake and then the GET, with certificate verification off, because a pod's certificate is its own. Only the status line is read.
+
+There are no exec probes, startup probes or split readiness and liveness probes.
 
 `Debug` of a `ContainerSpec` prints the names of its env variables and never their values. `Debug` of an HTTP probe action prints the names of its headers and never their values. Either can be a secret. Requests that carry a spec must not be logged.
 
@@ -435,56 +442,43 @@ The intent is that a node can permit more. A root-owned allow-list on the node, 
 | workloads named by one removal | 64 | service |
 | containers in a workload | 16 | service |
 | replicas of a workload | 1024 | service |
+| nodes in `placement.nodes` | 64 | service |
 | volumes of a workload | 32 | service |
+| `size_bytes` of a volume | 1 MiB to 1 TiB (block) or 64 GiB (ramdisk) | service |
+| block volumes of a workload together; ramdisks together | 4 TiB; 256 GiB | service |
 | mounts of a container | 32 | service |
 | ports of a container | 64 | service |
 | env variables of a container | 256 | service |
 | env variable name | 256 bytes | service |
 | env variable value | 32 KiB | service |
 | image reference | 512 bytes | service |
-| `command` and `args` entries together; entries of an exec probe | 256 | service |
+| `command` and `args` entries together | 256 | service |
 | one command entry | 8 KiB | service |
 | a path | 4096 bytes | service |
 | `stop_grace_secs` | 3600 | service |
-| `cpu_millis` of a limit or a request | 1000000 | service |
-| `memory_bytes` of a limit or a request, and `size_bytes` of an ephemeral volume | 2^63 - 1 | service |
+| `interval_secs` of a probe | 1 to 3600 | service |
+| `cpu_millis` of a container | 1 to 256000 | service |
+| `memory_bytes` of a container | 1 to 4 TiB | service |
 
 A limit that apply checks answers 409 `workloads_exhausted`, except the 128 KiB of a deploy, which is 400 `bad_request` from either side. A limit that only the service checks answers 400 `bad_request`. The CLI runs the same validation before it sends anything.
 
 ### Exposure
 
-`expose` is stored and not enforced. Nothing reads it yet. The intent, for the version that has DNS and a firewall per environment: a workload that is not exposed will be neither resolvable nor reachable from outside its environment, and `cluster` makes it both for every environment of every project. Until then every container that runs on the container network can reach every other one.
-
-### Runner contract
-
-No runner exists. This is what the model promises about one, so that a spec stored today means the same when something runs it:
-
-- A container runs unprivileged, with all capabilities dropped and `no-new-privileges` set.
-- It gets the capabilities its `capabilities` field lists and no others. The field holds only allowed ones (see "Workload model").
-- A node refuses a `host_path` volume whose path is outside the node's allow-list. The list is local to the node and owned by root. It is not replicated, so a deploy cannot change it. The name `FABER_HOST_PATH_ALLOW` is reserved for it. The default is empty: no host path is allowed.
-- A pod restarts when its workload's `revision` moves.
-
-None of this is enforced yet, because nothing runs containers. Today the service accepts any `host_path` that passes validation, and the CLI warns about each one.
-
-What the runner must do with a record it reads from `env/...`:
-
-- Run `WorkloadSpec::validate` on every spec again and refuse one that fails. Apply does not validate (see "Project and workload commands"), and a rule added after a spec was stored never ran on it.
-- Resolve symlinks in a host path before it compares the path with the node's allow-list, and refuse a path that leaves the allowed root through a link. The model checks the spelling only, and a path that the list allows by name can point anywhere.
-- Refuse a host path that resolves to a socket or a device. The containerd socket or a disk hands the node to the container.
-- Resolve `sub_path` inside the root of its volume, without following a symlink out of it. The model refuses `..`, but a symlink inside the volume can still lead out.
-- Resolve every mount target inside the container's root filesystem. An image can ship a symlink such as `/x -> /proc`, and a mount on `/x` that followed it on the host side would get around the mount-path rule.
-- Mount every volume `nosuid,nodev`. Root in a container, with `SETFCAP` or a setuid binary on a shared volume, must gain nothing on the host or in another workload.
-- Check `capabilities` against the allow-list again, for the same reason it validates again.
+`expose` is stored and not enforced. Nothing reads it yet. DNS answers for every service, and every container on the container network can reach every other one. The intent, for a later version: a workload that is not exposed will be neither resolvable nor reachable from outside its environment, and `cluster` makes it both for every environment of every project.
 
 ### Known limits
 
-- Env values are stored in clear in the raft log, the state machine and every snapshot. Any local user on any node can read them through the loopback API. There is no secret store. Do not put a secret in `env` that such a user may not see.
-- The API has no authentication. Whoever can reach a node's loopback listener can deploy. Once a runner exists, the right to deploy will equal root on every node: a workload can ask for capabilities and, where a node allows them, host paths.
+- Env values are encrypted at rest and masked on read, but a node that runs a replica holds the cluster key and the replica's plaintext env. Root on that node can read both, and so can any local user through the unauthenticated loopback API with `?reveal=true`. Do not put in `env` a secret that such a user may not see (see "Encryption").
+- The API has no authentication. Whoever can reach a node's loopback listener can deploy, and a deploy runs containers on every node it is placed on. The right to deploy is the right to run any public image on the cluster, inside a user namespace and with the limits in "faber-node". A registered node can also write through `/raft/cluster/workloads`.
 - `expose` is not enforced.
-- A stock image that relies on Docker's default capabilities needs them listed in `cap_add`, or in `securityContext.capabilities.add`. The model starts from none.
+- Container egress is off. A container reaches the other containers and the services of the cluster and nothing else. Images are pulled by containerd on the host, so pulls are not affected.
+- Images are pulled anonymously from public registries. There is no registry authentication.
+- There is no log collection.
+- A block volume cannot be resized: faber-node refuses a changed `size_bytes` on an existing volume. The runner never removes a block volume (see "Volumes").
 - A write that meets a leader change answers 503 `no_leader` or `not_leader`. Nothing retries it, and the CLI prints the error.
 - A node that joins late may fail to catch up once the state has grown. The raft snapshot and append timeouts are openraft's defaults. A snapshot travels in 3 MiB chunks with 200 ms for each, and an append has the heartbeat interval. Snapshot bytes are sent as JSON arrays of numbers, about 3.6 times their size. On a slow link this can fail once the state passes roughly 1 MiB, although the limit on all environment records is 16 MiB. This piece of work does not fix it.
-- `Debug` of a spec hides env values and probe header values and nothing else. `command`, `args` and the command of an exec probe are printed, and they can hold a password given as an argument. Nothing may log a spec.
+- `Debug` of a spec hides env values and probe header values and nothing else. `command` and `args` are printed, and they can hold a password given as an argument. Nothing may log a spec.
+- There is no data migration. A cluster that holds records of an older shape must be created again.
 
 ## HTTP routes
 
