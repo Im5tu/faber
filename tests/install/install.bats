@@ -2570,13 +2570,13 @@ write_identity() {
 
 # --- bootstrap-error record ------------------------------------------------
 
-@test "bootstrap_error_code: only the four fixed codes from a regular file" {
+@test "bootstrap_error_code: only the six fixed codes from a regular file" {
   mkdir -p "$FABER_STATE_DIR"
   local f="$FABER_STATE_DIR/bootstrap-error" code
   run bootstrap_error_code
   [ "$status" -eq 0 ]
   [ -z "$output" ]
-  for code in token_expired token_invalid invite_rejected node_removed; do
+  for code in token_expired token_invalid invite_rejected node_removed key_mismatch key_unavailable; do
     printf '%s\n' "$code" > "$f"
     run bootstrap_error_code
     [ "$status" -eq 0 ]
@@ -2647,16 +2647,18 @@ write_identity() {
   [ "$(bootstrap_error_code)" = token_expired ]
 }
 
-@test "real run (join): health timeout names an expired, invalid or rejected token, or a removed node" {
+@test "real run (join): health timeout names an expired, invalid or rejected token, a cluster key problem, or a removed node" {
   setup_full_run systemd
   touch "$TMP/unhealthy"
   local code msg
-  for code in token_expired token_invalid invite_rejected node_removed; do
+  for code in token_expired token_invalid invite_rejected node_removed key_mismatch key_unavailable; do
     case "$code" in
       token_expired) msg="the join token has expired; create a new invite (faber mesh invite ...) on an existing node and re-run with --join <token>" ;;
       token_invalid) msg="the join token is not valid; create a new invite (faber mesh invite ...) on an existing node and re-run with --join <token>" ;;
       invite_rejected) msg="the invite was rejected by the cluster; create a new invite and re-run with --join <token>" ;;
       node_removed) msg="the cluster removed this node; create a new invite (faber mesh invite ...) on an existing node and rejoin with --join <token> --reset" ;;
+      key_mismatch) msg="the cluster key sent to this node is not the cluster's, so it did not join; once the cluster key file is sound, create a new invite (faber mesh invite ...) on an existing node and re-run with --join <token>" ;;
+      key_unavailable) msg="the cluster never sent its cluster key, so this node did not join; put the cluster key file on a mesh node, create a new invite (faber mesh invite ...) and re-run with --join <token>" ;;
     esac
     printf '%s\n' "$code" > "$TMP/bootstrap-error"
     install_run --join "$TOKEN"

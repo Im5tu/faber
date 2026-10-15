@@ -681,8 +681,10 @@ struct LeftMesh {
 
 /// Whether this node left the mesh for good in an earlier run, and why. All
 /// of these must hold:
-/// - the `bootstrap-error` marker says `node_removed` or `invite_rejected`,
-///   which only [`leave_mesh`] writes;
+/// - the `bootstrap-error` marker says `node_removed`, `invite_rejected` or
+///   `key_mismatch`, which no start can put right: a wrong key file does not
+///   fix itself. (`key_unavailable` is not among them: the key may be put on
+///   a mesh node, so that start tries again.)
 /// - neither `--join-token-file` nor `--new-mesh` is set, so nothing makes a
 ///   new identity. install.sh takes both out of the environment once the
 ///   node has created or joined its cluster, and leaves them in place after
@@ -708,7 +710,9 @@ fn left_for_good(config: &Config) -> anyhow::Result<Option<BootstrapError>> {
         .filter(|r| {
             matches!(
                 r,
-                BootstrapError::NodeRemoved | BootstrapError::InviteRejected
+                BootstrapError::NodeRemoved
+                    | BootstrapError::InviteRejected
+                    | BootstrapError::KeyMismatch
             )
         });
     let discarded =
@@ -2832,7 +2836,11 @@ mod tests {
     /// systemd would repeat that every few seconds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_that_left_the_mesh_stays_idle_after_a_restart() {
-        for reason in [BootstrapError::NodeRemoved, BootstrapError::InviteRejected] {
+        for reason in [
+            BootstrapError::NodeRemoved,
+            BootstrapError::InviteRejected,
+            BootstrapError::KeyMismatch,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let state_dir = dir.path().join("state");
             let data_dir = dir.path().join("data");
@@ -2904,19 +2912,23 @@ mod tests {
         assert_eq!(bootstrap_error(&state_dir), None);
         node.shutdown().await.unwrap();
 
-        // Any other marker without an identity is still a startup error.
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::new(1, dir.path().join("data"));
-        config.node_id = None;
-        config.state_dir = dir.path().to_path_buf();
-        config.manage_host = true;
-        mesh::bootstrap::write(&config.state_dir, BootstrapError::TokenExpired).unwrap();
-        let err = idle(config).await.err().map(|e| e.to_string());
-        assert!(
-            err.as_deref()
-                .is_some_and(|e| e.contains("not bootstrapped")),
-            "{err:?}"
-        );
+        // Any other marker without an identity is still a startup error. A
+        // missing cluster key may be put right on the mesh, so
+        // `key_unavailable` keeps retrying where `key_mismatch` stays idle.
+        for reason in [BootstrapError::TokenExpired, BootstrapError::KeyUnavailable] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::new(1, dir.path().join("data"));
+            config.node_id = None;
+            config.state_dir = dir.path().to_path_buf();
+            config.manage_host = true;
+            mesh::bootstrap::write(&config.state_dir, reason).unwrap();
+            let err = idle(config).await.err().map(|e| e.to_string());
+            assert!(
+                err.as_deref()
+                    .is_some_and(|e| e.contains("not bootstrapped")),
+                "{reason:?}: {err:?}"
+            );
+        }
     }
 
     /// A host whose link exists only once `ip link add` has run (or `link`

@@ -2018,12 +2018,12 @@ wait_for_join() {
   done
 }
 
-# bootstrap_error_code: print token_expired, token_invalid, invite_rejected
-# or node_removed when fabercp recorded that in
+# bootstrap_error_code: print token_expired, token_invalid, invite_rejected,
+# node_removed, key_mismatch or key_unavailable when fabercp recorded that in
 # $FABER_STATE_DIR/bootstrap-error, else nothing.
 # The file sits in a directory the faber user can write, so it is read only
 # when it is a regular file and not a symlink, at most 64 bytes of it, and the
-# result is one of the four literals below, never the file's content. A file
+# result is one of the six literals below, never the file's content. A file
 # older than join.token was written about an earlier token and is ignored.
 bootstrap_error_code() {
   local f="$FABER_STATE_DIR/bootstrap-error" token content
@@ -2035,13 +2035,13 @@ bootstrap_error_code() {
   # NUL bytes become '?' so they cannot match (and bash does not warn).
   content="$(head -c 64 -- "$f" 2>/dev/null | tr '\0' '?')" || return 0
   case "$content" in
-    token_expired | token_invalid | invite_rejected | node_removed) printf '%s\n' "$content" ;;
+    token_expired | token_invalid | invite_rejected | node_removed | key_mismatch | key_unavailable) printf '%s\n' "$content" ;;
   esac
   return 0
 }
 
-# warn_bootstrap_error: when a join failed because of its token, or because
-# the cluster removed this node, say so and return 0; return 1 when fabercp
+# warn_bootstrap_error: when a join failed because of its token or the cluster
+# key, or because the cluster removed this node, say so and return 0; return 1 when fabercp
 # recorded no (known) reason.
 warn_bootstrap_error() {
   [[ "$MODE" == join ]] || return 1
@@ -2057,6 +2057,12 @@ warn_bootstrap_error() {
       ;;
     node_removed)
       warn "the cluster removed this node; create a new invite (faber mesh invite ...) on an existing node and rejoin with --join <token> --reset"
+      ;;
+    key_mismatch)
+      warn "the cluster key sent to this node is not the cluster's, so it did not join; once the cluster key file is sound, create a new invite (faber mesh invite ...) on an existing node and re-run with --join <token>"
+      ;;
+    key_unavailable)
+      warn "the cluster never sent its cluster key, so this node did not join; put the cluster key file on a mesh node, create a new invite (faber mesh invite ...) and re-run with --join <token>"
       ;;
     *) return 1 ;;
   esac
