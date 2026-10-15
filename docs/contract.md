@@ -204,35 +204,52 @@ install.sh reads it as root, so it must not trust the file further than this: re
 
 | Key | Type | Written by |
 |---|---|---|
-| `mesh` | `mesh::MeshState` | `InitCluster`, `CreateInvite`, `RegisterNode`, `SetEndpoint`, `AdvanceClock`, `RenewLease`, `RemoveNode`, `SetLease` |
-| `config/containerd` | `faber_container_runtime::ContainerRuntimeSpec` | `InitCluster` |
+| `mesh` | `mesh::MeshState` | `InitCluster`, `CreateInvite`, `RegisterNode`, `SetEndpoint`, `AdvanceClock`, `RenewLease`, `RemoveNode`, `SetLease`, and the first `ReportNode` of a node |
 | `projects` | `apps::state::ProjectIndex` | `CreateProject`, `DeleteProject`, `AddEnvironment`, `RemoveEnvironment`, `ApplyWorkloads`, `RemoveWorkloads` |
 | `env/<project>/<environment>` | `apps::state::EnvironmentRecord` | the same six commands |
+| `keys/cluster-id` | `ClusterKeyId` | `SetClusterKeyId` |
+| `keys/data/<scope>` | `DataKeyRecord` | `CreateDataKey` |
+| `place/<project>/<environment>` | `PlacementRecord` | `PlaceReplicas` |
+| `place-uids` | `UidAllocator` | `PlaceReplicas` |
+| `status/<node_id>` | `NodeStatus` | `ReportNode` |
+| `config/status_interval` | `IntervalSetting` | `SetStatusInterval` |
+| `services/ips` | `ServiceIps` | `AllocateServiceIp`, `ReleaseServiceIp` |
 
-`Request::Set` rejects all four with `bad_request`. The key `projects` and every key that starts with `env/` are reserved, whether or not a record exists under them. The snapshot format is unchanged, since snapshots are all of `sm_data`.
+`Request::Set` rejects every key above with `bad_request`. The reserved keys are `mesh`, `projects`, `keys/cluster-id`, `place-uids`, `config/status_interval`, and everything under `env/`, `keys/data/`, `place/`, `status/` and `services/`, whether or not a record exists under them. The snapshot format is unchanged, since snapshots are all of `sm_data`. A node builds a snapshot after every `--snapshot-logs` new log entries (`FABER_SNAPSHOT_LOGS`, default 5000) and keeps `--keep-logs` entries from before it (`FABER_KEEP_LOGS`, default 1000), so the log that status reports add stays bounded.
+
+No record holds a plaintext env value (see "Encryption").
 
 ### Records
 
 | Type | Fields |
 |---|---|
 | `MeshState` | `config`, `nodes` (by node id), `invites` (by invite id), `next_node_id`, `clock`, `lease_secs` |
-| `MeshConfig` | `cidr`, `peer_port`, `wg_port`, `container_cidr?`, `container_subnet_prefix` |
+| `MeshConfig` | `cidr`, `peer_port`, `wg_port`, `container_cidr?`, `container_subnet_prefix`, `service_cidr?` |
 | `NodeRecord` | `node_id`, `public_key`, `mesh_ip`, `endpoint?`, `invite_id?`, `instance_id?`, `container_subnet?`, `name`, `lease_renewed_at` |
 | `InviteRecord` | `invite_id`, `node_id`, `public_key`, `mesh_ip`, `endpoint`, `expires_at`, `name` |
 | `ProjectIndex` | `projects` (by project name) |
 | `ProjectRecord` | `created_at`, `environments` (by environment name) |
 | `EnvironmentIndexEntry` | `generation`, `bytes`, `workloads`, `updated_at` |
 | `EnvironmentRecord` | `generation`, `updated_at`, `workloads` (by workload name) |
-| `WorkloadRecord` | `revision`, `spec` (a `WorkloadSpec`, see "Projects, environments and workloads") |
+| `WorkloadRecord` | `revision`, `spec` (a `WorkloadSpec` whose containers all have an empty `env`, see "Projects, environments and workloads"), `env` (by container name, a `SealedEnv`) |
+| `SealedEnv` | `digest`, `values` (a sealed value by variable name) |
+| `ClusterKeyId` | `key_id` |
+| `DataKeyRecord` | `wrapped`, `key_id` |
+| `PlacementRecord` | `generation`, `basis`, `workloads` (by workload name: `uid_base` and `replicas`, each `{index, node?, reason?}`) |
+| `UidAllocator` | `next`, `free` |
+| `NodeStatus` | `reported_at`, `capacity` (`cpu_millis`, `memory_bytes`, `disk_bytes`), `replicas` |
+| `IntervalSetting` | `secs`, `previous_secs`, `changed_at` |
+| `ServiceIps` | `ips` (an address by `<project>/<environment>/<workload>`), `cursor` |
 
 - `MeshConfig.container_cidr` is the range every node's container subnet lies in. `InitCluster` fixes it. It is absent in a mesh created before containers were networked, and then no node gets a subnet.
 - `MeshConfig.container_subnet_prefix` is the prefix length of each node's subnet, default 24. It is stored in the state and not read from a constant, so replaying the log always allocates the same way. No flag sets it.
+- `MeshConfig.service_cidr` is the range the virtual IPs of services are taken from (see "Virtual IPs"). `InitCluster` fixes it. It is left out of the stored JSON when absent, and then no service gets an address.
 - `NodeRecord.container_subnet` is the subnet raft gave the node: the founder's in `InitCluster`, every other node's in `RegisterNode`.
 - `NodeRecord.name` is the name the node holds a lease on. Names are unique among nodes. `InviteRecord.name` is the name the new node will hold.
 - `NodeRecord.lease_renewed_at` is the value of `MeshState.clock` when the lease was last renewed.
 - `MeshState.clock` is the lease clock, in seconds. `MeshState.lease_secs` is how long a lease lasts without a renewal: default 28800 (8 hours), at least 300, at most 2592000 (30 days).
 
-Every field added since the first version defaults when absent, so an older log or snapshot still decodes: no container range, a prefix of 24, no subnet, an empty name, `lease_renewed_at` and `clock` at 0, and `lease_secs` at 28800. A node record without an `instance_id` matches no machine until a renewal gives it one. An empty name is held by nobody.
+There is no migration. The workload model changed shape, so a cluster that holds older records is created again. Within the current shape, a field that a mesh record gained later defaults when absent: no service range, no container range, a prefix of 24, no subnet, an empty name, `lease_renewed_at` and `clock` at 0, and `lease_secs` at 28800. A node record without an `instance_id` matches no machine until a renewal gives it one. An empty name is held by nobody.
 
 A lease has expired when `clock - lease_renewed_at >= lease_secs`. A node holds its name, mesh IP and container subnet from registration until its record is deleted, whether or not its lease has expired.
 
@@ -242,7 +259,7 @@ The leader stamps `at` (Unix seconds) on the invite commands, and apply never re
 
 | Command | Apply | Rejected with |
 |---|---|---|
-| `InitCluster{mesh, founder, containerd}` | Writes `mesh` with the founder as the only node, `clock = 0` and `lease_secs = 28800`, and writes `config/containerd`. The founder gets the first subnet of the container range, or none without a range, and its lease starts at clock 0. Apply overwrites `founder.container_subnet` and `founder.lease_renewed_at`. An empty `founder.name` becomes `node-1` | `already_initialized`: `mesh` exists. `bad_request`: the founder's mesh IP is not a host address of the mesh CIDR; the name is not a DNS label; the subnet prefix is above 30 or shorter than the range's own prefix; the range has host bits set or overlaps the mesh CIDR |
+| `InitCluster{mesh, founder}` | Writes `mesh` with the founder as the only node, `clock = 0` and `lease_secs = 28800`. The founder gets the first subnet of the container range, or none without a range, and its lease starts at clock 0. Apply overwrites `founder.container_subnet` and `founder.lease_renewed_at`. An empty `founder.name` becomes `node-1` | `already_initialized`: `mesh` exists. `bad_request`: the founder's mesh IP is not a host address of the mesh CIDR; the name is not a DNS label; the subnet prefix is above 30 or shorter than the range's own prefix; the range has host bits set or overlaps the mesh CIDR; the service range has host bits set, a prefix longer than /30, or overlaps the mesh or the container range |
 | `CreateInvite{invite_id, public_key, endpoint, name, ttl_secs, at}` | Drops expired invites. Drops a live invite that carries the same name, so a lost token cannot block a name. Reserves `next_node_id` and the lowest free host address of the mesh CIDR. Stores the invite with `expires_at = at + ttl_secs`. Changes no node. Answers `Invited` | `bad_request`: `ttl_secs` is 0 or above 604800; the name is empty or not a DNS label; the invite id or the public key is in use. `mesh_exhausted`: no free host address in the mesh CIDR, or no container subnet left for this invite (see below). A rejection keeps the prune of expired invites and nothing else |
 | `RegisterNode{invite_id, node_id, endpoint, instance_id, at}` | Moves the invite into `nodes` under the invite's name, node id and mesh IP, registered to `instance_id`, with its lease starting at the current `clock`. If no node holds the name, the node gets the lowest free subnet of the container range. If another node holds the name, this is a takeover: apply deletes that node's record and gives its subnet to the new node in the same write | `invite_used`, `invite_invalid`, `invite_expired`: see below. `not_ready`: the node that holds the name is still in the raft membership. `mesh_exhausted`: no subnet to take over and none free |
 | `SetEndpoint{node_id, endpoint}` | Replaces the node's endpoint | `not_found`: unknown node |
@@ -250,6 +267,13 @@ The leader stamps `at` (Unix seconds) on the invite commands, and apply never re
 | `RenewLease{node_id, instance_id}` | Sets the node's `lease_renewed_at` to `clock`. A record without an `instance_id` adopts the one given | Checked in this order. `mesh_node_removed`: unknown node. `mesh_lease_expired`: the node is known and its lease has already expired. `forbidden`: the record is registered to another `instance_id` |
 | `RemoveNode{node_id}` | Deletes the node's record, which frees its mesh IP, subnet and name. An unknown node is not an error, so a new leader can repeat it | `not_ready`: the lease has not expired, or the node is still in the raft membership |
 | `SetLease{secs}` | Sets `lease_secs` and restarts the lease of every node that had not expired under the old duration | `bad_request`: `secs` is below 300 or above 2592000 |
+| `CreateDataKey{scope, wrapped, key_id}` | Stores a data key wrapped under the cluster key at `keys/data/<scope>`. The first command for a scope wins. A later one changes nothing, and its proposer reads the stored key back and seals again with that (see "Encryption") | `bad_request`: the scope is not `cluster` or `<project>/<environment>` with both DNS labels; `key_id` is not 1 to 64 letters and digits |
+| `SetClusterKeyId{key_id}` | Records the id of the cluster key once. The same id again changes nothing | `bad_request`: a bad id; the id differs from the one recorded |
+| `PlaceReplicas{project, environment, generation, basis, workloads}` | Stores the plan under `place/<project>/<environment>`. A workload that is new to the plan gets the lowest free host uid range, and a workload the command leaves out gives its range back. With no workloads, for an environment that no longer exists, the record is deleted. Writes nothing else, so no generation moves (see "Placement") | `bad_request`: a name is not a DNS label; the generation is not the environment's, or is older than the stored plan's; the basis is older than the stored plan's; a workload the environment does not have; more than 1024 replicas; a replica index twice; a `reason` over 64 bytes; a node the mesh does not have. `not_found`: workloads for an environment that does not exist. `mesh_not_configured`: a replica names a node and the cluster has no mesh. `workloads_exhausted`: every uid range is taken |
+| `ReportNode{node_id, instance_id, capacity, replicas}` | Replaces `status/<node_id>` and stamps it with `clock` (see "Status reporting"). A node without an `instance_id` adopts the one given, and `mesh` is written then | In this order: `mesh_not_configured`; `mesh_node_removed`: unknown node; `mesh_lease_expired`; `forbidden`: another `instance_id`; `bad_request`: over 100 replicas, a name over 63 bytes, a `detail` over 200 bytes, a capacity over 4096000 CPU millis or 1 PiB, a name that is no DNS label, a `pod_ip` outside the node's container subnet or equal to its first host address |
+| `SetStatusInterval{secs}` | Sets the report interval and keeps the previous one for the readers (see "Status reporting"). The same value changes nothing | `bad_request`: `secs` is below 1 or above 300 |
+| `AllocateServiceIp{project, environment, workload}` | Gives the workload the next free host address of the service range after the cursor (see "Virtual IPs"). No change when it has one | `bad_request`: a bad name, or a mesh without a service range. `mesh_not_configured`. `not_found`: the workload is not in the environment. `mesh_exhausted`: no free address |
+| `ReleaseServiceIp{project, environment, workload}` | Frees the address. No change when the workload still exists or has no address | `bad_request`: a bad name |
 
 `RegisterNode` and `RemoveNode` are checked against the raft membership as the entry sees it: the voters and learners of the membership entry applied latest, in the same batch or an earlier one. Every replica applies the same entries in the same order, so each computes the same answer.
 
@@ -278,14 +302,14 @@ Each cell of "Rejected with" lists its checks in the order apply makes them.
 | `DeleteProject{name}` | Removes the project from the index and deletes the record of each of its environments | `not_found`: unknown project. `not_empty`: one of its environments holds a workload |
 | `AddEnvironment{project, name, at}` | Adds the environment and writes its empty record, with `generation = index` and `updated_at = at` | `not_found`: unknown project. `bad_request`: the name is not a DNS label. `project_exists`: the project has the environment. `workloads_exhausted`: the project has 16 environments |
 | `RemoveEnvironment{project, name}` | Removes the environment from the index and deletes its record | `not_found`: unknown project or environment. `not_empty`: the environment holds a workload |
-| `ApplyWorkloads{project, environment, workloads, prune, at}` | With `prune`, removes every stored workload the command does not name. Then, for each workload of the command: a new name is created with `revision = index`; a spec equal to the stored one is unchanged; any other spec replaces the stored one, and `revision` becomes `index` if the pod template differs. If nothing was created, updated or removed, apply writes nothing and answers with the generation the environment has. Otherwise the record gets `generation = index` and `updated_at = at`. Answers `Applied` | `not_found`: unknown project or environment. `bad_request`: a workload name is not a DNS label; `workloads` is over 128 KiB as JSON. `workloads_exhausted`: the environment would hold more than 64 workloads; its record would be over 512 KiB; all records together would be over 16 MiB. The three `workloads_exhausted` checks run only for a command that changes something |
+| `ApplyWorkloads{project, environment, workloads, prune, at}` | `workloads` maps each name to a `StoredWorkload{spec, env}`: the spec with every container's `env` empty, and the sealed env of each container (see "Encryption"). With `prune`, removes every stored workload the command does not name. Then, for each workload of the command: a new name is created with `revision = index`; a workload equal to the stored one is unchanged, the env compared by digest and not by ciphertext; any other one replaces the stored one, and `revision` becomes `index` if the pod template or an env digest differs. If nothing was created, updated or removed, apply writes nothing and answers with the generation the environment has. Otherwise the record gets `generation = index` and `updated_at = at`. Answers `Applied` | `not_found`: unknown project or environment. `bad_request`: a workload name is not a DNS label; a workload carries env values that are not sealed; `workloads` is over 128 KiB as JSON. `workloads_exhausted`: the environment would hold more than 64 workloads; its record would be over 512 KiB; all records together would be over 16 MiB. The three `workloads_exhausted` checks run only for a command that changes something |
 | `RemoveWorkloads{project, environment, names, at}` | Removes the named workloads and sets `generation = index` and `updated_at = at`. A name given twice is removed once. With no name at all the record stays as it is | `not_found`: unknown project or environment; a name the environment does not hold. Nothing is removed then, also not the names it does hold |
 
-The pod template of a spec is the spec with `scale`, `placement` and `expose` set to their defaults. `revision` moves only when the template changes, so a deploy that changes the replica count, the node or the exposure leaves it alone.
+The pod template of a spec is the spec with `scale`, `placement` and `expose` set to their defaults. `revision` moves only when the template or an env value changes, so a deploy that changes the replica count, the nodes or the exposure leaves it alone.
 
 Apply checks a fixed set of things about a workload: its name and the size of the command. It does not run the model's validation (`WorkloadSpec::validate`, `validate_workloads`). The service runs that before it proposes or forwards a command. The reason is replay. Every replica must compute the same answer for a logged command, today and after an upgrade. A validation rule that changes between versions would make an old entry apply on one build and fail on another. The fixed set in apply does not change. The price is that a spec which only apply has seen is not known to be valid, and a reader of `env/...` must not assume it is.
 
-`Response` is `None | Previous(Option<Value>) | Invited{node_id, mesh_ip, expires_at, name, replaces?} | Rejected{code, message} | Applied{generation, created, updated, unchanged, removed}`. `Invited.replaces` is the node that holds the name now, expired or not, and that `RegisterNode` will delete. `Applied` is the answer of `ApplyWorkloads`: the environment's generation after the command, and the name of every workload of the command in exactly one of `created`, `updated` and `unchanged`, each list sorted. `removed` names what `prune` removed. The other five project and workload commands answer `None`. A rejected command still advances `last_applied`.
+`Response` is `None | Previous(Option<Value>) | Invited{node_id, mesh_ip, expires_at, name, replaces?} | Rejected{code, message} | Applied{generation, created, updated, unchanged, removed}`. `Invited.replaces` is the node that holds the name now, expired or not, and that `RegisterNode` will delete. `Applied` is the answer of `ApplyWorkloads`: the environment's generation after the command, and the name of every workload of the command in exactly one of `created`, `updated` and `unchanged`, each list sorted. `removed` names what `prune` removed. The other commands answer `None`. A rejected command still advances `last_applied`.
 
 ### Lease clock
 
@@ -308,8 +332,6 @@ An invite for a name that a node already holds takes that node over when the new
 The new node has its own node id, key and mesh IP, all from the invite. Only the name and the container subnet move. The leader removes the old node from the raft membership before it proposes `RegisterNode`, under the quorum guard that the lease task uses (see "Node lease"), and answers `not_ready` until that has worked. `RegisterNode` then deletes the old record and gives the subnet to the new one in one write, so no two nodes ever hold a subnet. Whether the old node's lease has expired makes no difference.
 
 When the old node is the leader, it removes itself from the membership, steps down once that is applied, and answers `not_ready`. The joiner's retry reaches the next leader, which finishes the registration.
-
-`ContainerRuntimeSpec` defaults: `systemd_cgroup = true`, `sandbox_image = "registry.k8s.io/pause:3.10"`, `cni_bin_dir = "/opt/cni/bin"`, `cni_conf_dir = "/etc/cni/net.d"`.
 
 ## Invite token
 
