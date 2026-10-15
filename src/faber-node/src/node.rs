@@ -15,7 +15,7 @@ use faber_node_protocol::{
 };
 
 use crate::config::UidRange;
-use crate::cri_config::{self, ANNOTATION_UID_BASE, ResolvedMount};
+use crate::cri_config::{self, ANNOTATION_SPEC_HASH, ANNOTATION_UID_BASE, ResolvedMount};
 use crate::trust;
 use crate::volume::{EnsureVolume, VolumeError, VolumeManager, VolumeRef};
 
@@ -200,29 +200,40 @@ impl<C: CriClient + Clone> Node<C> {
                         ..Default::default()
                     }))
                     .await?;
-                // A retried request finds the container it already made.
+                let mut config =
+                    cri_config::container_config(&replica, &container, &env, uid_base, 0, &mounts)
+                        .map_err(|e| Fail::new(ErrorCode::InvalidRequest, e))?;
+                let spec_hash = cri_config::spec_hash(&container, &env, uid_base, &mounts);
+                // A retried request finds the container it already made, if
+                // it was made from the same spec. One made from another spec
+                // is stale: it is removed and replaced.
                 let same_name =
                     |c: &&faber_cri::Container| c.metadata.as_ref().is_some_and(|m| m.name == name);
-                if let Some(made) = existing
-                    .iter()
-                    .filter(same_name)
-                    .find(|c| c.state == CriContainerState::ContainerCreated as i32)
-                {
-                    return Ok(Response::Container {
-                        container_id: made.id.clone(),
-                    });
+                let mut remaining = Vec::new();
+                for c in existing.iter().filter(same_name) {
+                    if c.state == CriContainerState::ContainerCreated as i32 {
+                        if c.annotations.get(ANNOTATION_SPEC_HASH) == Some(&spec_hash) {
+                            return Ok(Response::Container {
+                                container_id: c.id.clone(),
+                            });
+                        }
+                        self.cri.remove_container(&c.id).await?;
+                    } else {
+                        remaining.push(c);
+                    }
                 }
-                let attempt = existing
+                let attempt = remaining
                     .iter()
-                    .filter(same_name)
                     .filter_map(|c| c.metadata.as_ref())
                     .map(|m| m.attempt + 1)
                     .max()
                     .unwrap_or(0);
-                let config = cri_config::container_config(
-                    &replica, &container, &env, uid_base, attempt, &mounts,
-                )
-                .map_err(|e| Fail::new(ErrorCode::InvalidRequest, e))?;
+                if let Some(metadata) = config.metadata.as_mut() {
+                    metadata.attempt = attempt;
+                }
+                config
+                    .annotations
+                    .insert(ANNOTATION_SPEC_HASH.to_owned(), spec_hash);
                 let sandbox_config =
                     cri_config::container_sandbox_config(&replica, uid_base, sandbox.metadata);
                 let container_id = self

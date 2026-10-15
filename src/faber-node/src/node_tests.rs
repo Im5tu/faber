@@ -523,6 +523,48 @@ async fn a_retried_create_returns_the_container_already_made() {
 }
 
 #[tokio::test]
+async fn a_retried_create_with_a_changed_spec_replaces_the_stale_container() {
+    let rig = rig();
+    ready_image(&rig).await;
+    let sandbox_id = sandbox(&rig).await;
+    let spec = || ContainerSpec::new("redis", "redis:7");
+    let Response::Container {
+        container_id: first,
+    } = rig
+        .node
+        .handle(container_request(&sandbox_id, spec(), BASE))
+        .await
+    else {
+        panic!()
+    };
+    // Same spec, different env value.
+    let changed = Request::CreateContainer {
+        replica: replica(),
+        sandbox_id: sandbox_id.clone(),
+        container: spec(),
+        env: SecretEnv([("PASSWORD".to_owned(), "other".to_owned())].into()),
+        uid_base: BASE,
+    };
+    let Response::Container {
+        container_id: second,
+    } = rig.node.handle(changed).await
+    else {
+        panic!()
+    };
+    assert_ne!(first, second);
+    assert!(
+        rig.cri
+            .calls()
+            .contains(&Call::RemoveContainer(first.clone()))
+    );
+    let Response::Replicas { replicas } = rig.node.handle(Request::ListReplicas).await else {
+        panic!()
+    };
+    let ids: Vec<_> = replicas[0].containers.iter().map(|c| &c.id).collect();
+    assert_eq!(ids, vec![&second]);
+}
+
+#[tokio::test]
 async fn concurrent_sandbox_requests_make_one_sandbox() {
     let rig = rig();
     let (a, b, c) = tokio::join!(

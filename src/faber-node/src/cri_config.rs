@@ -18,6 +18,10 @@ use faber_node_protocol::{DnsConfig, LABEL_CONTAINER, ReplicaRef, SecretEnv, USE
 /// Annotation on the sandbox recording the base of its user namespace.
 pub const ANNOTATION_UID_BASE: &str = "faber.uid_base";
 
+/// Annotation on a container: a digest of everything it was created from,
+/// env values included, so a retried create reuses it only when unchanged.
+pub const ANNOTATION_SPEC_HASH: &str = "faber.spec_hash";
+
 const CPU_PERIOD_MICROS: i64 = 100_000;
 
 /// Container 0 maps to host `uid_base`, for exactly [`USERNS_LENGTH`] ids,
@@ -248,6 +252,43 @@ pub fn container_config(
         }),
         ..Default::default()
     })
+}
+
+/// A digest of everything a container is created from: its spec, its mounts,
+/// the owner and every env name and value. Env values go in so a changed
+/// secret counts as a change; only the digest is stored.
+pub fn spec_hash(
+    container: &ContainerSpec,
+    env: &SecretEnv,
+    uid_base: u32,
+    mounts: &[ResolvedMount],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut spec = container.clone();
+    // The request's env replaces the spec's, which is not used.
+    spec.env.clear();
+    let mut hasher = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    part(&serde_json::to_vec(&spec).unwrap_or_default());
+    part(&uid_base.to_be_bytes());
+    for m in mounts {
+        part(m.container_path.as_bytes());
+        part(m.host_path.to_string_lossy().as_bytes());
+        part(&[u8::from(m.read_only)]);
+    }
+    for (key, value) in &env.0 {
+        part(key.as_bytes());
+        part(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `<workload>-<revision>-<container>`: unique within the pod.

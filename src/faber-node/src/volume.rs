@@ -394,11 +394,31 @@ impl Marker {
 fn read_marker(path: &Path) -> io::Result<Option<Marker>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Marker::parse(&text).map(Some).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "the volume marker is damaged")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the volume marker {} is damaged", path.display()),
+            )
         }),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Writes the marker whole or not at all: a temporary file, synced, then
+/// renamed over the final name.
+fn write_marker(path: &Path, marker: Marker) -> io::Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("tmp");
+    ignore_missing(std::fs::remove_file(&tmp))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.write_all(marker.render().as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 /// Removes any half-made image, then creates a sparse root-only file.
@@ -456,9 +476,22 @@ impl HostVolumes {
     async fn lock(&self, dir: &Path) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+            // A lock that only the map holds is idle: forget it.
+            map.retain(|_, l| Arc::strong_count(l) > 1);
             Arc::clone(map.entry(dir.to_path_buf()).or_default())
         };
         lock.lock_owned().await
+    }
+
+    /// Forgets the locks nobody holds or waits for.
+    fn prune(&self) {
+        let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, l| Arc::strong_count(l) > 1);
+    }
+
+    #[cfg(test)]
+    fn lock_count(&self) -> usize {
+        self.locks.lock().unwrap().len()
     }
 
     async fn ensure_block(
@@ -540,37 +573,53 @@ impl VolumeManager for HostVolumes {
             let paths = req.volume.paths(&self.root);
             let _guard = self.lock(&paths.dir).await;
             let (mount, marker_path) = (paths.mount.clone(), paths.marker.clone());
-            let existing = blocking("creating the volume directory", move || {
+            let (image, staging) = (paths.image.clone(), paths.staging.clone());
+            let (existing, has_files) = blocking("creating the volume directory", move || {
                 std::fs::create_dir_all(&mount)?;
-                read_marker(&marker_path)
+                Ok((
+                    read_marker(&marker_path)?,
+                    image.exists() || staging.exists(),
+                ))
             })
             .await?;
             let wanted = Marker {
                 kind: req.kind,
                 uid_base: req.uid_base,
             };
-            if let Some(have) = existing {
-                if have.kind != wanted.kind {
-                    return Err(VolumeError::Invalid(
-                        "the volume exists with a different kind".to_owned(),
-                    ));
+            match existing {
+                Some(have) => {
+                    if have.kind != wanted.kind {
+                        return Err(VolumeError::Invalid(
+                            "the volume exists with a different kind".to_owned(),
+                        ));
+                    }
+                    if have.uid_base != wanted.uid_base {
+                        return Err(VolumeError::Invalid(
+                            "the volume exists with a different uid_base".to_owned(),
+                        ));
+                    }
                 }
-                if have.uid_base != wanted.uid_base {
-                    return Err(VolumeError::Invalid(
-                        "the volume exists with a different uid_base".to_owned(),
-                    ));
+                None => {
+                    // Something is there that nothing recorded. Its kind and
+                    // owner are unknown, so it is not adopted.
+                    if has_files || self.mounter.is_mounted(&paths.mount).await? {
+                        return Err(VolumeError::Invalid(format!(
+                            "the volume at {} has no marker; remove it first",
+                            paths.dir.display()
+                        )));
+                    }
+                    // Recorded before anything is made, so no step can leave
+                    // a volume without it.
+                    let marker_path = paths.marker.clone();
+                    blocking("recording the volume", move || {
+                        write_marker(&marker_path, wanted)
+                    })
+                    .await?;
                 }
             }
             match req.kind {
                 VolumeKind::Block => self.ensure_block(req, &paths).await?,
                 VolumeKind::Ramdisk => self.ensure_ramdisk(req, &paths).await?,
-            }
-            if existing.is_none() {
-                let marker_path = paths.marker.clone();
-                blocking("recording the volume", move || {
-                    std::fs::write(marker_path, wanted.render())
-                })
-                .await?;
             }
             Ok(())
         })
@@ -579,32 +628,39 @@ impl VolumeManager for HostVolumes {
     fn remove<'a>(&'a self, volume: &'a VolumeRef) -> BoxFuture<'a, Result<(), VolumeError>> {
         Box::pin(async move {
             let paths = volume.paths(&self.root);
-            let _guard = self.lock(&paths.dir).await;
-            let dir = paths.dir.clone();
-            if !blocking("checking the volume", move || Ok(dir.exists())).await? {
-                return Ok(());
-            }
-            if self.mounter.is_mounted(&paths.mount).await? {
-                self.mounter.unmount(&paths.mount).await?;
+            let guard = self.lock(&paths.dir).await;
+            let result = async {
+                let dir = paths.dir.clone();
+                if !blocking("checking the volume", move || Ok(dir.exists())).await? {
+                    return Ok(());
+                }
                 if self.mounter.is_mounted(&paths.mount).await? {
-                    return Err(VolumeError::Invalid(
-                        "the volume is still mounted after unmounting".to_owned(),
-                    ));
+                    self.mounter.unmount(&paths.mount).await?;
+                    if self.mounter.is_mounted(&paths.mount).await? {
+                        return Err(VolumeError::Invalid(
+                            "the volume is still mounted after unmounting".to_owned(),
+                        ));
+                    }
                 }
+                // Single files and empty directories only: anything under an
+                // unexpectedly unmounted `mnt` makes `remove_dir` fail instead
+                // of being deleted.
+                let marker_tmp = paths.marker.with_extension("tmp");
+                blocking("removing the volume", move || {
+                    for file in [&paths.image, &paths.staging, &paths.marker, &marker_tmp] {
+                        ignore_missing(std::fs::remove_file(file))?;
+                    }
+                    for dir in [&paths.mount, &paths.dir] {
+                        ignore_missing(std::fs::remove_dir(dir))?;
+                    }
+                    Ok(())
+                })
+                .await
             }
-            // Single files and empty directories only: anything under an
-            // unexpectedly unmounted `mnt` makes `remove_dir` fail instead of
-            // being deleted.
-            blocking("removing the volume", move || {
-                for file in [&paths.image, &paths.staging, &paths.marker] {
-                    ignore_missing(std::fs::remove_file(file))?;
-                }
-                for dir in [&paths.mount, &paths.dir] {
-                    ignore_missing(std::fs::remove_dir(dir))?;
-                }
-                Ok(())
-            })
-            .await
+            .await;
+            drop(guard);
+            self.prune();
+            result
         })
     }
 
@@ -809,6 +865,7 @@ mod tests {
         assert_eq!(
             lines(&h),
             vec![
+                format!("/usr/bin/mountpoint -q {base}/mnt"),
                 format!("/usr/sbin/mkfs.ext4 -F -q -E root_owner=131072:989 {base}/disk.img.new"),
                 format!("/usr/bin/mountpoint -q {base}/mnt"),
                 format!("/usr/bin/mount -t ext4 -o loop,nosuid,nodev {base}/disk.img {base}/mnt"),
@@ -879,6 +936,91 @@ mod tests {
             .ensure(&req(VolumeKind::Block, 8 << 20))
             .await
             .unwrap();
+    }
+
+    fn data_dir(h: &Harness) -> PathBuf {
+        h.root.join("shop/prod/redis/1/data")
+    }
+
+    #[tokio::test]
+    async fn a_volume_with_an_image_but_no_marker_is_refused_not_adopted() {
+        // As after a crash between making the image and recording it.
+        let h = harness();
+        std::fs::create_dir_all(data_dir(&h)).unwrap();
+        std::fs::write(data_dir(&h).join("disk.img"), vec![0u8; 8 << 20]).unwrap();
+        let err = h
+            .volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, VolumeError::Invalid(m) if m.contains("no marker")),
+            "{err}"
+        );
+        assert!(!data_dir(&h).join("volume").exists());
+        assert!(h.runner.calls().iter().all(|c| !c.prog.contains("mount ")));
+    }
+
+    #[tokio::test]
+    async fn a_mounted_volume_with_no_marker_is_refused() {
+        let h = harness();
+        h.runner
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
+        let err = h
+            .volumes
+            .ensure(&req(VolumeKind::Ramdisk, 8 << 20))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::Invalid(m) if m.contains("no marker")));
+    }
+
+    #[tokio::test]
+    async fn the_marker_is_written_before_anything_is_made() {
+        let h = harness();
+        h.runner.script(
+            "/usr/sbin/mkfs.ext4",
+            None,
+            CommandOutput::failure(1, "boom"),
+        );
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap_err();
+        assert!(data_dir(&h).join("volume").exists());
+        assert!(!data_dir(&h).join("volume.tmp").exists());
+        // So the half-made volume still holds its owner.
+        let mut other = req(VolumeKind::Block, 8 << 20);
+        other.uid_base = 196608;
+        assert!(matches!(
+            h.volumes.ensure(&other).await,
+            Err(VolumeError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_damaged_marker_is_an_error_naming_its_path() {
+        let h = harness();
+        std::fs::create_dir_all(data_dir(&h)).unwrap();
+        std::fs::write(data_dir(&h).join("volume"), "garbage").unwrap();
+        let err = h
+            .volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("damaged") && text.contains("volume"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_locks_are_forgotten_after_a_remove() {
+        let h = harness();
+        let r = req(VolumeKind::Block, 8 << 20);
+        h.volumes.ensure(&r).await.unwrap();
+        h.volumes.remove(&r.volume).await.unwrap();
+        assert_eq!(h.volumes.lock_count(), 0);
     }
 
     #[tokio::test]
@@ -977,6 +1119,7 @@ mod tests {
         assert_eq!(
             lines(&h),
             vec![
+                format!("/usr/bin/mountpoint -q {base}/mnt"),
                 format!("/usr/bin/mountpoint -q {base}/mnt"),
                 format!(
                     "/usr/bin/mount -t tmpfs -o size=67108864,mode=0770,uid=131072,gid=989,nosuid,nodev tmpfs {base}/mnt"
