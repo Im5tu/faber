@@ -246,7 +246,7 @@ fn subnet_problem(config: &MeshConfig, subnet: Ipv4Net) -> Option<String> {
 /// The container subnet of node `node_id` in `mesh.nodes`. `Ok(None)` when
 /// the node is not registered or its record has no subnet; `Err` with the
 /// reason when the record's subnet fails [`subnet_problem`].
-fn own_subnet(mesh: &MeshState, node_id: u64) -> Result<Option<Ipv4Net>, String> {
+pub(crate) fn own_subnet(mesh: &MeshState, node_id: u64) -> Result<Option<Ipv4Net>, String> {
     let Some(subnet) = mesh.nodes.get(&node_id).and_then(|n| n.container_subnet) else {
         return Ok(None);
     };
