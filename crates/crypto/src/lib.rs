@@ -220,8 +220,8 @@ fn aad(label: &str, parts: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Seals `data_key` under `cluster_key`, bound to `scope`: `cluster` or
-/// `<project>/<environment>`.
+/// Seals `data_key` under `cluster_key`, bound to `scope`, the
+/// `<project>/<environment>` it belongs to.
 pub fn wrap(
     cluster_key: &ClusterKey,
     data_key: &DataKey,
@@ -346,7 +346,7 @@ mod tests {
             CryptoError::Open
         );
         assert_eq!(
-            unwrap(&ck, &wrapped, "cluster").unwrap_err(),
+            unwrap(&ck, &wrapped, "shop").unwrap_err(),
             CryptoError::Open
         );
         assert_eq!(
@@ -388,10 +388,10 @@ mod tests {
     #[test]
     fn a_wrapped_key_is_not_a_sealed_value() {
         let (ck, dk) = (cluster(), DataKey::generate().unwrap());
-        let wrapped = wrap(&ck, &dk, "cluster").unwrap();
+        let wrapped = wrap(&ck, &dk, "shop/staging").unwrap();
         let as_value = Sealed(wrapped.0.clone());
         let same_bytes = DataKey::from_bytes(ck.0);
-        assert!(open(&same_bytes, &as_value, &["cluster"]).is_err());
+        assert!(open(&same_bytes, &as_value, &["shop/staging"]).is_err());
     }
 
     #[test]
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn serde_forms_are_base64_strings() {
         let (ck, dk) = (cluster(), DataKey::generate().unwrap());
-        let wrapped = wrap(&ck, &dk, "cluster").unwrap();
+        let wrapped = wrap(&ck, &dk, "shop/staging").unwrap();
         let json = serde_json::to_value(&wrapped).unwrap();
         assert!(json.is_string());
         let back: WrappedKey = serde_json::from_value(json).unwrap();

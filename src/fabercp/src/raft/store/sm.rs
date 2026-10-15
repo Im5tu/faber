@@ -1082,7 +1082,7 @@ impl StateReader {
         Ok(self.service_ips()?.get(project, environment, workload))
     }
 
-    /// The data key stored for `scope` (`cluster` or `<project>/<environment>`).
+    /// The data key stored for `scope` (`<project>/<environment>`).
     pub fn data_key(&self, scope: &str) -> Result<Option<keys::DataKeyRecord>, ReadError> {
         self.typed(&keys::data_key_key(scope))
     }
@@ -3005,10 +3005,10 @@ mod tests {
 
         // Another scope is independent.
         assert_eq!(
-            apply_one(&mut s, 3, create_data_key("cluster")).await,
+            apply_one(&mut s, 3, create_data_key("shop/production")).await,
             Response::None
         );
-        assert!(s.reader.data_key("cluster").unwrap().is_some());
+        assert!(s.reader.data_key("shop/production").unwrap().is_some());
 
         let bad = apply_one(&mut s, 4, create_data_key("shop")).await;
         assert!(rejected(ec::BAD_REQUEST)(&bad), "{bad:?}");

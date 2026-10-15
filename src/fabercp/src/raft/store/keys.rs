@@ -24,9 +24,6 @@ use crate::mesh::Rejection;
 pub const KEY_CLUSTER_ID: &str = "keys/cluster-id";
 /// Prefix of the `sm_data` keys holding one JSON [`DataKeyRecord`] each.
 pub const DATA_KEY_PREFIX: &str = "keys/data/";
-/// The scope of the data key that belongs to the cluster rather than to an
-/// environment.
-pub const CLUSTER_SCOPE: &str = "cluster";
 
 /// The `sm_data` key of the data key of `scope`.
 pub fn data_key_key(scope: &str) -> String {
@@ -45,7 +42,7 @@ pub fn is_reserved_key(key: &str) -> bool {
 /// changes nothing. The proposer reads the stored key back and uses that.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateDataKey {
-    /// `cluster` or `<project>/<environment>`. It was also the associated
+    /// `<project>/<environment>`. It was also the associated
     /// data when the key was wrapped.
     pub scope: String,
     pub wrapped: WrappedKey,
@@ -94,21 +91,15 @@ fn bad_request(message: impl Into<String>) -> Rejection {
     Rejection::new(error_code::BAD_REQUEST, message)
 }
 
-/// Whether `scope` is `cluster` or `<project>/<environment>` with both names
-/// DNS labels.
+/// Whether `scope` is `<project>/<environment>` with both names DNS labels.
 fn check_scope(scope: &str) -> Result<(), Rejection> {
-    if scope == CLUSTER_SCOPE {
-        return Ok(());
-    }
     let ok = scope.split_once('/').is_some_and(|(project, environment)| {
         validate_dns_label(project).is_ok() && validate_dns_label(environment).is_ok()
     });
     if ok {
         Ok(())
     } else {
-        Err(bad_request(
-            "a key scope is `cluster` or `<project>/<environment>`",
-        ))
+        Err(bad_request("a key scope is `<project>/<environment>`"))
     }
 }
 
@@ -208,10 +199,10 @@ mod tests {
 
     #[test]
     fn data_key_scopes_are_checked() {
-        for scope in ["cluster", "shop/staging", "a-b/c-d"] {
+        for scope in ["shop/staging", "a-b/c-d"] {
             assert!(create_data_key(None, command(scope).0).unwrap().is_some());
         }
-        for scope in ["", "shop", "shop/", "/staging", "Shop/staging", "a/b/c"] {
+        for scope in ["", "cluster", "shop", "shop/", "/staging", "Shop/staging", "a/b/c"] {
             let rejected = create_data_key(None, command(scope).0).unwrap_err();
             assert_eq!(rejected.code, error_code::BAD_REQUEST, "{scope:?}");
         }
