@@ -12,7 +12,7 @@ use crate::workload::{
 };
 use crate::{
     ClusterStatus, CreateInviteRequest, ErrorBody, HealthResponse, InviteResponse, JoinRequest,
-    LeaseResponse, SetLeaseRequest, error_code,
+    LeaseResponse, SetLeaseRequest, SetStatusIntervalRequest, StatusIntervalResponse, error_code,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -37,11 +37,11 @@ pub struct ClientTimeouts {
     /// Opening the TCP connection.
     pub connect: Duration,
     /// A whole call that only reads: `health`, `cluster_status`,
-    /// `mesh_lease`, `project_list`, `project_get`, `workload_list` and
+    /// `mesh_lease`, `mesh_status_interval`, `project_list`, `project_get`, `workload_list` and
     /// `workload_get`.
     pub read: Duration,
     /// A whole call that writes through raft: `cluster_init`, `cluster_join`,
-    /// `mesh_invite`, `mesh_set_lease`, `project_create`, `project_delete`,
+    /// `mesh_invite`, `mesh_set_lease`, `mesh_set_status_interval`, `project_create`, `project_delete`,
     /// `environment_add`, `environment_remove`, `deploy` and
     /// `workload_delete`. The server waits up to 120 s for a join to finish
     /// and 10 s more for the node to see the result, so this must be longer.
@@ -146,6 +146,24 @@ impl FaberClient {
     pub async fn mesh_set_lease(&self, secs: u64) -> Result<LeaseResponse, ClientError> {
         let req = SetLeaseRequest { lease_secs: secs };
         send_json(self.request_json(Method::PUT, "/api/v1/mesh/lease", &req)?).await
+    }
+
+    /// `GET /api/v1/mesh/status-interval`: seconds between two status reports
+    /// of a node. Only served on the loopback listener.
+    pub async fn mesh_status_interval(&self) -> Result<StatusIntervalResponse, ClientError> {
+        send_json(self.request(Method::GET, "/api/v1/mesh/status-interval")).await
+    }
+
+    /// `PUT /api/v1/mesh/status-interval`: sets the report interval to `secs`
+    /// seconds for the whole mesh. Only served on the loopback listener.
+    pub async fn mesh_set_status_interval(
+        &self,
+        secs: u64,
+    ) -> Result<StatusIntervalResponse, ClientError> {
+        let req = SetStatusIntervalRequest {
+            interval_secs: secs,
+        };
+        send_json(self.request_json(Method::PUT, "/api/v1/mesh/status-interval", &req)?).await
     }
 
     /// `POST /api/v1/projects`: creates a project with the environments

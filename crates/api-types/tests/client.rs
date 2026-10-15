@@ -379,6 +379,35 @@ async fn mesh_set_lease_errors_are_decoded() {
     );
 }
 
+#[tokio::test]
+async fn mesh_status_interval_returns_the_interval() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/mesh/status-interval"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"interval_secs": 5})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let got = client(&server).mesh_status_interval().await.unwrap();
+    assert_eq!(got, StatusIntervalResponse { interval_secs: 5 });
+}
+
+#[tokio::test]
+async fn mesh_set_status_interval_puts_the_seconds_and_returns_the_interval() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/mesh/status-interval"))
+        .and(body_json(json!({"interval_secs": 9})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"interval_secs": 9})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let got = client(&server).mesh_set_status_interval(9).await.unwrap();
+    assert_eq!(got, StatusIntervalResponse { interval_secs: 9 });
+}
+
 /// Read calls give up after `read`; calls that write through raft get the
 /// longer `write`, because a join can take minutes on the server.
 #[tokio::test]
