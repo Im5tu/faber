@@ -744,6 +744,29 @@ async fn list_volumes_answers_with_the_volumes_that_exist() {
     assert_eq!(volumes.len(), 1);
 }
 
+#[tokio::test]
+async fn volume_space_answers_with_the_free_space_of_the_volume_root() {
+    let rig = rig();
+    rig.volumes.set_free_bytes(Some(123 << 20));
+    assert_eq!(
+        rig.node.handle(Request::VolumeSpace).await,
+        Response::VolumeSpace {
+            free_bytes: 123 << 20
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_failed_measurement_is_a_runtime_error_that_names_no_path() {
+    let rig = rig();
+    rig.volumes.set_free_bytes(None);
+    let Response::Error { code, message } = rig.node.handle(Request::VolumeSpace).await else {
+        panic!("an error expected");
+    };
+    assert_eq!(code, ErrorCode::Runtime);
+    assert!(!message.contains("/vol"), "{message}");
+}
+
 fn configure(pod_network: Option<PodNetwork>) -> Request {
     Request::ConfigureRuntime { pod_network }
 }

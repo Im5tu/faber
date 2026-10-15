@@ -144,6 +144,10 @@ pub trait VolumeManager: Send + Sync {
     /// Every volume under the root, sorted. Reads the layout, never a path
     /// from a request, and follows no symlink.
     fn list(&self) -> BoxFuture<'_, Result<Vec<VolumeInfo>, VolumeError>>;
+
+    /// Bytes free for unprivileged use on the file system that holds the
+    /// root: what the images of block volumes can grow into.
+    fn free_bytes(&self) -> BoxFuture<'_, Result<u64, VolumeError>>;
 }
 
 /// Host mounts. Every one is `nosuid,nodev`.
@@ -770,6 +774,33 @@ impl VolumeManager for HostVolumes {
             blocking("listing the volumes", move || scan_volumes(&root)).await
         })
     }
+
+    fn free_bytes(&self) -> BoxFuture<'_, Result<u64, VolumeError>> {
+        Box::pin(async move {
+            let root = self.root.clone();
+            blocking("measuring the free space of the volume root", move || {
+                free_bytes_at(&root)
+            })
+            .await
+        })
+    }
+}
+
+/// Free space for unprivileged use on the file system of `path`: fragment
+/// size times available blocks.
+#[cfg(target_os = "linux")]
+fn free_bytes_at(path: &Path) -> io::Result<u64> {
+    let stat = nix::sys::statvfs::statvfs(path).map_err(io::Error::from)?;
+    let bytes = u128::from(stat.fragment_size()) * u128::from(stat.blocks_available());
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn free_bytes_at(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "free space is measured on Linux only",
+    ))
 }
 
 /// In-memory [`VolumeManager`] for tests.
@@ -785,6 +816,8 @@ pub mod fake {
         /// Ensured volumes: kind, size and owner.
         volumes: Mutex<BTreeMap<String, (VolumeKind, u64, u32)>>,
         root: PathBuf,
+        /// What [`VolumeManager::free_bytes`] answers; `None` fails it.
+        free_bytes: Mutex<Option<u64>>,
     }
 
     impl FakeVolumes {
@@ -792,7 +825,14 @@ pub mod fake {
             Self {
                 volumes: Mutex::default(),
                 root: root.into(),
+                free_bytes: Mutex::new(Some(0)),
             }
+        }
+
+        /// Sets the free space the fake reports, or makes the measurement
+        /// fail.
+        pub fn set_free_bytes(&self, free: Option<u64>) {
+            *self.free_bytes.lock().unwrap() = free;
         }
 
         fn key(volume: &VolumeRef) -> String {
@@ -854,6 +894,15 @@ pub mod fake {
                         })
                     })
                     .collect())
+            })
+        }
+
+        fn free_bytes(&self) -> BoxFuture<'_, Result<u64, VolumeError>> {
+            Box::pin(async move {
+                (*self.free_bytes.lock().unwrap()).ok_or_else(|| VolumeError::Io {
+                    what: "measuring the free space of the volume root".into(),
+                    source: io::Error::other("fake failure"),
+                })
             })
         }
 
@@ -1059,6 +1108,23 @@ mod tests {
 
     fn data_dir(h: &Harness) -> PathBuf {
         h.root.join("shop/prod/redis/1/data")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_free_space_is_that_of_the_volume_root() {
+        let h = harness();
+        assert!(h.volumes.free_bytes().await.unwrap() > 0);
+        // A root that is not there is an error, not a zero.
+        let missing = HostVolumes::new(
+            h.root.join("missing"),
+            989,
+            ToolPaths::default(),
+            h.runner.clone(),
+            Arc::new(CommandMounter::new(ToolPaths::default(), h.runner.clone())),
+        );
+        let err = missing.free_bytes().await.unwrap_err();
+        assert!(matches!(err, VolumeError::Io { .. }), "{err}");
     }
 
     #[tokio::test]

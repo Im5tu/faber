@@ -116,6 +116,10 @@ pub enum Request {
     /// Every volume under faber-node's volume root, found on disk. Takes no
     /// argument: no path is ever sent.
     ListVolumes,
+    /// The free space of the file system that holds the volume root: what
+    /// block volumes can use. Takes no argument: no path is ever sent.
+    /// Answered with [`Response::VolumeSpace`].
+    VolumeSpace,
     /// Brings the containerd drop-in and the CNI network config to this
     /// state, in files and directories that faber-node alone names, with
     /// settings (cgroup driver, pause image, bridge, plugin directory) that
@@ -226,6 +230,11 @@ pub enum Response {
     Volumes {
         volumes: Vec<VolumeInfo>,
     },
+    /// Bytes free for unprivileged use on the file system of the volume
+    /// root.
+    VolumeSpace {
+        free_bytes: u64,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -324,6 +333,7 @@ mod tests {
             },
             Request::ListReplicas,
             Request::ListVolumes,
+            Request::VolumeSpace,
             Request::ConfigureRuntime {
                 pod_network: Some(PodNetwork {
                     subnet: "10.200.3.0/24".parse().unwrap(),
@@ -392,6 +402,9 @@ mod tests {
                     kind: VolumeKind::Ramdisk,
                 }],
             },
+            Response::VolumeSpace {
+                free_bytes: 1 << 40,
+            },
             Response::error(ErrorCode::Forbidden, "no"),
         ];
         for response in all {
@@ -409,6 +422,7 @@ mod tests {
         );
         assert!(serde_json::from_str::<Request>(r#"{"type":"list_replicas"}"#).is_ok());
         assert!(serde_json::from_str::<Request>(r#"{"type":"list_volumes"}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"type":"volume_space"}"#).is_ok());
         // Neither a path nor a file body can be named.
         for extra in [
             r#""path":"/etc""#,

@@ -360,6 +360,9 @@ impl<C: CriClient + Clone> Node<C> {
             Request::ListVolumes => Ok(Response::Volumes {
                 volumes: self.volumes.list().await?,
             }),
+            Request::VolumeSpace => Ok(Response::VolumeSpace {
+                free_bytes: self.volumes.free_bytes().await?,
+            }),
             Request::ConfigureRuntime { pod_network } => {
                 if let Some(network) = &pod_network {
                     trust::check_pod_network(network)?;
