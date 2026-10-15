@@ -329,7 +329,7 @@ fn nat_chains(
             pre,
         ),
         (
-            "output {\n\t\ttype nat hook output priority dstnat; policy accept;".into(),
+            "output {\n\t\ttype nat hook output priority -100; policy accept;".into(),
             dnat,
         ),
         (
@@ -605,7 +605,7 @@ table inet faber {{
 		type nat hook prerouting priority dstnat; policy accept;
 	}
 	chain output {
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
@@ -669,7 +669,7 @@ table inet faber {
 		iifname "faberbr0" ip daddr 10.200.1.1 tcp dport 53 redirect to :5300
 	}
 	chain output {
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
@@ -703,7 +703,7 @@ table inet faber {
 		iifname "faberbr0" ip daddr 10.200.0.1 tcp dport 53 redirect to :5300
 	}
 	chain output {
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
@@ -765,7 +765,7 @@ table inet faber {
 		iifname "faberbr0" ip daddr 10.201.0.2 tcp dport 6379 dnat ip to numgen random mod 2 map { 0 : 10.200.1.4, 1 : 10.200.2.5 }
 	}
 	chain output {
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 		ip daddr 10.201.0.1 tcp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
 		ip daddr 10.201.0.1 udp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
 		ip daddr 10.201.0.2 tcp dport 6379 dnat ip to numgen random mod 2 map { 0 : 10.200.1.4, 1 : 10.200.2.5 }
