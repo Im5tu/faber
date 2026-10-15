@@ -143,9 +143,6 @@ pub struct DeployOptions {
     /// reads that JSON back.
     #[arg(long)]
     pub dry_run: bool,
-    /// Fail and deploy nothing when the input gives a warning.
-    #[arg(long)]
-    pub strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -425,25 +422,19 @@ pub async fn run_with_inputs(
             let plan = match deploy::plan(file, &options.expose, options.prune, &mut inputs) {
                 Ok(plan) => plan,
                 Err(failure) => {
-                    let lines = output::failure_text(&failure.errors, &failure.warnings);
+                    let lines = output::failure_text(&failure.errors);
                     err.write_all(lines.as_bytes())?;
                     err.flush()?;
                     bail!("nothing was deployed");
                 }
             };
-            if options.strict && !plan.warnings.is_empty() {
-                err.write_all(output::warnings_text(&plan.warnings).as_bytes())?;
-                err.flush()?;
-                bail!("nothing was deployed: --strict turns a warning into an error");
-            }
             let details = output::DeployDetails {
-                warnings: &plan.warnings,
                 variables: &[],
                 files: options.dry_run.then_some(&plan.files[..]),
                 notes: &plan.notes,
             };
-            // Before anything is sent: what the warnings say is about to
-            // happen, and it may be a reason to stop the command.
+            // Before anything is sent, so the notes are seen even if the
+            // request fails.
             err.write_all(details.text(format).as_bytes())?;
             err.flush()?;
             let (project, environment) = (&target.project, &target.environment);

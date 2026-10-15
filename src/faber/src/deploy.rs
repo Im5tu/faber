@@ -91,10 +91,7 @@ impl fmt::Display for Diagnostic {
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub workloads: BTreeMap<String, WorkloadSpec>,
-    /// What a node may refuse.
-    pub warnings: Vec<Diagnostic>,
-    /// Things to know that are no fault of the input. `--strict` ignores
-    /// them.
+    /// Things to know that are no fault of the input.
     pub notes: Vec<String>,
     /// Every file the deploy read, in the order of the first read, with
     /// `-` for stdin. Each is the real path, with symlinks resolved, and
@@ -106,14 +103,12 @@ pub(crate) struct Plan {
 #[derive(Debug)]
 pub(crate) struct Failure {
     pub errors: Vec<Diagnostic>,
-    pub warnings: Vec<Diagnostic>,
 }
 
 impl Failure {
     fn of(error: Diagnostic) -> Self {
         Self {
             errors: vec![error],
-            warnings: Vec::new(),
         }
     }
 }
@@ -139,7 +134,6 @@ pub(crate) fn plan(
             ))
         })?
         .0;
-    let warnings = Vec::new();
 
     let mut errors = Vec::new();
     if workloads.is_empty() && !prune {
@@ -180,13 +174,12 @@ pub(crate) fn plan(
         );
     }
     if !errors.is_empty() {
-        return Err(Failure { errors, warnings });
+        return Err(Failure { errors });
     }
 
     Ok(Plan {
         notes: notes(&workloads),
         workloads,
-        warnings,
         files: reader.read.into_inner(),
     })
 }

@@ -702,47 +702,17 @@ pub fn workloads_removed(format: OutputFormat, fqdns: &[String]) -> Result<Strin
     }
 }
 
-/// A warning as it appears in the JSON output of a deploy.
-#[derive(Serialize)]
-struct Finding<'a> {
-    source: &'a str,
-    path: &'a str,
-    message: &'a str,
-}
-
-fn findings(warnings: &[Diagnostic]) -> Vec<Finding<'_>> {
-    warnings
-        .iter()
-        .map(|w| Finding {
-            source: &w.source,
-            path: &w.path,
-            message: &w.message,
-        })
-        .collect()
-}
-
-/// The stderr lines of a deploy that failed: every warning, then every
-/// error.
-pub fn failure_text(errors: &[Diagnostic], warnings: &[Diagnostic]) -> String {
-    let mut s = warnings_text(warnings);
+/// The stderr lines of a deploy that failed: every error.
+pub fn failure_text(errors: &[Diagnostic]) -> String {
+    let mut s = String::new();
     for e in errors {
         let _ = writeln!(s, "error: {}", esc(&e.to_string()));
     }
     s
 }
 
-/// One `warning: ...` line per warning.
-pub fn warnings_text(warnings: &[Diagnostic]) -> String {
-    let mut s = String::new();
-    for w in warnings {
-        let _ = writeln!(s, "warning: {}", esc(&w.to_string()));
-    }
-    s
-}
-
 /// What a deploy says about itself, apart from its result.
 pub struct DeployDetails<'a> {
-    pub warnings: &'a [Diagnostic],
     /// Names of the caller's variables whose value went into the workloads.
     pub variables: &'a [String],
     /// The files read. Only a dry run lists them.
@@ -752,13 +722,13 @@ pub struct DeployDetails<'a> {
 
 impl DeployDetails<'_> {
     /// The stderr lines of text mode, which are written before anything is
-    /// sent: `warning: ...`, `uses variable: NAME`, `read: <path>` and
+    /// sent: `uses variable: NAME`, `read: <path>` and
     /// `note: ...`, one each. JSON mode has them in its document.
     pub fn text(&self, format: OutputFormat) -> String {
         if format == OutputFormat::Json {
             return String::new();
         }
-        let mut s = warnings_text(self.warnings);
+        let mut s = String::new();
         for name in self.variables {
             let _ = writeln!(s, "uses variable: {}", esc(name));
         }
@@ -778,7 +748,6 @@ impl DeployDetails<'_> {
     pub fn failure_line(&self, format: OutputFormat) -> Result<String> {
         #[derive(Serialize)]
         struct Details<'a> {
-            warnings: Vec<Finding<'a>>,
             notes: &'a [String],
             variables: &'a [String],
         }
@@ -786,7 +755,6 @@ impl DeployDetails<'_> {
             return Ok(String::new());
         }
         let mut line = serde_json::to_string(&Details {
-            warnings: findings(self.warnings),
             notes: self.notes,
             variables: self.variables,
         })?;
@@ -807,14 +775,12 @@ pub fn deployed(
     #[derive(Serialize)]
     struct Deployed<'a> {
         result: &'a DeployResponse,
-        warnings: Vec<Finding<'a>>,
         notes: &'a [String],
         variables: &'a [String],
     }
     if format == OutputFormat::Json {
         return pretty(&Deployed {
             result,
-            warnings: findings(details.warnings),
             notes: details.notes,
             variables: details.variables,
         });
@@ -845,7 +811,6 @@ pub fn dry_run(
         project: &'a str,
         environment: &'a str,
         spec: &'a BTreeMap<String, WorkloadSpec>,
-        warnings: Vec<Finding<'a>>,
         notes: &'a [String],
         variables: &'a [String],
         files: &'a [String],
@@ -855,7 +820,6 @@ pub fn dry_run(
             project,
             environment,
             spec,
-            warnings: findings(details.warnings),
             notes: details.notes,
             variables: details.variables,
             files: details.files.unwrap_or_default(),
@@ -966,27 +930,19 @@ mod tests {
     }
 
     /// An input file can put anything in a key or a value
-    /// that ends up in a finding.
+    /// that ends up in an error or a detail.
     #[test]
     fn findings_escape_what_came_from_the_input() {
-        let warning = Diagnostic::new("a\x1b[2J.yaml", "services.we\x07b", "skipped\r\n");
         let error = Diagnostic::new("f", "", "bad \x1b]0;title\x07");
-        let warnings = [warning];
-        assert_eq!(
-            failure_text(&[error], &warnings),
-            "warning: a\\x1b[2J.yaml: services.we\\x07b: skipped\\x0d\\x0a\n\
-             error: f: bad \\x1b]0;title\\x07\n"
-        );
+        assert_eq!(failure_text(&[error]), "error: f: bad \\x1b]0;title\\x07\n");
         let details = DeployDetails {
-            warnings: &warnings,
             variables: &["HO\u{202e}ME".to_string()],
             files: Some(&["a\nb.env".to_string()]),
             notes: &["note\x1b".to_string()],
         };
         assert_eq!(
             details.text(OutputFormat::Text),
-            "warning: a\\x1b[2J.yaml: services.we\\x07b: skipped\\x0d\\x0a\n\
-             uses variable: HO\\u{202e}ME\n\
+            "uses variable: HO\\u{202e}ME\n\
              read: a\\x0ab.env\n\
              note: note\\x1b\n"
         );

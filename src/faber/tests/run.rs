@@ -1786,7 +1786,6 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         v,
         json!({
             "result": deploy_body(),
-            "warnings": [],
             "notes": [NOTE_CAPABILITIES.trim_start_matches("note: ").trim_end()],
             "variables": [],
         })
@@ -1800,7 +1799,6 @@ async fn deploy_spec_json_is_one_document_and_nothing_on_stderr() {
         v,
         json!({
             "result": deploy_body(),
-            "warnings": [],
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
             "variables": [],
         })
@@ -1854,7 +1852,6 @@ async fn deploy_dry_run_prints_the_spec_and_sends_nothing() {
             "project": "shop",
             "environment": "staging",
             "spec": fixture_workloads("volume.json"),
-            "warnings": [],
             "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
             "variables": [],
             "files": ["volume.json"],
@@ -1996,18 +1993,6 @@ async fn deploy_notes_go_to_stderr_and_do_not_stop_the_deploy() {
     assert_eq!(err, NOTE_SECRETS);
 }
 
-/// A note is not a warning: `--strict` lets it through.
-#[tokio::test]
-async fn deploy_strict_ignores_notes() {
-    let server = MockServer::start().await;
-    mount_deploy(&server, fixture_workloads("spec.json"), false, 1).await;
-
-    let args = with_target(&["deploy", "spec", "spec.json"], &["--strict"]);
-    let (out, err) = run_fx(&server, &args).await.ok();
-    assert_eq!(out, DEPLOY_TEXT);
-    assert_eq!(err, NOTE_CAPABILITIES);
-}
-
 #[tokio::test]
 async fn deploy_spec_that_does_not_decode_names_the_file() {
     let server = silent_server().await;
@@ -2114,7 +2099,7 @@ async fn deploy_refused_by_the_api_is_readable() {
             let outcome = run_fx(&server, &args).await;
             assert_eq!(outcome.failed(), want);
             assert_eq!(outcome.out, "");
-            // The warnings were printed before the request went out, so
+            // The notes were printed before the request went out, so
             // they are there although it failed. JSON mode has no
             // document on stdout, so it writes one line of JSON here.
             if format == "text" {
@@ -2127,7 +2112,6 @@ async fn deploy_refused_by_the_api_is_readable() {
             assert_eq!(
                 v,
                 json!({
-                    "warnings": [],
                     "notes": [NOTE_SECRETS.trim_start_matches("note: ").trim_end()],
                     "variables": [],
                 })
@@ -2369,7 +2353,6 @@ async fn deploy_json_that_cannot_connect_keeps_its_details_on_stderr() {
     assert_eq!(err.matches('\n').count(), 1, "{err}");
     let v: Value = serde_json::from_str(&err).unwrap();
     assert_eq!(v["variables"], json!([]));
-    assert_eq!(v["warnings"], json!([]));
     assert_eq!(
         v["notes"],
         json!([NOTE_CAPABILITIES.trim_start_matches("note: ").trim_end()])

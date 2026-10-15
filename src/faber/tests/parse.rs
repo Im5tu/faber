@@ -132,6 +132,24 @@ fn deploy_compose_and_k8s_are_rejected() {
 }
 
 #[test]
+fn deploy_strict_is_rejected() {
+    let message = parse_err(&[
+        "deploy",
+        "spec",
+        "spec.json",
+        "--project",
+        "shop",
+        "--env",
+        "staging",
+        "--strict",
+    ]);
+    assert!(
+        message.contains("unexpected argument '--strict'"),
+        "{message}"
+    );
+}
+
+#[test]
 fn missing_subcommand_is_rejected() {
     parse_err(&[]);
     parse_err(&["cluster"]);
@@ -289,7 +307,6 @@ fn no_options() -> DeployOptions {
         expose: vec![],
         prune: false,
         dry_run: false,
-        strict: false,
     }
 }
 
