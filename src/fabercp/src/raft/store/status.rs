@@ -116,7 +116,7 @@ pub struct NodeStatus {
 /// - Too many replicas, or a name or `detail` over its limit: `bad_request`.
 /// - Capacity over [`MAX_CPU_MILLIS`] or [`MAX_BYTES`], a name that is no DNS
 ///   label, or a `pod_ip` outside the container subnet the mesh recorded
-///   for the node: `bad_request`. One bad entry refuses the whole report, so
+///   for the node, or the gateway (the first host address): `bad_request`. One bad entry refuses the whole report, so
 ///   a node cannot point a workload's address at anything but its own pods.
 ///
 /// What a node reports is not trusted beyond that: readers ignore replicas
@@ -183,9 +183,11 @@ fn check_replicas(replicas: &[ReplicaReport]) -> Result<(), Rejection> {
 
 fn check_pod_ips(replicas: &[ReplicaReport], subnet: Option<Ipv4Net>) -> Result<(), Rejection> {
     for ip in replicas.iter().filter_map(|r| r.pod_ip) {
-        if !subnet.is_some_and(|net| is_host_addr(net, ip)) {
+        // The first host address is the bridge gateway, where DNS answers.
+        let usable = |net: Ipv4Net| is_host_addr(net, ip) && net.hosts().next() != Some(ip);
+        if !subnet.is_some_and(usable) {
             return Err(bad(format!(
-                "pod address {ip} is outside the container subnet of the node, or its network or broadcast address"
+                "pod address {ip} is outside the container subnet of the node, or its network, broadcast or gateway address"
             )));
         }
     }
@@ -359,6 +361,8 @@ mod tests {
             // The network and broadcast addresses of the subnet.
             "10.200.0.0",
             "10.200.0.255",
+            // The bridge gateway, the first host address.
+            "10.200.0.1",
             "10.99.0.2",
             "192.168.1.1",
         ] {

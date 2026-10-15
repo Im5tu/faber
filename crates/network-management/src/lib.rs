@@ -634,6 +634,7 @@ mod tests {
             local_subnet: Some("10.200.1.0/24".parse().unwrap()),
             node_mesh_ips: ["10.99.0.1".parse().unwrap()].into_iter().collect(),
             bridge: "faberbr0".into(),
+            service_cidr: None,
         });
         NetworkManager::new(r.clone())
             .reconcile(&spec)
@@ -693,6 +694,7 @@ mod tests {
             local_subnet: Some("10.200.1.0/24".parse().unwrap()),
             node_mesh_ips: Default::default(),
             bridge: "faberbr0".into(),
+            service_cidr: None,
         });
         spec
     }

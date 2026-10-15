@@ -73,6 +73,12 @@
 //!   its own address as the source. `postrouting` masquerades exactly that
 //!   case, for every backend that is on `<local>`.
 //!
+//! The host's own connections to a service are masqueraded to the tunnel
+//! address when they go to a pod, so that the peer accepts them. With
+//! [`ContainerFirewall::service_cidr`], two filter chains after the nat
+//! chains reject what is still addressed to the service range: an address
+//! with no backend, or one that no service holds.
+//!
 //! No default-drop for anything else. A later replicated `config/firewall`
 //! key feeds the same [`render`].
 //!
@@ -140,6 +146,11 @@ pub struct ContainerFirewall {
     /// Written into the script verbatim; [`apply`] rejects a name that
     /// fails [`crate::is_valid_iface_name`] or equals the mesh interface.
     pub bridge: String,
+    /// The range the virtual IPs of the services are taken from. When set,
+    /// a packet to an address of it that no service rule translated is
+    /// rejected (see the module docs).
+    #[serde(default)]
+    pub service_cidr: Option<Ipv4Net>,
 }
 
 /// Transport protocol of a service port.
@@ -250,7 +261,7 @@ pub fn render_with_services(iface: &str, spec: &FirewallSpec, services: &[Servic
     }
     out.push_str("\t}\n");
     if let Some(containers) = &spec.containers {
-        for (header, rules) in nat_chains(containers, services) {
+        for (header, rules) in nat_chains(iface, containers, services) {
             let _ = writeln!(out, "\tchain {header}");
             for rule in rules {
                 let _ = writeln!(out, "\t\t{rule}");
@@ -264,9 +275,10 @@ pub fn render_with_services(iface: &str, spec: &FirewallSpec, services: &[Servic
 
 /// The nat chains as `(name and hook lines, rules)`. See the module docs.
 fn nat_chains(
+    iface: &str,
     containers: &ContainerFirewall,
     services: &[ServiceNat],
-) -> [(String, Vec<String>); 3] {
+) -> Vec<(String, Vec<String>)> {
     let bridge = &containers.bridge;
     // One group per virtual IP and port, the backends sorted and unique.
     let mut groups: BTreeMap<(Ipv4Addr, NatProtocol, u16), BTreeSet<Ipv4Addr>> = BTreeMap::new();
@@ -296,7 +308,18 @@ fn nat_chains(
         .collect();
 
     let mut pre = Vec::new();
-    let mut post = Vec::new();
+    // A connection the host opens to a service and that goes to a pod on
+    // another node leaves with the host's own source address, which is
+    // not a mesh address, and the peer's WireGuard drops it. It is
+    // masqueraded to the address of the tunnel interface (this node's mesh
+    // IP). Chosen over a route with a mesh `src` because the rule is part
+    // of the same table and needs no second thing kept in step.
+    // `ip saddr != <cidr>` limits it to packets the host made (`fib` is not
+    // available in postrouting), so a container keeps its own source.
+    let cidr = containers.cidr;
+    let mut post = vec![format!(
+        "oifname \"{iface}\" ip saddr != {cidr} ip daddr {cidr} ct status dnat masquerade"
+    )];
     if let Some(local) = containers.local_subnet {
         if let Some(gateway) = local.hosts().next() {
             for protocol in ["udp", "tcp"] {
@@ -323,7 +346,7 @@ fn nat_chains(
         dnat.iter()
             .map(|rule| format!("iifname \"{bridge}\" {rule}")),
     );
-    [
+    let mut chains = vec![
         (
             "prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;".into(),
             pre,
@@ -336,7 +359,25 @@ fn nat_chains(
             "postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;".into(),
             post,
         ),
-    ]
+    ];
+    if let Some(range) = containers.service_cidr {
+        // After the nat chains (priority filter is after dstnat), so a
+        // packet that a service rule translated no longer has a virtual IP
+        // as its destination. What is left is an allocated address with no
+        // backend, or one nobody holds: refused at once instead of being
+        // routed away or dropped without an answer. `reject` is not
+        // available in a nat chain, hence the filter chains.
+        chains.push((
+            "service_reject_prerouting {\n\t\ttype filter hook prerouting priority filter; policy accept;".into(),
+            vec![format!("iifname \"{bridge}\" ip daddr {range} reject")],
+        ));
+        chains.push((
+            "service_reject_output {\n\t\ttype filter hook output priority filter; policy accept;"
+                .into(),
+            vec![format!("ip daddr {range} reject")],
+        ));
+    }
+    chains
 }
 
 /// The forward chain's rules, in order. See the module docs for what each
@@ -548,6 +589,7 @@ table inet faber {
                 local_subnet: local_subnet.map(|s| s.parse().unwrap()),
                 node_mesh_ips: node_mesh_ips.iter().map(|ip| ip.parse().unwrap()).collect(),
                 bridge: "faberbr0".into(),
+                service_cidr: None,
             }),
             ..spec()
         }
@@ -609,6 +651,7 @@ table inet faber {{
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
 	}
 }
 "#;
@@ -673,6 +716,7 @@ table inet faber {
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
 	}
 }
 "#;
@@ -707,6 +751,7 @@ table inet faber {
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
 	}
 }
 "#;
@@ -772,6 +817,7 @@ table inet faber {
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
 		oifname "faberbr0" ip saddr 10.200.1.2 ip daddr 10.200.1.2 ct status dnat masquerade
 		oifname "faberbr0" ip saddr 10.200.1.4 ip daddr 10.200.1.4 ct status dnat masquerade
 	}
@@ -846,6 +892,47 @@ table inet faber {
         assert_eq!(dnat.len(), 2, "{script}");
         assert!(dnat[0].trim_start().starts_with("iifname \"faberbr0\" "));
         assert!(!dnat[1].contains("iifname"));
+    }
+
+    #[test]
+    fn host_connections_to_a_service_are_masqueraded_to_the_tunnel_address() {
+        let s = container_spec(Some("10.200.1.0/24"), &[]);
+        let script = render("faber0", &s);
+        let rule = "oifname \"faber0\" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade";
+        let post = &script[script.find("\tchain postrouting {").unwrap()..];
+        assert!(post.contains(rule), "{post}");
+        // Not in the chains that see the bridge's packets first.
+        assert!(!script[..script.find("\tchain postrouting {").unwrap()].contains(rule));
+    }
+
+    #[test]
+    fn the_service_range_is_rejected_after_the_nat_chains() {
+        let mut s = container_spec(Some("10.200.1.0/24"), &[]);
+        s.containers.as_mut().unwrap().service_cidr = Some("10.201.0.0/16".parse().unwrap());
+        let services = [service(
+            "10.201.0.1",
+            vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
+        )];
+        let script = render_with_services("faber0", &s, &services);
+        let expected = r#"	chain service_reject_prerouting {
+		type filter hook prerouting priority filter; policy accept;
+		iifname "faberbr0" ip daddr 10.201.0.0/16 reject
+	}
+	chain service_reject_output {
+		type filter hook output priority filter; policy accept;
+		ip daddr 10.201.0.0/16 reject
+	}
+}
+"#;
+        assert!(script.ends_with(expected), "{script}");
+        // The nat chains come first, and the filter chains are the only
+        // ones with a reject: it is not valid in a nat chain.
+        let first_reject = script.find("reject").unwrap();
+        assert!(first_reject > script.find("dnat ip to").unwrap());
+        assert_eq!(script.matches("reject").count(), 4);
+        // Without the range there is no reject.
+        let plain = render_with_services("faber0", &container_spec(None, &[]), &services);
+        assert!(!plain.contains("reject"));
     }
 
     #[test]

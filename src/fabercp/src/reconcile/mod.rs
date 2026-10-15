@@ -210,6 +210,7 @@ pub fn desired_network(
                 local_subnet,
                 node_mesh_ips,
                 bridge: POD_BRIDGE.to_string(),
+                service_cidr: mesh.and_then(|m| m.config.service_cidr),
             }),
         },
     };
@@ -1271,6 +1272,19 @@ mod tests {
     }
 
     #[test]
+    fn the_service_range_reaches_the_container_firewall() {
+        let mut m = container_mesh(vec![node_with_subnet(2, "10.200.1.0/24")], vec![]);
+        let (spec, _) = desired_firewall(&local(2), Some(&m), 0);
+        assert_eq!(spec.containers.unwrap().service_cidr, None);
+        m.config.service_cidr = Some(net("10.201.0.0/16"));
+        let (spec, _) = desired_firewall(&local(2), Some(&m), 0);
+        assert_eq!(
+            spec.containers.unwrap().service_cidr,
+            Some(net("10.201.0.0/16"))
+        );
+    }
+
+    #[test]
     fn desired_firewall_from_bootstrap_with_warnings() {
         let bootstrap = vec![
             TokenPeer {
@@ -1495,6 +1509,7 @@ mod tests {
                 local_subnet: Some(net("10.200.1.0/24")),
                 node_mesh_ips: ips(&["10.99.0.1", "10.99.0.3"]),
                 bridge: "faberbr0".into(),
+                service_cidr: None,
             })
         );
     }
@@ -1879,6 +1894,7 @@ mod tests {
                 local_subnet: Some(own),
                 node_mesh_ips: BTreeSet::new(),
                 bridge: "faberbr0".into(),
+                service_cidr: None,
             })
         );
         let runtime = plan.desired.runtime.clone().expect("settings replicated");
