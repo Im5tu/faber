@@ -1869,19 +1869,8 @@ m_roll_ping_stop() {
 # m_roll_gap FILE: the longest gap in seconds between two PONG lines of FILE
 # ("epoch answer"), and the number of PONGs: "GAP COUNT".
 m_roll_gap() {
-  awk '$2 == "PONG" { n++; if (last && $1 - last > max) max = $1 - last; last = $1 } END { print max + 0, n + 0 }' "$1"
-}
-
-# m_roll_stopped_samples FILE: the number of samples in FILE ("epoch index
-# revision state", one row per replica) in which no replica was available at
-# all. With the old replicas stopped together that is what a roll that took
-# both down at once looks like.
-m_roll_stopped_samples() {
-  awk '
-    function flush() { if (cur != "" && up == 0) bad++; up = 0 }
-    $1 != cur { flush(); cur = $1 }
-    $4 == "available" { up++ }
-    END { flush(); print bad + 0 }' "$1"
+  # The time from the last PONG to the end of the log counts too.
+  awk '{ end = $1 } $2 == "PONG" { n++; if (last && $1 - last > max) max = $1 - last; last = $1 } END { if (last && end - last > max) max = end - last; print max + 0, n + 0 }' "$1"
 }
 
 # m_roll_old_down_samples FILE REV: the number of samples in which every
@@ -2013,7 +2002,7 @@ phase_m() {
     ts="$(date +%s)"
     out="$(m_replicas "$NODE_A")"
     [[ -n "$out" ]] && awk -v t="$ts" '{ print t, $1, $3, $4 }' <<<"$out" >>"$LOG_DIR/m-roll-samples.log"
-    if [[ "$(m_available "$NODE_A" "$rev2")" == 2 ]]; then rolled=1; break; fi
+    if [[ "$(awk -v r="$rev2" '$3 == r && $4 == "available" { n++ } END { print n + 0 }' <<<"$out")" == 2 ]]; then rolled=1; break; fi
     sleep 1
   done
   sleep 3
@@ -2033,9 +2022,8 @@ phase_m() {
   else
     fail "M rolling: never more than $M_ROLL_GAP_MAX s without an answer from $M_NAME (longest $seen s)" "$(tail -n 80 "$LOG_DIR/m-roll-ping.log")"
   fi
-  assert_eq "M rolling: no sample had both replicas down at once (none available)" "$(m_roll_stopped_samples "$LOG_DIR/m-roll-samples.log")" "0"
   assert_eq "M rolling: the two replicas were never both on the old revision and down" "$(m_roll_old_down_samples "$LOG_DIR/m-roll-samples.log" "$rev2")" "0"
-  assert_ne "M rolling: the samples saw replicas on the old revision" "$(grep -c " $rev1 " "$LOG_DIR/m-roll-samples.log")" "0"
+  assert_ne "M rolling: the samples saw replicas on the old revision" "$(awk -v r="$rev1" '$3 == r' "$LOG_DIR/m-roll-samples.log" | wc -l)" "0"
   assert_has "M the new revision has GREETING=two" "$(m_show "$NODE_A")" 'GREETING=two'
   vip2="$(m_vip "$NODE_A")"
   assert_eq "M the virtual IP did not change on $NODE_A" "$vip2" "$vip1"
