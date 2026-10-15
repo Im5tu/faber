@@ -22,8 +22,9 @@
 //!   nodes that run the workload, then nodes that host the environment, then
 //!   the most loaded that still fits.
 //! - Each replica reserves the sum of its containers' `cpu_millis` and
-//!   `memory_bytes` against the capacity a node reported. Disk is not
-//!   reserved.
+//!   `memory_bytes` against the capacity a node reported. Block
+//!   volume sizes are reserved against the disk it reported; ramdisks count
+//!   as memory.
 //!
 //! The same pass gives every workload its virtual IP and takes back the
 //! address of a workload that is gone ([`service_ip_proposals`]).
