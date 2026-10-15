@@ -1947,6 +1947,15 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [[ "$output" == *"+ zypper -n in "*" iproute2"* ]]
 }
 
+@test "dry-run: every family installs e2fsprogs for faber-node's block volumes" {
+  make_stub_path
+  local fixture
+  for fixture in ubuntu fedora rocky arch opensuse; do
+    OS_RELEASE_FILE="$FIXTURES/os-release.$fixture" PATH="$TMP/bin:$PATH" run bash "$SCRIPT" --dry-run
+    [[ "$output" == *" install "*" e2fsprogs"* || "$output" == *"zypper -n in "*" e2fsprogs"* || "$output" == *"pacman -Syu "*" e2fsprogs"* ]]
+  done
+}
+
 @test "dry-run: ip missing and no --endpoint defers autodetect instead of dying" {
   make_stub_path
   hide_ip
@@ -4333,20 +4342,28 @@ removed_node() {
     "ExecStart=$FABER_NODE_INSTALL_DIR/faber-node --env-file $FABER_ETC/faber-node.env" \
     'Restart=always' 'StateDirectory=faber-node' 'StateDirectoryMode=0755' \
     'RuntimeDirectory=faber' 'RuntimeDirectoryMode=0755' \
-    'ProtectSystem=strict' 'ReadWritePaths=/var/lib/faber-node' \
-    'ReadWritePaths=/run/faber' 'MountFlags=shared' \
+    'NoNewPrivileges=yes' \
     '[Install]' 'WantedBy=multi-user.target'; do
     grep -qxF -- "$line" <<<"$output"
   done
-  [[ "$output" != *"PrivateDevices"* ]]
   [[ "$output" != *"User=faber"* ]]
+  # mount namespacing would hide the volume mounts from containerd
+  local directive
+  for directive in ProtectSystem= ReadWritePaths= ReadOnlyPaths= InaccessiblePaths= \
+    MountFlags= ProtectHome= PrivateTmp= PrivateMounts= ProtectKernel ProtectControlGroups= \
+    PrivateDevices= BindPaths= BindReadOnlyPaths= TemporaryFileSystem= ProtectProc= ; do
+    if grep -q "^$directive" <<<"$output"; then
+      echo "unexpected $directive" >&2
+      return 1
+    fi
+  done
 }
 
-@test "render_faber_node_unit: a custom socket directory is writable and has no RuntimeDirectory" {
+@test "render_faber_node_unit: a custom socket has no RuntimeDirectory" {
   FABER_NODE_SOCKET=/srv/faber/node.sock run render_faber_node_unit
-  grep -qxF 'ReadWritePaths=/srv/faber' <<<"$output"
   [[ "$output" != *"RuntimeDirectory"* ]]
-  [[ "$output" != *"ReadWritePaths=/run/faber"* ]]
+  run grep -q "^ReadWritePaths" <<<"$output"
+  [ "$status" -eq 1 ]
 }
 
 @test "render_fabercp_unit: starts after faber-node and gains no capability" {
@@ -4391,7 +4408,6 @@ removed_node() {
   grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/fabercp.env"
   grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/faber-node.env"
   [ "$(stat -c '%U:%G %a' "$TMP/srv/faber")" = "root:root 755" ]
-  grep -qxF "ReadWritePaths=$TMP/srv/faber" "$SYSTEMD_UNIT_DIR/faber-node.service"
 }
 
 @test "real run: a changed faber-node binary or env restarts only faber-node, a re-run restarts nothing" {
@@ -4553,7 +4569,7 @@ removed_node() {
   chmod +x "$TMP/bin/systemd-nspawn"
   PATH="$TMP/bin:$PATH" run warn_uid_range_overlaps
   [ "$status" -eq 0 ]
-  [[ "$output" == *"systemd-nspawn"*"524288-1878982655"* ]]
+  [[ "$output" == *"systemd-nspawn"*"524288-1879048191"* ]]
 }
 
 @test "real run: an overlapping subuid entry warns and the install still succeeds" {

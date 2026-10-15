@@ -54,7 +54,8 @@
 #     placement allocates from), FABER_NODE_FABER_UID/GID of the faber user,
 #     FABER_NODE_BIN_DIR/SBIN_DIR and, for a custom $FABER_NODE_SOCKET,
 #     FABER_NODE_SOCKET (also written to fabercp.env). faber-node.service runs
-#     as root after containerd under ProtectSystem=strict; its socket is
+#     as root after containerd, with no mount namespacing (its mounts must
+#     reach containerd); its socket is
 #     /run/faber/node.sock (root:faber 0660, made by faber-node). fabercp
 #     starts after it and gains no capability from it.
 #   - --service-cidr (new mesh only, default 10.201.0.0/16) goes to fabercp as
@@ -225,8 +226,6 @@ readonly NODE_UID_MIN=1048576
 readonly NODE_UID_MAX=2147483648
 # faber-node's default socket (DEFAULT_SOCKET in src/faber-node/src/config.rs).
 readonly DEFAULT_NODE_SOCKET="/run/faber/node.sock"
-# Its default volume root is $NODE_STATE_DIR/volumes (DEFAULT_VOLUME_ROOT).
-readonly NODE_STATE_DIR="/var/lib/faber-node"
 readonly MIN_CONTAINERD_MAJOR=2
 readonly MIN_KERNEL_MAJOR=6
 readonly MIN_KERNEL_MINOR=3
@@ -865,14 +864,14 @@ install_packages() {
     apt)
       run_cmd env DEBIAN_FRONTEND=noninteractive apt-get update
       run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        "${pkgs[@]}" ca-certificates curl tar iproute2
+        "${pkgs[@]}" ca-certificates curl tar iproute2 e2fsprogs
       ;;
     dnf | dnf-el)
       # Only request curl when absent: EL/Fedora images often ship
       # curl-minimal, which conflicts with the full curl package.
       extra=()
       have curl || extra+=(curl)
-      extra+=(tar iproute)
+      extra+=(tar iproute e2fsprogs)
       if [[ "$family" == dnf-el ]]; then
         run_cmd dnf install -y dnf-plugins-core
         if [[ ! -f /etc/yum.repos.d/docker-ce.repo ]]; then
@@ -884,10 +883,10 @@ install_packages() {
       ;;
     pacman)
       # Full sync (-Syu): Arch does not support partial upgrades.
-      run_cmd pacman -Syu --needed --noconfirm "${pkgs[@]}" curl tar iproute2
+      run_cmd pacman -Syu --needed --noconfirm "${pkgs[@]}" curl tar iproute2 e2fsprogs
       ;;
     zypper)
-      run_cmd zypper -n in "${pkgs[@]}" curl tar iproute2
+      run_cmd zypper -n in "${pkgs[@]}" curl tar iproute2 e2fsprogs
       run_cmd zypper -n up "${pkgs[@]}"
       ;;
     *) die "unknown package family: $family" ;;
@@ -1625,18 +1624,20 @@ render_node_env() {
 }
 
 # render_faber_node_unit: faber-node runs as root (it mounts, chowns and talks
-# CRI for fabercp). It writes only its state directory (the volumes) and the
-# directory of its socket, so those are the only ReadWritePaths. The default
-# socket directory /run/faber comes from RuntimeDirectory= with mode 0755:
-# faber-node refuses a socket directory that is not root's alone, and the
-# faber user must still be able to reach the socket (root:faber 0660, set by
-# faber-node). A custom socket's directory is made by the installer.
-# MountFlags=shared lets the volume mounts reach containerd's mount namespace.
+# CRI for fabercp). The default socket directory /run/faber comes from
+# RuntimeDirectory= with mode 0755: faber-node refuses a socket directory that
+# is not root's alone, and the faber user must still be able to reach the
+# socket (root:faber 0660, set by faber-node). A custom socket's directory is
+# made by the installer. There is deliberately no ProtectSystem=,
+# ReadWritePaths=, ProtectHome=, PrivateTmp= or MountFlags=: each puts the unit
+# in its own mount namespace, and systemd does not propagate mounts out of it,
+# so the volume tmpfs and loop mounts would never be visible to containerd.
 render_faber_node_unit() {
-  local sock_dir
-  sock_dir="$(dirname "$FABER_NODE_SOCKET")"
   cat <<EOF
 $MANAGED_MARKER
+# No ProtectSystem, ReadWritePaths, PrivateTmp or MountFlags on purpose: they
+# put the unit in its own mount namespace, and the volume mounts it makes
+# would never reach containerd.
 [Unit]
 Description=Faber node helper (root)
 After=containerd.service
@@ -1654,12 +1655,7 @@ EOF
     printf 'RuntimeDirectory=faber\nRuntimeDirectoryMode=0755\n'
   fi
   cat <<EOF
-ProtectSystem=strict
-ReadWritePaths=$NODE_STATE_DIR
-ReadWritePaths=$sock_dir
-MountFlags=shared
-ProtectHome=yes
-PrivateTmp=yes
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -2239,8 +2235,8 @@ warn_uid_range_overlaps() {
     done <"$file"
   done
   if have systemd-nspawn; then
-    # systemd-nspawn -U picks from 524288-1878982655 (systemd UIDS-GIDS docs).
-    warn "systemd-nspawn is installed and picks container ids from 524288-1878982655, which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); do not run both on this node"
+    # systemd-nspawn -U picks from 524288-1879048191 (systemd UIDS-GIDS docs).
+    warn "systemd-nspawn is installed and picks container ids from 524288-1879048191, which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); do not run both on this node"
   fi
 }
 
