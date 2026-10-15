@@ -64,6 +64,38 @@ fn labels(replica: &ReplicaRef) -> HashMap<String, String> {
     replica.labels().into_iter().collect()
 }
 
+/// The systemd slice a workload's pods run in: `faber-<project>-<env>-<workload>.slice`,
+/// a child of `faber-<project>-<env>.slice`, `faber-<project>.slice` and
+/// `faber.slice`. containerd's systemd cgroup driver needs a slice here, and
+/// the slice puts every pod of a workload under one cgroup that systemd and
+/// the container limits both see.
+///
+/// Built only from the replica's names, which `trust::check_replica` has
+/// already limited to DNS labels (`a-z`, `0-9`, `-`). systemd reads `-` as a
+/// step down the hierarchy, so a dash inside a name becomes `_`, which no
+/// label contains: two different replicas never share a slice by accident.
+/// Any other character cannot occur; it is mapped to `_` rather than passed
+/// on, so a name never adds a slice level or a path.
+pub fn cgroup_parent(replica: &ReplicaRef) -> String {
+    let part = |name: &str| -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!(
+        "faber-{}-{}-{}.slice",
+        part(&replica.project),
+        part(&replica.env),
+        part(&replica.workload)
+    )
+}
+
 pub fn sandbox_config(
     replica: &ReplicaRef,
     uid_base: u32,
@@ -106,6 +138,7 @@ pub fn sandbox_config(
         labels: labels(replica),
         annotations: HashMap::from([(ANNOTATION_UID_BASE.to_owned(), uid_base.to_string())]),
         linux: Some(LinuxPodSandboxConfig {
+            cgroup_parent: cgroup_parent(replica),
             security_context: Some(LinuxSandboxSecurityContext {
                 namespace_options: Some(namespace_options(uid_base)),
                 privileged: false,
@@ -350,6 +383,55 @@ mod tests {
             nameservers: vec![Ipv4Addr::new(10, 200, 0, 1)],
             searches: vec!["prod.shop.faber.local".into()],
         }
+    }
+
+    #[test]
+    fn the_cgroup_parent_is_a_slice_of_the_workload() {
+        assert_eq!(cgroup_parent(&replica()), "faber-shop-prod-redis.slice");
+        let mut r = replica();
+        r.project = "my-shop".into();
+        r.workload = "web-1".into();
+        // A dash inside a name is not a level of the hierarchy.
+        assert_eq!(cgroup_parent(&r), "faber-my_shop-prod-web_1.slice");
+    }
+
+    #[test]
+    fn the_cgroup_parent_is_set_on_both_sandbox_configs() {
+        let r = replica();
+        let want = "faber-shop-prod-redis.slice";
+        let run = sandbox_config(&r, 65536, &dns(), &[]);
+        assert_eq!(run.linux.unwrap().cgroup_parent, want);
+        let create = container_sandbox_config(&r, 65536, None);
+        assert_eq!(create.linux.unwrap().cgroup_parent, want);
+    }
+
+    #[test]
+    fn the_cgroup_parent_never_adds_a_level_or_a_path() {
+        // Names that trust::check_replica refuses; still harmless here.
+        for bad in ["../x", "a/b", "a.slice", "A", "a b", "a\nb", "é", ""] {
+            let mut r = replica();
+            r.workload = bad.into();
+            let slice = cgroup_parent(&r);
+            let name = slice.strip_suffix(".slice").expect("ends in .slice");
+            assert_eq!(name.matches('-').count(), 3, "{bad:?} {slice}");
+            assert!(
+                name.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'-' | b'_')),
+                "{bad:?} {slice}"
+            );
+        }
+    }
+
+    #[test]
+    fn different_workloads_get_different_slices() {
+        let mut a = replica();
+        let mut b = replica();
+        a.project = "a-b".into();
+        a.env = "c".into();
+        b.project = "a".into();
+        b.env = "b-c".into();
+        assert_ne!(cgroup_parent(&a), cgroup_parent(&b));
     }
 
     fn assert_userns(opts: &NamespaceOption, base: u32) {
