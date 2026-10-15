@@ -789,7 +789,7 @@ impl MeshState {
 /// Whether `ip` is a host address of `net`: inside it, and neither the
 /// network nor the broadcast address (both count as hosts in /31 and /32,
 /// matching [`Ipv4Net::hosts`]).
-fn is_host_addr(net: Ipv4Net, ip: Ipv4Addr) -> bool {
+pub(crate) fn is_host_addr(net: Ipv4Net, ip: Ipv4Addr) -> bool {
     net.contains(&ip) && (net.prefix_len() >= 31 || (ip != net.network() && ip != net.broadcast()))
 }
 

@@ -19,6 +19,7 @@ use faber_api_types::workload::ReplicaState;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
+use crate::mesh::state::is_host_addr;
 use crate::mesh::{MeshState, Rejection};
 
 /// Every status record is under this prefix. `Request::Set` refuses it.
@@ -182,9 +183,9 @@ fn check_replicas(replicas: &[ReplicaReport]) -> Result<(), Rejection> {
 
 fn check_pod_ips(replicas: &[ReplicaReport], subnet: Option<Ipv4Net>) -> Result<(), Rejection> {
     for ip in replicas.iter().filter_map(|r| r.pod_ip) {
-        if !subnet.is_some_and(|net| net.contains(&ip)) {
+        if !subnet.is_some_and(|net| is_host_addr(net, ip)) {
             return Err(bad(format!(
-                "pod address {ip} is outside the container subnet of the node"
+                "pod address {ip} is outside the container subnet of the node, or its network or broadcast address"
             )));
         }
     }
@@ -355,6 +356,9 @@ mod tests {
             "127.0.0.1",
             "169.254.169.254",
             "10.200.1.2",
+            // The network and broadcast addresses of the subnet.
+            "10.200.0.0",
+            "10.200.0.255",
             "10.99.0.2",
             "192.168.1.1",
         ] {
