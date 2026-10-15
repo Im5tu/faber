@@ -41,8 +41,6 @@
 #      replicas available, its name resolves to the virtual IP and answers
 #      PING from containers on both nodes, a killed redis comes back with
 #      its data, and a redeploy with a changed env keeps the virtual IP.
-#      E2E_CGROUPFS_WORKAROUND=1 sets runc to cgroupfs first (see
-#      e2e-findings.md).
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -333,7 +331,7 @@ check_binaries() {
 containerd_checks() {
   local t="$1" n="$2" out dump
   out="$(dx "$n" 'stat -c "%U:%G %a" /etc/containerd/conf.d/faber.toml')"
-  assert_eq "$t containerd: conf.d/faber.toml exists, faber:faber 0644" "$out" "faber:faber 644"
+  assert_eq "$t containerd: conf.d/faber.toml exists, root:root 0644" "$out" "root:root 644"
   out="$(dx "$n" 'cat /etc/containerd/config.toml')"
   assert_has "$t containerd: root config is version 2 and imports conf.d" "$out" '^imports = \["/etc/containerd/conf.d/\*\.toml"\]$'
   info "containerd version: $(dx "$n" 'containerd --version')"
@@ -372,7 +370,7 @@ reload_path_checks() {
   dx "$n" 'set -e
     cd /etc/containerd/conf.d
     sed "s#pause:3.10#pause:3.9-e2e#" faber.toml > .e2e-new.toml
-    chown faber:faber .e2e-new.toml && chmod 0644 .e2e-new.toml
+    chown root:root .e2e-new.toml && chmod 0644 .e2e-new.toml
     mv -f .e2e-new.toml faber.toml' >/dev/null
   wait_for 30 "$n" "systemctl is-active -q containerd && [[ \"\$(systemctl show -p MainPID --value containerd)\" != \"$before_pid\" ]] && containerd config dump | grep -q 'pause:3.9-e2e'"
   after_pid="$(main_pid "$n" containerd)"
@@ -759,7 +757,7 @@ container_node_checks() {
   local cidr_re="${CONTAINER_CIDR//./\\.}"
 
   wait_for 30 "$n" "grep -q '\"subnet\"' $CNI_CONFLIST"
-  assert_eq "$t $n: $CNI_CONFLIST is faber:faber 0644" "$(dx "$n" "stat -c '%U:%G %a' $CNI_CONFLIST")" "faber:faber 644"
+  assert_eq "$t $n: $CNI_CONFLIST is root:root 0644" "$(dx "$n" "stat -c '%U:%G %a' $CNI_CONFLIST")" "root:root 644"
   out="$(dx "$n" "cat $CNI_CONFLIST")"
   printf '%s\n' "$out" >"$LOG_DIR/conflist-$n.log"
   evidence "$(grep -E '"(cniVersion|name|type|bridge|ipMasq|mtu|subnet|dataDir)"' <<<"$out")"
@@ -1067,10 +1065,12 @@ phase_j() {
 
   # Unknown targets. The spec has no replicas, so nothing ever runs: a
   # deploy of it only stores records.
-  j_put "$NODE_B" spec.json <<'EOF'
+  for n in "$NODE_A" "$NODE_B"; do
+    j_put "$n" spec.json <<'EOF'
 {"web":{"scale":{"replicas":{"count":0}},"containers":[{"name":"web","image":"nginx:1.27"}]},
  "api":{"scale":{"replicas":{"count":0}},"containers":[{"name":"api","image":"nginx:1.27"}]}}
 EOF
+  done
   out="$(dx "$NODE_B" "faber deploy spec $J_DIR/spec.json --project nope --env staging")"
   rc=$?
   assert_eq "J deploy to an unknown project exits 1" "$rc" "1"
@@ -1132,8 +1132,8 @@ EOF
   rc=$?
   evidence "$out"
   assert_ok "J $NODE_B: faber app rm web api exits 0" "$rc" "$out"
-  assert_has "J app rm prints removed web.staging.shop" "$out" '^removed web\.staging\.shop\.faber\.(internal|local)$'
-  assert_has "J app rm prints removed api.staging.shop" "$out" '^removed api\.staging\.shop\.faber\.(internal|local)$'
+  assert_has "J app rm prints removed web.staging.shop" "$out" '^removed web\.staging\.shop\.faber\.local$'
+  assert_has "J app rm prints removed api.staging.shop" "$out" '^removed api\.staging\.shop\.faber\.local$'
   out="$(dx "$NODE_B" 'faber app rm web --project shop --env staging')"
   rc=$?
   assert_eq "J faber app rm of a removed workload exits 1" "$rc" "1"
@@ -1148,7 +1148,7 @@ EOF
   assert_ok "J faber project env rm of the now empty staging exits 0" "$rc" "$out"
   assert_has "J env rm prints removed environment staging from shop" "$out" '^removed environment staging from shop$'
   out="$(dx "$NODE_A" 'faber app rm web api --project shop --env production')"
-  assert_has "J app rm prints removed web.production.shop" "$out" '^removed web\.production\.shop\.faber\.(internal|local)$'
+  assert_has "J app rm prints removed web.production.shop" "$out" '^removed web\.production\.shop\.faber\.local$'
   out="$(dx "$NODE_A" 'faber project rm shop')"
   rc=$?
   evidence "$out"
@@ -1181,7 +1181,8 @@ phase_c() {
     out="$(dx "$n" 'cat /etc/faber/fabercp.env')"
     evidence "$out"
     assert_hasnt "C $n: fabercp.env has no bootstrap variables" "$out" '^FABER_(JOIN_TOKEN_FILE|NEW_MESH|MESH_CIDR|NODE_NAME|CONTAINER_CIDR)='
-    assert_has "C $n: fabercp.env names the CNI config directory" "$out" '^FABER_CNI_CONF_DIR=/etc/cni/net\.d$'
+    assert_hasnt "C $n: fabercp.env no longer names the config directories (faber-node writes them)" "$out" '^FABER_(CNI|CONTAINERD)_CONF_DIR='
+    assert_has "C $n: faber-node.env names the CNI config directory" "$(dx "$n" 'cat /etc/faber/faber-node.env')" '^FABER_NODE_CNI_CONF_DIR=/etc/cni/net\.d$'
     assert_eq "C $n: fabercp.env is root:faber 0640" "$(dx "$n" 'stat -c "%U:%G %a" /etc/faber/fabercp.env')" "root:faber 640"
     assert_eq "C $n: still 2 voters" "$(voters "$n")" "2"
   done
@@ -1258,10 +1259,11 @@ phase_e() {
     assert_eq "E $n: /var/lib/faber is faber:faber 0700" "$(dx "$n" 'stat -c "%U:%G %a" /var/lib/faber')" "faber:faber 700"
     assert_eq "E $n: identity.json is faber:faber 0600" "$(dx "$n" 'stat -c "%U:%G %a" /var/lib/faber/identity.json')" "faber:faber 600"
     assert_eq "E $n: /etc/faber is root:faber 0750" "$(dx "$n" 'stat -c "%U:%G %a" /etc/faber')" "root:faber 750"
-    assert_eq "E $n: /etc/cni/net.d is faber:faber 0755" "$(dx "$n" 'stat -c "%U:%G %a" /etc/cni/net.d')" "faber:faber 755"
+    assert_eq "E $n: /etc/cni/net.d is root:root 0755" "$(dx "$n" 'stat -c "%U:%G %a" /etc/cni/net.d')" "root:root 755"
+    assert_eq "E $n: /etc/containerd/conf.d is root:root 0755" "$(dx "$n" 'stat -c "%U:%G %a" /etc/containerd/conf.d')" "root:root 755"
     out="$(dx "$n" 'grep -E "^(ReadWritePaths|AmbientCapabilities|CapabilityBoundingSet)=" /etc/systemd/system/fabercp.service' | tr '\n' ' ')"
-    assert_eq "E $n: the unit grants CAP_NET_ADMIN only and may write the containerd and CNI config directories" "$out" \
-      "AmbientCapabilities=CAP_NET_ADMIN CapabilityBoundingSet=CAP_NET_ADMIN ReadWritePaths=/etc/containerd/conf.d ReadWritePaths=/etc/cni/net.d "
+    assert_eq "E $n: the unit grants CAP_NET_ADMIN only and may write no config directory" "$out" \
+      "AmbientCapabilities=CAP_NET_ADMIN CapabilityBoundingSet=CAP_NET_ADMIN "
     out="$(dx "$n" 'systemd-analyze verify /etc/systemd/system/fabercp.service /etc/systemd/system/faber-containerd-reload.path /etc/systemd/system/faber-containerd-reload.service; echo "rc=$?"')"
     evidence "$out"
     assert_has "E $n: systemd-analyze verify exits 0 for the three units" "$out" '^rc=0$'
@@ -1776,8 +1778,7 @@ EOF
 m_deploy() {
   m_spec "$1" | docker exec -i "$NODE_A" faber deploy spec - --project "$M_PROJECT" --env "$M_ENV" >"$LOG_DIR/m-deploy-$1.log" 2>&1
   M_RC=${PIPESTATUS[1]}
-  M_OUT="$(tr -d '
-' <"$LOG_DIR/m-deploy-$1.log")"
+  M_OUT="$(tr -d '\r' <"$LOG_DIR/m-deploy-$1.log")"
 }
 
 # m_show NODE: faber app show of the service.
@@ -1843,15 +1844,6 @@ phase_m() {
   section "M: redis from Docker Hub behind a virtual IP, on $NODE_A and $NODE_B"
   pfx_a="${SUBNET_A%.0/24}."
 
-  # containerd 2.x with systemd cgroups needs a pod cgroup parent that is a
-  # slice. See e2e-findings.md. Until faber sets one, E2E_CGROUPFS_WORKAROUND=1
-  # makes runc use cgroupfs so the rest of the phase can run.
-  if [[ "${E2E_CGROUPFS_WORKAROUND:-0}" == 1 ]]; then
-    for n in "$NODE_A" "$NODE_B"; do
-      dx "$n" 'printf "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]\n  SystemdCgroup = false\n" > /etc/containerd/conf.d/zz-e2e-cgroupfs.toml && systemctl restart containerd' >/dev/null
-    done
-    info "E2E_CGROUPFS_WORKAROUND=1: runc uses cgroupfs on both nodes"
-  fi
   for n in "$NODE_A" "$NODE_B"; do
     out="$(install_crictl "$n")"
     assert_ok "M $n: crictl is installed" "$?" "$out"
