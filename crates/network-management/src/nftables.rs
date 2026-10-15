@@ -56,6 +56,23 @@
 //! and matches no rule. The input chain is the same with and without
 //! containers, so a container reaches no other node's mesh IP.
 //!
+//! With containers there are also three nat chains, `prerouting`, `output` and
+//! `postrouting`, in the same table:
+//! - Packets from `<bridge>` addressed to the bridge gateway (the first host
+//!   address of `<local>`, where the CNI plugin puts it) on port 53, udp and
+//!   tcp, are redirected to [`DNS_REDIRECT_PORT`], so the DNS server needs no
+//!   privileged port.
+//! - Each [`ServiceNat`] adds a `dnat` rule per `(protocol, port)` to
+//!   `prerouting` (only for packets from `<bridge>`, so the node never
+//!   relays virtual IP traffic for a peer) and to `output` (the host's own
+//!   packets). The backend is picked per new connection with
+//!   `numgen random mod N` over the backends that serve that port. A port
+//!   with no backend gets no rule (`mod 0` is invalid). The port number is
+//!   not changed.
+//! - A pod that reaches its own service and is sent back to itself would see
+//!   its own address as the source. `postrouting` masquerades exactly that
+//!   case, for every backend that is on `<local>`.
+//!
 //! No default-drop for anything else. A later replicated `config/firewall`
 //! key feeds the same [`render`].
 //!
@@ -64,7 +81,7 @@
 //! can drop the packet, so our accepts never open a port the admin's firewall
 //! closes. A `drop` is final everywhere, so our drops always hold.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -84,6 +101,10 @@ pub const SET_PEER_ENDPOINTS: &str = "peer_endpoints";
 pub const SET_PEER_ENDPOINTS6: &str = "peer_endpoints6";
 /// Set of peer mesh IPs (`type ipv4_addr`).
 pub const SET_PEER_MESH_IPS: &str = "peer_mesh_ips";
+/// Port the DNS server listens on at the bridge gateway. Port 53 on the
+/// gateway is redirected to it. Not 5353, which mDNS daemons bind, and not
+/// the default peer port.
+pub const DNS_REDIRECT_PORT: u16 = 5300;
 /// Set of registered nodes' mesh IPs (`type ipv4_addr`). Only in the table
 /// when [`FirewallSpec::containers`] is set.
 pub const SET_NODE_MESH_IPS: &str = "node_mesh_ips";
@@ -121,6 +142,41 @@ pub struct ContainerFirewall {
     pub bridge: String,
 }
 
+/// Transport protocol of a service port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatProtocol {
+    Tcp,
+    Udp,
+}
+
+impl NatProtocol {
+    fn keyword(self) -> &'static str {
+        match self {
+            NatProtocol::Tcp => "tcp",
+            NatProtocol::Udp => "udp",
+        }
+    }
+}
+
+/// One container that serves a port of a service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NatBackend {
+    /// The pod address.
+    pub ip: Ipv4Addr,
+    /// The port, which is also the port of the virtual IP.
+    pub port: u16,
+    pub protocol: NatProtocol,
+}
+
+/// A service's virtual IP and the containers that serve it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceNat {
+    pub vip: Ipv4Addr,
+    /// May be empty: then the service has no rule.
+    pub backends: Vec<NatBackend>,
+}
+
 /// The full `nft -f -` script: deletes and recreates `table inet faber`
 /// atomically (`table inet faber {}` + `delete table inet faber` + the
 /// definition), so reloading is idempotent. Deterministic for equal input.
@@ -128,7 +184,10 @@ pub struct ContainerFirewall {
 /// `iface` (the WireGuard interface) and the container bridge name are
 /// written into the script verbatim; [`apply`] rejects names that fail
 /// [`crate::is_valid_iface_name`].
-pub fn render(iface: &str, spec: &FirewallSpec) -> String {
+///
+/// `services` add the nat rules to the nat chains, which exist only when
+/// [`FirewallSpec::containers`] is set.
+pub fn render_with_services(iface: &str, spec: &FirewallSpec, services: &[ServiceNat]) -> String {
     let v4: Vec<String> = spec
         .peer_endpoint_ips
         .iter()
@@ -189,8 +248,95 @@ pub fn render(iface: &str, spec: &FirewallSpec) -> String {
     for rule in forward_rules(iface, spec.containers.as_ref()) {
         let _ = writeln!(out, "\t\t{rule}");
     }
-    out.push_str("\t}\n}\n");
+    out.push_str("\t}\n");
+    if let Some(containers) = &spec.containers {
+        for (header, rules) in nat_chains(containers, services) {
+            let _ = writeln!(out, "\tchain {header}");
+            for rule in rules {
+                let _ = writeln!(out, "\t\t{rule}");
+            }
+            out.push_str("\t}\n");
+        }
+    }
+    out.push_str("}\n");
     out
+}
+
+/// The nat chains as `(name and hook lines, rules)`. See the module docs.
+fn nat_chains(
+    containers: &ContainerFirewall,
+    services: &[ServiceNat],
+) -> [(String, Vec<String>); 3] {
+    let bridge = &containers.bridge;
+    // One group per virtual IP and port, the backends sorted and unique.
+    let mut groups: BTreeMap<(Ipv4Addr, NatProtocol, u16), BTreeSet<Ipv4Addr>> = BTreeMap::new();
+    for service in services {
+        for b in &service.backends {
+            groups
+                .entry((service.vip, b.protocol, b.port))
+                .or_default()
+                .insert(b.ip);
+        }
+    }
+    let dnat: Vec<String> = groups
+        .iter()
+        .map(|((vip, protocol, port), ips)| {
+            let map = ips
+                .iter()
+                .enumerate()
+                .map(|(i, ip)| format!("{i} : {ip}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "ip daddr {vip} {} dport {port} dnat ip to numgen random mod {} map {{ {map} }}",
+                protocol.keyword(),
+                ips.len()
+            )
+        })
+        .collect();
+
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    if let Some(local) = containers.local_subnet {
+        if let Some(gateway) = local.hosts().next() {
+            for protocol in ["udp", "tcp"] {
+                pre.push(format!(
+                    "iifname \"{bridge}\" ip daddr {gateway} {protocol} dport 53 redirect to :{DNS_REDIRECT_PORT}"
+                ));
+            }
+        }
+        // A rule per backend on this node: nft cannot compare the source
+        // with the destination.
+        let local_backends: BTreeSet<Ipv4Addr> = groups
+            .values()
+            .flatten()
+            .copied()
+            .filter(|ip| local.contains(ip))
+            .collect();
+        for ip in local_backends {
+            post.push(format!(
+                "oifname \"{bridge}\" ip saddr {ip} ip daddr {ip} ct status dnat masquerade"
+            ));
+        }
+    }
+    pre.extend(
+        dnat.iter()
+            .map(|rule| format!("iifname \"{bridge}\" {rule}")),
+    );
+    [
+        (
+            "prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;".into(),
+            pre,
+        ),
+        (
+            "output {\n\t\ttype nat hook output priority dstnat; policy accept;".into(),
+            dnat,
+        ),
+        (
+            "postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;".into(),
+            post,
+        ),
+    ]
 }
 
 /// The forward chain's rules, in order. See the module docs for what each
@@ -249,13 +395,14 @@ fn write_set(out: &mut String, name: &str, ty: &str, elements: &[String]) {
     out.push_str("\t}\n");
 }
 
-/// Loads [`render`] with `nft -f -`, the script on stdin. Runs nothing when
+/// Loads [`render_with_services`] with `nft -f -`, the script on stdin. Runs nothing when
 /// `iface` or the container bridge name is not a valid interface name, or
 /// when the two are the same.
 pub async fn apply(
     runner: &dyn CommandRunner,
     iface: &str,
     spec: &FirewallSpec,
+    services: &[ServiceNat],
 ) -> Result<(), NetworkError> {
     check_iface_name(iface)?;
     if let Some(containers) = &spec.containers {
@@ -270,7 +417,7 @@ pub async fn apply(
         runner,
         "nft",
         &["-f", "-"],
-        Some(render(iface, spec).into_bytes()),
+        Some(render_with_services(iface, spec, services).into_bytes()),
     )
     .await?;
     Ok(())
@@ -284,6 +431,12 @@ pub fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
         .parse::<SocketAddr>()
         .ok()
         .map(|sa| sa.ip().to_canonical())
+}
+
+/// [`render_with_services`] without services.
+#[cfg(test)]
+pub(crate) fn render(iface: &str, spec: &FirewallSpec) -> String {
+    render_with_services(iface, spec, &[])
 }
 
 #[cfg(test)]
@@ -448,6 +601,15 @@ table inet faber {{
 		oifname "faber0" drop
 		iifname "faber0" drop
 	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
 }
 "#;
         assert_eq!(
@@ -501,6 +663,17 @@ table inet faber {
 		oifname "faber0" drop
 		iifname "faber0" drop
 	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "faberbr0" ip daddr 10.200.1.1 udp dport 53 redirect to :5300
+		iifname "faberbr0" ip daddr 10.200.1.1 tcp dport 53 redirect to :5300
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
 }
 "#;
         let s = container_spec(Some("10.200.1.0/24"), &["10.99.0.4", "10.99.0.1"]);
@@ -524,12 +697,161 @@ table inet faber {
 		oifname "faber0" drop
 		iifname "faber0" drop
 	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "faberbr0" ip daddr 10.200.0.1 udp dport 53 redirect to :5300
+		iifname "faberbr0" ip daddr 10.200.0.1 tcp dport 53 redirect to :5300
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
 }
 "#;
         assert_eq!(
             render("faber0", &container_spec(Some("10.200.0.0/24"), &[])),
             format!("{head}{forward}")
         );
+    }
+
+    fn backend(ip: &str, port: u16, protocol: NatProtocol) -> NatBackend {
+        NatBackend {
+            ip: ip.parse().unwrap(),
+            port,
+            protocol,
+        }
+    }
+
+    fn service(vip: &str, backends: Vec<NatBackend>) -> ServiceNat {
+        ServiceNat {
+            vip: vip.parse().unwrap(),
+            backends,
+        }
+    }
+
+    const NAT_START: &str = "\tchain prerouting {";
+
+    #[test]
+    fn render_service_nat_golden() {
+        let services = [
+            // Two replicas, listed out of order, one of them on this node.
+            service(
+                "10.201.0.2",
+                vec![
+                    backend("10.200.2.5", 6379, NatProtocol::Tcp),
+                    backend("10.200.1.4", 6379, NatProtocol::Tcp),
+                ],
+            ),
+            // Two protocols on one port, one replica.
+            service(
+                "10.201.0.1",
+                vec![
+                    backend("10.200.1.2", 53, NatProtocol::Udp),
+                    backend("10.200.1.2", 53, NatProtocol::Tcp),
+                ],
+            ),
+            // No backend: no rule.
+            service("10.201.0.3", vec![]),
+        ];
+        let s = container_spec(Some("10.200.1.0/24"), &["10.99.0.1"]);
+        let expected = r#"	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "faberbr0" ip daddr 10.200.1.1 udp dport 53 redirect to :5300
+		iifname "faberbr0" ip daddr 10.200.1.1 tcp dport 53 redirect to :5300
+		iifname "faberbr0" ip daddr 10.201.0.1 tcp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
+		iifname "faberbr0" ip daddr 10.201.0.1 udp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
+		iifname "faberbr0" ip daddr 10.201.0.2 tcp dport 6379 dnat ip to numgen random mod 2 map { 0 : 10.200.1.4, 1 : 10.200.2.5 }
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr 10.201.0.1 tcp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
+		ip daddr 10.201.0.1 udp dport 53 dnat ip to numgen random mod 1 map { 0 : 10.200.1.2 }
+		ip daddr 10.201.0.2 tcp dport 6379 dnat ip to numgen random mod 2 map { 0 : 10.200.1.4, 1 : 10.200.2.5 }
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faberbr0" ip saddr 10.200.1.2 ip daddr 10.200.1.2 ct status dnat masquerade
+		oifname "faberbr0" ip saddr 10.200.1.4 ip daddr 10.200.1.4 ct status dnat masquerade
+	}
+}
+"#;
+        let script = render_with_services("faber0", &s, &services);
+        assert_eq!(&script[script.find(NAT_START).unwrap()..], expected);
+        // Above the nat chains the table is the one without services.
+        let plain = render("faber0", &s);
+        assert_eq!(
+            script[..script.find(NAT_START).unwrap()],
+            plain[..plain.find(NAT_START).unwrap()]
+        );
+    }
+
+    #[test]
+    fn service_nat_does_not_depend_on_input_order() {
+        let a = service(
+            "10.201.0.1",
+            vec![
+                backend("10.200.1.2", 80, NatProtocol::Tcp),
+                backend("10.200.2.2", 80, NatProtocol::Tcp),
+            ],
+        );
+        let b = service(
+            "10.201.0.2",
+            vec![backend("10.200.1.3", 80, NatProtocol::Tcp)],
+        );
+        let mut a_rev = a.clone();
+        a_rev.backends.reverse();
+        let s = container_spec(Some("10.200.1.0/24"), &[]);
+        assert_eq!(
+            render_with_services("faber0", &s, &[a.clone(), b.clone()]),
+            render_with_services("faber0", &s, &[b, a_rev])
+        );
+    }
+
+    #[test]
+    fn a_service_without_backends_has_no_rule() {
+        let s = container_spec(Some("10.200.1.0/24"), &[]);
+        let script = render_with_services("faber0", &s, &[service("10.201.0.1", vec![])]);
+        assert!(!script.contains("mod 0"), "{script}");
+        assert_eq!(script, render("faber0", &s));
+    }
+
+    #[test]
+    fn nat_rules_come_only_with_containers() {
+        let services = [service(
+            "10.201.0.1",
+            vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
+        )];
+        assert_eq!(
+            render_with_services("faber0", &spec(), &services),
+            render("faber0", &spec())
+        );
+    }
+
+    /// A node must not relay virtual IP traffic for a peer: the rules in
+    /// `prerouting` match the bridge, the rules in `output` match no input.
+    #[test]
+    fn dnat_applies_only_to_the_bridge_and_the_host() {
+        let services = [service(
+            "10.201.0.1",
+            vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
+        )];
+        let s = container_spec(Some("10.200.1.0/24"), &[]);
+        let script = render_with_services("faber0", &s, &services);
+        let dnat: Vec<&str> = script
+            .lines()
+            .filter(|l| l.contains("dnat ip to"))
+            .collect();
+        assert_eq!(dnat.len(), 2, "{script}");
+        assert!(dnat[0].trim_start().starts_with("iifname \"faberbr0\" "));
+        assert!(!dnat[1].contains("iifname"));
+    }
+
+    #[test]
+    fn the_dns_port_is_not_the_mdns_port() {
+        assert_ne!(DNS_REDIRECT_PORT, 5353);
+        assert!(DNS_REDIRECT_PORT > 1024);
     }
 
     /// The container rules never touch the input chain: a container must not
@@ -823,7 +1145,7 @@ table inet faber {
         let r = RecordingRunner::new();
         let mut s = with_subnet();
         s.containers.as_mut().unwrap().bridge = "faber0".into();
-        let err = apply(&r, "faber0", &s).await.unwrap_err();
+        let err = apply(&r, "faber0", &s, &[]).await.unwrap_err();
         assert!(
             matches!(&err, NetworkError::BridgeIsMeshInterface(n) if n == "faber0"),
             "{err:?}"
@@ -834,7 +1156,7 @@ table inet faber {
         );
         assert!(r.calls().is_empty());
         // A bridge with another name is fine.
-        apply(&r, "faber0", &with_subnet()).await.unwrap();
+        apply(&r, "faber0", &with_subnet(), &[]).await.unwrap();
         assert_eq!(r.cmdlines(), vec!["nft -f -"]);
     }
 
@@ -843,7 +1165,7 @@ table inet faber {
         let r = RecordingRunner::new();
         let mut s = with_subnet();
         s.containers.as_mut().unwrap().bridge = "br0\" accept".into();
-        let err = apply(&r, "faber0", &s).await.unwrap_err();
+        let err = apply(&r, "faber0", &s, &[]).await.unwrap_err();
         assert!(
             matches!(&err, NetworkError::InvalidInterface(n) if n == "br0\" accept"),
             "{err:?}"
@@ -854,7 +1176,7 @@ table inet faber {
     #[tokio::test]
     async fn apply_pipes_script_on_stdin() {
         let r = RecordingRunner::new();
-        apply(&r, "faber0", &spec()).await.unwrap();
+        apply(&r, "faber0", &spec(), &[]).await.unwrap();
         let calls = r.calls();
         assert_eq!(r.cmdlines(), vec!["nft -f -"]);
         assert_eq!(
@@ -871,7 +1193,7 @@ table inet faber {
             None,
             CommandOutput::failure(1, "Error: syntax error, unexpected junk"),
         );
-        let err = apply(&r, "faber0", &spec()).await.unwrap_err();
+        let err = apply(&r, "faber0", &spec(), &[]).await.unwrap_err();
         assert!(err.to_string().contains("unexpected junk"), "{err}");
     }
 
@@ -880,7 +1202,7 @@ table inet faber {
         let r = RecordingRunner::new();
         let s = spec();
         assert!(matches!(
-            apply(&r, "faber0\" accept", &s).await,
+            apply(&r, "faber0\" accept", &s, &[]).await,
             Err(NetworkError::InvalidInterface(_))
         ));
         assert!(r.calls().is_empty());

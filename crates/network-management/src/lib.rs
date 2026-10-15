@@ -19,12 +19,15 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-pub use nftables::{ContainerFirewall, FirewallSpec, endpoint_ip};
+pub use nftables::{
+    ContainerFirewall, DNS_REDIRECT_PORT, FirewallSpec, NatBackend, NatProtocol, ServiceNat,
+    endpoint_ip,
+};
 pub use wireguard::{WireGuardPeer, WireGuardSpec};
 
 /// Default WireGuard interface name.
@@ -48,12 +51,33 @@ pub struct NetworkSpec {
 #[derive(Clone)]
 pub struct NetworkManager {
     runner: Arc<dyn CommandRunner>,
+    /// Shared by every clone: the table is one script, so both writers of
+    /// it must see what the other last asked for.
+    table: Arc<Mutex<TableState>>,
+}
+
+/// What the `inet faber` table is rendered from, besides the firewall spec.
+#[derive(Default)]
+struct TableState {
+    /// The interface and firewall of the last [`NetworkManager::reconcile`]
+    /// that got as far as the firewall. `None` before that.
+    base: Option<(String, FirewallSpec)>,
+    /// The services of the last [`NetworkManager::set_services`].
+    services: Vec<ServiceNat>,
 }
 
 impl NetworkManager {
     /// Runs host commands through `runner`.
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            table: Arc::default(),
+        }
+    }
+
+    fn table(&self) -> MutexGuard<'_, TableState> {
+        // Nothing here can leave the state half written.
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs real processes ([`SystemRunner`]).
@@ -85,7 +109,8 @@ impl NetworkManager {
 
     /// Brings `spec.interface` to `spec.wireguard` (link, address,
     /// `wg syncconf`, MTU and up, routes), then loads `spec.firewall` with
-    /// `nft -f -`. Idempotent. Stops at the first failing command.
+    /// `nft -f -`, together with the services of [`Self::set_services`].
+    /// Idempotent. Stops at the first failing command.
     ///
     /// A missing link is created; an existing one is used as it is, with
     /// every IPv4 address other than the wanted one removed. Whether the
@@ -94,7 +119,37 @@ impl NetworkManager {
     pub async fn reconcile(&self, spec: &NetworkSpec) -> Result<(), NetworkError> {
         let runner = self.runner.as_ref();
         wireguard::ensure_up(runner, &spec.interface, &spec.wireguard).await?;
-        nftables::apply(runner, &spec.interface, &spec.firewall).await
+        let services = {
+            let mut table = self.table();
+            table.base = Some((spec.interface.clone(), spec.firewall.clone()));
+            table.services.clone()
+        };
+        nftables::apply(runner, &spec.interface, &spec.firewall, &services).await
+    }
+
+    /// Sets the nat rules of the services and loads the table again. The
+    /// table is one script that [`Self::reconcile`] replaces as a whole, so
+    /// the services are kept here and every later `reconcile` includes them.
+    ///
+    /// Nothing is run when `reconcile` has not loaded the table yet (it will
+    /// include them), or when there are no services now and there were none
+    /// before. The services count as set once the table is loaded with them,
+    /// so after an error the same call tries again.
+    pub async fn set_services(&self, services: &[ServiceNat]) -> Result<(), NetworkError> {
+        let (iface, firewall) = {
+            let mut table = self.table();
+            let Some(base) = table.base.clone() else {
+                table.services = services.to_vec();
+                return Ok(());
+            };
+            if services.is_empty() && table.services.is_empty() {
+                return Ok(());
+            }
+            base
+        };
+        nftables::apply(self.runner.as_ref(), &iface, &firewall, services).await?;
+        self.table().services = services.to_vec();
+        Ok(())
     }
 }
 
@@ -629,6 +684,104 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, NetworkError::InvalidInterface(_)), "{err:?}");
         assert!(r.calls().is_empty());
+    }
+
+    fn container_network_spec() -> NetworkSpec {
+        let mut spec = network_spec("faber0");
+        spec.firewall.containers = Some(ContainerFirewall {
+            cidr: "10.200.0.0/16".parse().unwrap(),
+            local_subnet: Some("10.200.1.0/24".parse().unwrap()),
+            node_mesh_ips: Default::default(),
+            bridge: "faberbr0".into(),
+        });
+        spec
+    }
+
+    fn redis() -> Vec<ServiceNat> {
+        vec![ServiceNat {
+            vip: "10.201.0.1".parse().unwrap(),
+            backends: vec![NatBackend {
+                ip: "10.200.1.2".parse().unwrap(),
+                port: 6379,
+                protocol: NatProtocol::Tcp,
+            }],
+        }]
+    }
+
+    /// The scripts of the `nft -f -` calls.
+    fn nft_scripts(r: &RecordingRunner) -> Vec<String> {
+        r.calls()
+            .into_iter()
+            .filter(|c| c.cmdline() == "nft -f -")
+            .map(|c| String::from_utf8(c.stdin.unwrap()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn services_are_loaded_with_the_table_and_survive_a_reconcile() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        let spec = container_network_spec();
+        manager.reconcile(&spec).await.unwrap();
+        manager.set_services(&redis()).await.unwrap();
+        // A clone shares the services, as the two steps do.
+        manager.clone().reconcile(&spec).await.unwrap();
+
+        let scripts = nft_scripts(&r);
+        assert_eq!(scripts.len(), 3, "{scripts:#?}");
+        assert!(!scripts[0].contains("10.201.0.1"));
+        assert_eq!(
+            scripts[1],
+            nftables::render_with_services("faber0", &spec.firewall, &redis())
+        );
+        assert_eq!(scripts[2], scripts[1]);
+        assert!(scripts[2].contains("ip daddr 10.201.0.1 tcp dport 6379 dnat ip to"));
+    }
+
+    #[tokio::test]
+    async fn services_set_before_the_table_is_loaded_wait_for_reconcile() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        manager.set_services(&redis()).await.unwrap();
+        assert!(r.calls().is_empty());
+
+        manager.reconcile(&container_network_spec()).await.unwrap();
+        let scripts = nft_scripts(&r);
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("ip daddr 10.201.0.1 tcp dport 6379 dnat ip to"));
+    }
+
+    #[tokio::test]
+    async fn no_services_before_and_after_runs_nothing() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        manager.reconcile(&container_network_spec()).await.unwrap();
+        r.clear();
+        manager.set_services(&[]).await.unwrap();
+        assert!(r.calls().is_empty());
+
+        // Taking the last service away does load the table.
+        manager.set_services(&redis()).await.unwrap();
+        manager.set_services(&[]).await.unwrap();
+        let scripts = nft_scripts(&r);
+        assert_eq!(scripts.len(), 2);
+        assert!(!scripts[1].contains("10.201.0.1"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_of_services_is_tried_again() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        manager.reconcile(&container_network_spec()).await.unwrap();
+        r.script("nft", None, CommandOutput::failure(1, "boom"));
+        manager.set_services(&redis()).await.unwrap_err();
+        r.script("nft", None, CommandOutput::success());
+        manager.set_services(&redis()).await.unwrap();
+        let scripts = nft_scripts(&r);
+        assert_eq!(scripts.len(), 3);
+        // The failed call and the retry carry the same services.
+        assert!(scripts[1].contains("10.201.0.1"));
+        assert_eq!(scripts[2], scripts[1]);
     }
 
     #[test]
