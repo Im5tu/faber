@@ -32,7 +32,7 @@ const NOTE_NO_CAPABILITIES: &str = "containers get no Linux capabilities unless 
      them; images that expect Docker's default set may fail to start";
 
 const NOTE_SECRET_NAMES: &str = "an env variable name looks like a secret; env values are \
-     stored unencrypted in cluster state and are readable by local users on every node";
+     encrypted at rest, but the CLI always shows them";
 
 /// What a deploy reads from the machine it runs on.
 pub struct Inputs {
