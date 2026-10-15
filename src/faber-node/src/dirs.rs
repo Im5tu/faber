@@ -5,7 +5,10 @@
 //! as root: a plugin is executed by containerd, and a config names one. So
 //! every directory of the path, up to `/`, must belong to the trusted user
 //! and be closed to group and others, and the leaf is not a symlink. The
-//! check runs at startup and again before every write.
+//! plugins themselves are checked the same way: every file in the plugin
+//! directory must belong to the trusted user and be closed to group and
+//! others, and so must the target of a symlink and the directories above it.
+//! The checks run at startup and again before every write.
 
 use std::path::{Path, PathBuf};
 
@@ -117,9 +120,69 @@ impl DirPolicy {
         Err(unsupported().to_string())
     }
 
-    /// Checks the three directories `containerd` writes to or names. The
-    /// error names the role and the reason, and the first one that fails
-    /// wins.
+    /// Whether every file of the plugin directory `dir` belongs to the
+    /// trusted user and is closed to group and others. A symlink is followed
+    /// only to a regular file that passes the same test, in a directory
+    /// whose whole path passes [`check`](Self::check); a symlink that leads
+    /// anywhere else, or nowhere, is refused. Subdirectories are not looked
+    /// into: nothing runs from them.
+    #[cfg(unix)]
+    pub fn check_plugins(&self, dir: &Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if meta.is_dir() {
+                continue;
+            }
+            let (file, meta) = if meta.file_type().is_symlink() {
+                let target = std::fs::canonicalize(&path).map_err(|e| {
+                    format!("{} is a symlink that leads nowhere: {e}", path.display())
+                })?;
+                let parent = target
+                    .parent()
+                    .ok_or_else(|| format!("{} leads to /", path.display()))?;
+                self.check(parent)
+                    .map_err(|e| format!("{} leads to an untrusted place: {e}", path.display()))?;
+                let meta =
+                    std::fs::metadata(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+                (target, meta)
+            } else {
+                (path, meta)
+            };
+            if !meta.is_file() {
+                return Err(format!("{} is not a regular file", file.display()));
+            }
+            if meta.uid() != self.owner_uid {
+                return Err(format!(
+                    "{} is owned by uid {}, not {}",
+                    file.display(),
+                    meta.uid(),
+                    self.owner_uid
+                ));
+            }
+            if meta.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{} is writable by group or others (mode {:o})",
+                    file.display(),
+                    meta.mode() & 0o7777
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn check_plugins(&self, _dir: &Path) -> Result<(), String> {
+        Err(unsupported().to_string())
+    }
+
+    /// Checks the three directories `containerd` writes to or names, and the
+    /// plugins in the last. The error names the role and the reason, and the
+    /// first one that fails wins.
     pub fn check_runtime_dirs(&self, containerd: &Containerd) -> Result<(), RuntimeDirError> {
         for (role, dir) in [
             ("containerd conf dir", &containerd.conf_dir),
@@ -129,7 +192,11 @@ impl DirPolicy {
             self.check(dir)
                 .map_err(|detail| RuntimeDirError { role, detail })?;
         }
-        Ok(())
+        self.check_plugins(&containerd.cni_bin_dir)
+            .map_err(|detail| RuntimeDirError {
+                role: "CNI bin dir",
+                detail,
+            })
     }
 }
 
@@ -268,6 +335,118 @@ mod tests {
         symlink(&dir, &link).unwrap();
         policy.create_if_missing(&link).unwrap();
         assert!(policy.check(&link).is_err());
+    }
+
+    fn plugin(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn plugin_files_must_be_closed_to_group_and_others() {
+        let (tmp, policy) = tmp();
+        let bin = tmp.path().join("bin");
+        make(&bin, 0o755);
+        plugin(&bin, "bridge", 0o755);
+        plugin(&bin, "host-local", 0o750);
+        plugin(&bin, ".version", 0o644);
+        make(&bin.join("subdir-is-skipped"), 0o777);
+        assert_eq!(policy.check_plugins(&bin), Ok(()));
+
+        for mode in [0o775, 0o757, 0o777, 0o666, 0o722] {
+            let bad = plugin(&bin, "loopback", mode);
+            let err = policy.check_plugins(&bin).unwrap_err();
+            assert!(
+                err.contains("loopback") && err.contains("writable by group or others"),
+                "{mode:o}: {err}"
+            );
+            std::fs::remove_file(bad).unwrap();
+        }
+        assert_eq!(policy.check_plugins(&bin), Ok(()));
+    }
+
+    #[test]
+    fn a_plugin_of_another_owner_is_refused() {
+        let (tmp, _) = tmp();
+        let bin = tmp.path().join("bin");
+        make(&bin, 0o755);
+        plugin(&bin, "bridge", 0o755);
+        let policy = DirPolicy::owned_by(my_uid(&bin) + 1, tmp.path().to_path_buf());
+        let err = policy.check_plugins(&bin).unwrap_err();
+        assert!(err.contains("is owned by uid"), "{err}");
+    }
+
+    #[test]
+    fn a_symlinked_plugin_is_followed_only_to_a_trusted_file() {
+        let (tmp, policy) = tmp();
+        let bin = tmp.path().join("bin");
+        let libexec = tmp.path().join("libexec");
+        make(&bin, 0o755);
+        make(&libexec, 0o755);
+        let good = plugin(&libexec, "real", 0o755);
+        symlink(&good, bin.join("bridge")).unwrap();
+        assert_eq!(policy.check_plugins(&bin), Ok(()));
+
+        // The target is writable by others.
+        let loose = plugin(&libexec, "loose", 0o666);
+        symlink(&loose, bin.join("loose")).unwrap();
+        let err = policy.check_plugins(&bin).unwrap_err();
+        assert!(err.contains("writable by group or others"), "{err}");
+        std::fs::remove_file(bin.join("loose")).unwrap();
+
+        // The target is fine, but its directory is open to others.
+        let open = tmp.path().join("open");
+        make(&open, 0o777);
+        let inside = plugin(&open, "inside", 0o755);
+        symlink(&inside, bin.join("inside")).unwrap();
+        let err = policy.check_plugins(&bin).unwrap_err();
+        assert!(err.contains("untrusted place"), "{err}");
+        std::fs::remove_file(bin.join("inside")).unwrap();
+
+        // A link to a directory, to nothing, and to a link of those.
+        symlink(&libexec, bin.join("dir")).unwrap();
+        assert!(
+            policy
+                .check_plugins(&bin)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        std::fs::remove_file(bin.join("dir")).unwrap();
+        symlink(tmp.path().join("missing"), bin.join("dangling")).unwrap();
+        assert!(
+            policy
+                .check_plugins(&bin)
+                .unwrap_err()
+                .contains("leads nowhere")
+        );
+        std::fs::remove_file(bin.join("dangling")).unwrap();
+        assert_eq!(policy.check_plugins(&bin), Ok(()));
+    }
+
+    #[test]
+    fn a_loose_plugin_makes_the_runtime_dirs_untrusted() {
+        let (tmp, policy) = tmp();
+        let (conf, cni, bin) = (
+            tmp.path().join("conf.d"),
+            tmp.path().join("net.d"),
+            tmp.path().join("bin"),
+        );
+        for d in [&conf, &cni, &bin] {
+            make(d, 0o755);
+        }
+        let containerd = Containerd {
+            conf_dir: conf,
+            cni_conf_dir: cni,
+            cni_bin_dir: bin.clone(),
+            sandbox_image: "p:1".into(),
+            bridge: "faberbr0".into(),
+        };
+        plugin(&bin, "bridge", 0o666);
+        let err = policy.check_runtime_dirs(&containerd).unwrap_err();
+        assert_eq!(err.role, "CNI bin dir");
+        assert!(err.detail.contains("bridge"), "{}", err.detail);
     }
 
     #[test]

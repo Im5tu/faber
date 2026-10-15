@@ -48,7 +48,7 @@ mod linux {
     use faber_node::dirs::DirPolicy;
     use faber_node::host_net::IpHostNetworks;
     use faber_node::listener;
-    use faber_node::node::Node;
+    use faber_node::node::{Node, RuntimeHost};
     use faber_node::peer::Authorizer;
     use faber_node::volume::{CommandMounter, HostVolumes, ToolPaths};
 
@@ -120,9 +120,12 @@ mod linux {
             config.runtime_handler.clone(),
             cri,
             Arc::new(volumes),
-            containerd,
-            policy,
-            Arc::new(networks),
+            RuntimeHost {
+                containerd,
+                dirs: policy,
+                networks: Arc::new(networks),
+                mesh_interface: config.mesh_interface.clone(),
+            },
         ));
         let listener = listener::bind(&config)?;
         tracing::info!(socket = %config.socket.display(), "faber-node listening");

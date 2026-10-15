@@ -16,6 +16,8 @@ pub const DEFAULT_ENV_FILE: &str = "/etc/faber/faber-node.env";
 pub const DEFAULT_CONTAINERD_CONF_DIR: &str = "/etc/containerd/conf.d";
 pub const DEFAULT_CNI_CONF_DIR: &str = "/etc/cni/net.d";
 pub const DEFAULT_CNI_BIN_DIR: &str = "/opt/cni/bin";
+/// The WireGuard interface fabercp creates unless told otherwise.
+pub const DEFAULT_MESH_INTERFACE: &str = "faber0";
 /// The pause image of containerd 2.x.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "registry.k8s.io/pause:3.10";
 
@@ -107,6 +109,9 @@ pub struct NodeConfig {
     pub cni_bin_dir: PathBuf,
     /// The pause image of every pod sandbox.
     pub sandbox_image: String,
+    /// The WireGuard interface of the mesh. A container subnet must be
+    /// routed into it (or into the bridge) before faber-node accepts it.
+    pub mesh_interface: String,
     pub containerd_socket: PathBuf,
     /// Directories of the host tools, run by absolute path.
     pub bin_dir: PathBuf,
@@ -205,6 +210,25 @@ impl NodeConfig {
             key: "FABER_NODE_SANDBOX_IMAGE",
             reason: e.message,
         })?;
+        let mesh_interface = map
+            .get("FABER_NODE_MESH_INTERFACE")
+            .map_or(DEFAULT_MESH_INTERFACE, String::as_str);
+        // As Linux reads an interface name: at most 15 bytes, no `/`, no
+        // spaces, not `.` or `..`.
+        let iface_ok = !mesh_interface.is_empty()
+            && mesh_interface.len() <= 15
+            && mesh_interface != "."
+            && mesh_interface != ".."
+            && mesh_interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        if !iface_ok {
+            return Err(ConfigError::Invalid {
+                key: "FABER_NODE_MESH_INTERFACE",
+                reason: "must be an interface name of at most 15 characters of a-z, 0-9, - _ ."
+                    .to_owned(),
+            });
+        }
         Ok(Self {
             socket: path("FABER_NODE_SOCKET", DEFAULT_SOCKET)?,
             volume_root: path("FABER_NODE_VOLUME_ROOT", DEFAULT_VOLUME_ROOT)?,
@@ -215,6 +239,7 @@ impl NodeConfig {
             cni_conf_dir: path("FABER_NODE_CNI_CONF_DIR", DEFAULT_CNI_CONF_DIR)?,
             cni_bin_dir: path("FABER_NODE_CNI_BIN_DIR", DEFAULT_CNI_BIN_DIR)?,
             sandbox_image: sandbox_image.to_owned(),
+            mesh_interface: mesh_interface.to_owned(),
             containerd_socket: path("FABER_NODE_CONTAINERD_SOCKET", faber_cri::DEFAULT_SOCKET)?,
             bin_dir: path("FABER_NODE_BIN_DIR", "/usr/bin")?,
             sbin_dir: path("FABER_NODE_SBIN_DIR", "/usr/sbin")?,
@@ -258,6 +283,7 @@ FABER_NODE_FABER_GID=989
         assert_eq!(cfg.cni_conf_dir, PathBuf::from("/etc/cni/net.d"));
         assert_eq!(cfg.cni_bin_dir, PathBuf::from("/opt/cni/bin"));
         assert_eq!(cfg.sandbox_image, "registry.k8s.io/pause:3.10");
+        assert_eq!(cfg.mesh_interface, "faber0");
         assert_eq!((cfg.faber_uid, cfg.faber_gid), (990, 989));
         assert_eq!(cfg.bin_dir, PathBuf::from("/usr/bin"));
         assert_eq!(cfg.sbin_dir, PathBuf::from("/usr/sbin"));
@@ -327,6 +353,36 @@ FABER_NODE_FABER_GID=989
                     NodeConfig::parse(&text),
                     Err(ConfigError::Invalid {
                         key: "FABER_NODE_SANDBOX_IMAGE",
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mesh_interface_comes_from_the_file_and_is_checked() {
+        let text = format!("{GOOD}FABER_NODE_MESH_INTERFACE=wg-faber_1\n");
+        assert_eq!(
+            NodeConfig::parse(&text).unwrap().mesh_interface,
+            "wg-faber_1"
+        );
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a b",
+            "a/b",
+            "0123456789abcdef",
+            "faber\u{e9}",
+        ] {
+            let text = format!("{GOOD}FABER_NODE_MESH_INTERFACE={bad}\n");
+            assert!(
+                matches!(
+                    NodeConfig::parse(&text),
+                    Err(ConfigError::Invalid {
+                        key: "FABER_NODE_MESH_INTERFACE",
                         ..
                     })
                 ),

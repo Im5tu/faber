@@ -100,6 +100,16 @@ impl ReplicaLocks {
     }
 }
 
+/// What the runtime config needs of the host: where it goes, who may own
+/// the directories, and what the host's network looks like.
+pub struct RuntimeHost {
+    pub containerd: Containerd,
+    pub dirs: DirPolicy,
+    pub networks: Arc<dyn HostNetworks>,
+    /// The WireGuard interface a container subnet must be routed into.
+    pub mesh_interface: String,
+}
+
 pub struct Node<C> {
     sandbox_locks: ReplicaLocks,
     uid_range: UidRange,
@@ -107,9 +117,7 @@ pub struct Node<C> {
     cri: C,
     images: ImagePuller<C>,
     volumes: Arc<dyn VolumeManager>,
-    containerd: Containerd,
-    dirs: DirPolicy,
-    networks: Arc<dyn HostNetworks>,
+    runtime: RuntimeHost,
 }
 
 impl<C: CriClient + Clone> Node<C> {
@@ -118,14 +126,10 @@ impl<C: CriClient + Clone> Node<C> {
         runtime_handler: String,
         cri: C,
         volumes: Arc<dyn VolumeManager>,
-        containerd: Containerd,
-        dirs: DirPolicy,
-        networks: Arc<dyn HostNetworks>,
+        runtime: RuntimeHost,
     ) -> Self {
         Self {
-            containerd,
-            dirs,
-            networks,
+            runtime,
             sandbox_locks: ReplicaLocks::default(),
             uid_range,
             runtime_handler,
@@ -368,13 +372,13 @@ impl<C: CriClient + Clone> Node<C> {
                         mtu: n.mtu,
                     }),
                 };
-                let changed = self.containerd.reconcile(&spec).await?;
+                let changed = self.runtime.containerd.reconcile(&spec).await?;
                 Ok(Response::Changed { changed })
             }
             Request::RemoveCniConfig => {
                 self.check_runtime_dirs()?;
                 Ok(Response::Changed {
-                    changed: self.containerd.remove_pod_network().await?,
+                    changed: self.runtime.containerd.remove_pod_network().await?,
                 })
             }
         }
@@ -383,8 +387,9 @@ impl<C: CriClient + Clone> Node<C> {
     /// The directories root loads config from are checked again before every
     /// write, not only at startup. The detail (a path) is logged, not sent.
     fn check_runtime_dirs(&self) -> Result<(), Fail> {
-        self.dirs
-            .check_runtime_dirs(&self.containerd)
+        self.runtime
+            .dirs
+            .check_runtime_dirs(&self.runtime.containerd)
             .map_err(|e| {
                 tracing::error!(role = e.role, detail = %e.detail, "a runtime directory cannot be trusted");
                 Fail::new(
@@ -394,15 +399,27 @@ impl<C: CriClient + Clone> Node<C> {
             })
     }
 
-    /// A subnet that overlaps what the host uses is refused. The faber
-    /// bridge's own current subnet does not count.
+    /// A subnet that overlaps what the host uses, or that is not routed
+    /// into the mesh interface or the bridge, is refused. The response says
+    /// nothing of the host; the log says which network and interface.
     async fn check_subnet_free(&self, subnet: ipnet::Ipv4Net) -> Result<(), Fail> {
-        let claims = self.networks.claims().await.map_err(|e| {
+        let claims = self.runtime.networks.claims().await.map_err(|e| {
             tracing::error!(error = %e, "reading the host's addresses and routes failed");
             Fail::new(ErrorCode::Runtime, "the host's addresses cannot be read")
         })?;
-        check_subnet_free(&claims, subnet, &self.containerd.bridge)
-            .map_err(|e| Fail::new(ErrorCode::Forbidden, e))
+        check_subnet_free(
+            &claims,
+            subnet,
+            &self.runtime.containerd.bridge,
+            &self.runtime.mesh_interface,
+        )
+        .map_err(|why| {
+            tracing::error!(%subnet, %why, "a container subnet was refused");
+            Fail::new(
+                ErrorCode::Forbidden,
+                "the subnet is not allowed on this host",
+            )
+        })
     }
 
     async fn ensure_sandbox(

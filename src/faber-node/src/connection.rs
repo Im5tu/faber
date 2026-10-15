@@ -120,6 +120,7 @@ mod tests {
     use crate::config::UidRange;
     use crate::dirs::DirPolicy;
     use crate::host_net::fake::FakeHostNetworks;
+    use crate::node::RuntimeHost;
     use crate::peer::Peer;
     use crate::peer::fake::FakeStream;
     use crate::volume::fake::FakeVolumes;
@@ -130,15 +131,18 @@ mod tests {
             String::new(),
             cri,
             Arc::new(FakeVolumes::new("/vol")),
-            Containerd {
-                conf_dir: "/nonexistent/conf.d".into(),
-                cni_conf_dir: "/nonexistent/net.d".into(),
-                cni_bin_dir: "/opt/cni/bin".into(),
-                sandbox_image: "pause:3".into(),
-                bridge: "faberbr0".into(),
+            RuntimeHost {
+                containerd: Containerd {
+                    conf_dir: "/nonexistent/conf.d".into(),
+                    cni_conf_dir: "/nonexistent/net.d".into(),
+                    cni_bin_dir: "/opt/cni/bin".into(),
+                    sandbox_image: "pause:3".into(),
+                    bridge: "faberbr0".into(),
+                },
+                dirs: DirPolicy::root(),
+                networks: Arc::new(FakeHostNetworks::default()),
+                mesh_interface: "faber0".into(),
             },
-            DirPolicy::root(),
-            Arc::new(FakeHostNetworks::default()),
         )
     }
 

@@ -18,8 +18,9 @@ use faber_node_protocol::{
 
 use crate::config::UidRange;
 use crate::dirs::DirPolicy;
-use crate::host_net::fake::{FakeHostNetworks, address, route};
+use crate::host_net::fake::{FakeHostNetworks, address, mesh_route, route};
 use crate::node::Node;
+use crate::node::RuntimeHost;
 use crate::volume::fake::FakeVolumes;
 
 const BASE: u32 = 65536 * 2;
@@ -86,9 +87,12 @@ fn rig() -> Rig {
             "runc".into(),
             cri.clone(),
             volumes.clone(),
-            containerd,
-            policy,
-            networks.clone(),
+            RuntimeHost {
+                containerd,
+                dirs: policy,
+                networks: networks.clone(),
+                mesh_interface: "faber0".into(),
+            },
         ),
         cri,
         volumes,
@@ -849,12 +853,20 @@ async fn an_invalid_pod_network_is_refused_and_writes_nothing() {
 async fn a_subnet_that_overlaps_the_host_is_refused_and_writes_nothing() {
     let rig = rig();
     rig.networks.set(vec![
-        address("eth0", "192.168.1.0/24"),
+        mesh_route(),
+        address("eth0", "10.200.7.0/24"),
         route("eth1", "10.200.5.0/25"),
     ]);
-    for subnet in ["192.168.1.0/24", "192.168.0.0/16", "10.200.5.0/24"] {
+    for subnet in ["10.200.7.0/24", "10.200.7.0/28", "10.200.5.0/24"] {
         let reply = rig.node.handle(configure(Some(pod_network(subnet)))).await;
-        assert_eq!(error_code(&reply), Some(ErrorCode::Forbidden), "{subnet}");
+        let Response::Error { code, message } = reply else {
+            panic!("{subnet}: {reply:?}")
+        };
+        assert_eq!(code, ErrorCode::Forbidden, "{subnet}");
+        // Nothing of the host is told to the peer.
+        for leak in ["eth0", "eth1", "10.200.7", "10.200.5.0/25", "overlaps"] {
+            assert!(!message.contains(leak), "{leak}: {message}");
+        }
     }
     assert!(rig.files().is_empty());
 
@@ -867,12 +879,47 @@ async fn a_subnet_that_overlaps_the_host_is_refused_and_writes_nothing() {
 }
 
 #[tokio::test]
+async fn a_subnet_that_would_pull_host_traffic_into_the_bridge_is_refused() {
+    let rig = rig();
+    // A corporate 10/8 and the default route on the LAN interface, next to
+    // the tunnel's route of the container range.
+    rig.networks.set(vec![
+        mesh_route(),
+        route("eth0", "10.0.0.0/8"),
+        route("eth0", "192.168.0.0/16"),
+    ]);
+    for subnet in [
+        "8.8.8.0/24",
+        "10.5.5.0/24",
+        "192.168.4.0/24",
+        "172.16.9.0/24",
+    ] {
+        let reply = rig.node.handle(configure(Some(pod_network(subnet)))).await;
+        let Response::Error { code, message } = reply else {
+            panic!("{subnet}: {reply:?}")
+        };
+        assert_eq!(code, ErrorCode::Forbidden, "{subnet}");
+        assert!(!message.contains("faber0"), "{message}");
+    }
+    assert!(rig.files().is_empty());
+
+    // With no route into the tunnel at all, nothing is accepted.
+    rig.networks.set(vec![route("eth0", "10.0.0.0/8")]);
+    let reply = rig
+        .node
+        .handle(configure(Some(pod_network("10.200.3.0/24"))))
+        .await;
+    assert_eq!(error_code(&reply), Some(ErrorCode::Forbidden));
+    assert!(rig.files().is_empty());
+}
+
+#[tokio::test]
 async fn the_bridges_own_subnet_and_the_container_range_route_are_not_overlaps() {
     let rig = rig();
     rig.networks.set(vec![
+        mesh_route(),
         address("faberbr0", "10.200.3.0/24"),
         route("faberbr0", "10.200.3.0/24"),
-        route("faber0", "10.200.0.0/16"),
     ]);
     let request = configure(Some(pod_network("10.200.3.0/24")));
     assert_eq!(
@@ -964,4 +1011,33 @@ async fn a_symlinked_conflist_is_replaced_and_its_target_left_alone() {
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     let meta = std::fs::symlink_metadata(rig.cni_dir().join(CONFLIST_FILE)).unwrap();
     assert!(meta.is_file());
+}
+
+#[tokio::test]
+async fn a_loose_plugin_file_stops_every_write() {
+    let rig = rig();
+    let plugin = rig.bin_dir().join("bridge");
+    std::fs::write(&plugin, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        rig.node.handle(configure(None)).await,
+        Response::Changed { changed: true }
+    );
+
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o666)).unwrap();
+    for request in [
+        configure(Some(pod_network("10.200.3.0/24"))),
+        configure(None),
+        Request::RemoveCniConfig,
+    ] {
+        let reply = rig.node.handle(request).await;
+        let Response::Error { code, message } = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(code, ErrorCode::Forbidden);
+        assert!(message.contains("CNI bin dir"), "{message}");
+        assert!(!message.contains("bridge"), "{message}");
+    }
+    // Nothing new was written: only the drop-in from the first call.
+    assert_eq!(rig.files(), [format!("conf.d/{DROP_IN_FILE}")]);
 }
