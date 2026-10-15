@@ -195,6 +195,8 @@ teardown() {
   [[ "$output" == *"--endpoint"* ]]
   [[ "$output" == *"--mesh-cidr"* ]]
   [[ "$output" == *"--container-cidr <cidr>"* ]]
+  [[ "$output" == *"--service-cidr <cidr>"* ]]
+  [[ "$output" == *"10.201.0.0/16"* ]]
   [[ "$output" == *"10.200.0.0/16"* ]]
   [[ "$output" == *"--name <name>"* ]]
   [[ "$output" == *"--reset "* ]]
@@ -1192,7 +1194,7 @@ stub_containerd_io() {
 }
 
 @test "script: flags without a value exit 2" {
-  for flag in --join --endpoint --mesh-cidr --container-cidr --name; do
+  for flag in --join --endpoint --mesh-cidr --container-cidr --service-cidr --name; do
     run bash "$SCRIPT" --dry-run "$flag"
     [ "$status" -eq 2 ]
     [[ "$output" == *"$flag needs a value"* ]]
@@ -1464,11 +1466,20 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     "FABER_CONTAINERD_CONF_DIR=$CONTAINERD_CONF_DIR" \
     "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" \
     'FABER_NEW_MESH=1' \
-    'FABER_MESH_CIDR=10.99.0.0/16')"
+    'FABER_MESH_CIDR=10.99.0.0/16' \
+    'FABER_SERVICE_CIDR=10.201.0.0/16')"
   [ "$output" = "$expected" ]
 }
 
-@test "render_env: new mesh with --container-cidr adds FABER_CONTAINER_CIDR last" {
+@test "render_env: new mesh with --service-cidr writes it" {
+  MODE=new WG_ENDPOINT="" MESH_CIDR="10.99.0.0/16" SERVICE_CIDR="10.77.0.0/20"
+  run render_env 1
+  [ "$status" -eq 0 ]
+  grep -qxF 'FABER_SERVICE_CIDR=10.77.0.0/20' <<<"$output"
+  [ "$(grep -c SERVICE_CIDR <<<"$output")" = 1 ]
+}
+
+@test "render_env: new mesh with --container-cidr adds FABER_CONTAINER_CIDR before the service range" {
   MODE=new WG_ENDPOINT="203.0.113.7:51820" MESH_CIDR="10.99.0.0/16" CONTAINER_CIDR="10.210.0.0/16"
   run render_env 1
   [ "$status" -eq 0 ]
@@ -1485,7 +1496,8 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" \
     'FABER_NEW_MESH=1' \
     'FABER_MESH_CIDR=10.99.0.0/16' \
-    'FABER_CONTAINER_CIDR=10.210.0.0/16')"
+    'FABER_CONTAINER_CIDR=10.210.0.0/16' \
+    'FABER_SERVICE_CIDR=10.201.0.0/16')"
   [ "$output" = "$expected" ]
 }
 
@@ -1496,6 +1508,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [[ "$output" != *"FABER_NEW_MESH"* ]]
   [[ "$output" != *"FABER_MESH_CIDR"* ]]
   [[ "$output" != *"FABER_CONTAINER_CIDR"* ]]
+  [[ "$output" != *"FABER_SERVICE_CIDR"* ]]
   [[ "$output" != *"FABER_WG_ENDPOINT"* ]]
   [[ "$output" != *"$TOKEN"* ]]
   grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" <<<"$output"
@@ -1512,6 +1525,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     [[ "$output" != *"FABER_NEW_MESH"* ]]
     [[ "$output" != *"FABER_MESH_CIDR"* ]]
     [[ "$output" != *"FABER_CONTAINER_CIDR"* ]]
+    [[ "$output" != *"FABER_SERVICE_CIDR"* ]]
     [[ "$output" != *"FABER_JOIN_TOKEN_FILE"* ]]
     [[ "$output" == *"FABER_MANAGE_HOST=1"* ]]
     grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" <<<"$output"
@@ -2996,7 +3010,7 @@ write_identity() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"cluster: created"* ]]
   [ "$(count_calls 'try-restart fabercp')" = 0 ]
-  run grep -q 'FABER_NEW_MESH\|FABER_MESH_CIDR\|FABER_CONTAINER_CIDR' "$FABER_ETC/fabercp.env"
+  run grep -q 'FABER_NEW_MESH\|FABER_MESH_CIDR\|FABER_CONTAINER_CIDR\|FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
   [ "$status" -eq 1 ]
   grep -qxF "FABER_CNI_CONF_DIR=$CNI_CONF_DIR" "$FABER_ETC/fabercp.env"
   install_run --container-cidr 10.210.0.0/16
@@ -3501,11 +3515,12 @@ EOF
   MODE=new WG_ENDPOINT="203.0.113.7:51820" MESH_CIDR="10.99.0.0/16" NODE_NAME=web-01 CONTAINER_CIDR="10.210.0.0/16"
   run render_env 1
   [ "$status" -eq 0 ]
-  [ "$(tail -n 4 <<<"$output")" = "$(printf '%s\n' \
+  [ "$(tail -n 5 <<<"$output")" = "$(printf '%s\n' \
     'FABER_NEW_MESH=1' \
     'FABER_MESH_CIDR=10.99.0.0/16' \
     'FABER_NODE_NAME=web-01' \
-    'FABER_CONTAINER_CIDR=10.210.0.0/16')" ]
+    'FABER_CONTAINER_CIDR=10.210.0.0/16' \
+    'FABER_SERVICE_CIDR=10.201.0.0/16')" ]
   run render_env 0
   [[ "$output" != *"FABER_NODE_NAME"* ]]
   MODE=join
@@ -4108,4 +4123,140 @@ removed_node() {
   JOIN_REQUESTED=1 CONFIGURED=no
   run check_node_removed
   [ "$status" -eq 0 ]
+}
+
+# --- --service-cidr -------------------------------------------------------
+
+@test "parse_args: --service-cidr, space and = forms" {
+  parse_args --service-cidr 10.77.0.0/16
+  [ "$SERVICE_CIDR_ARG" = "10.77.0.0/16" ]
+  SERVICE_CIDR_ARG=""
+  parse_args --service-cidr=10.78.0.0/24
+  [ "$SERVICE_CIDR_ARG" = "10.78.0.0/24" ]
+}
+
+@test "valid_service_cidr: network address with a prefix of at most 30" {
+  valid_service_cidr 10.201.0.0/16
+  valid_service_cidr 10.201.0.0/30
+  run valid_service_cidr 10.201.0.0/31
+  [ "$status" -eq 1 ]
+  run valid_service_cidr 10.201.0.1/16
+  [ "$status" -eq 1 ]
+  run valid_service_cidr 10.201.0.0
+  [ "$status" -eq 1 ]
+  run valid_service_cidr fd00::/64
+  [ "$status" -eq 1 ]
+}
+
+@test "script: bad --service-cidr exits 2" {
+  local bad
+  for bad in 10.201.0.0/31 10.201.0.1/16 10.201.0.0 nonsense; do
+    run bash "$SCRIPT" --dry-run --service-cidr "$bad"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--service-cidr must be an IPv4 CIDR"* ]]
+  done
+}
+
+@test "script: --join with --service-cidr exits 2, token not echoed" {
+  run bash "$SCRIPT" --dry-run --join "$TOKEN" --service-cidr 10.77.0.0/16
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--join and --service-cidr cannot be combined"* ]]
+  [[ "$output" != *"$TOKEN"* ]]
+}
+
+@test "resolve_mode: the service CIDR is the flag, else the stored value, else the default" {
+  resolve_mode
+  [ "$SERVICE_CIDR" = 10.201.0.0/16 ]
+  SERVICE_CIDR_ARG=10.77.0.0/16
+  resolve_mode
+  [ "$SERVICE_CIDR" = 10.77.0.0/16 ]
+  SERVICE_CIDR_ARG=""
+  mkdir -p "$FABER_ETC"
+  printf 'FABER_NEW_MESH=1\nFABER_SERVICE_CIDR=10.78.0.0/16\n' > "$FABER_ETC/fabercp.env"
+  resolve_mode
+  [ "$SERVICE_CIDR" = 10.78.0.0/16 ]
+}
+
+@test "resolve_mode: a service CIDR overlapping the mesh CIDR dies" {
+  SERVICE_CIDR_ARG=10.99.4.0/24
+  run resolve_mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"service CIDR 10.99.4.0/24 overlaps the mesh CIDR 10.99.0.0/16"* ]]
+  # the default range counts too
+  MESH_CIDR_ARG=10.201.0.0/24 SERVICE_CIDR_ARG=""
+  run resolve_mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"service CIDR 10.201.0.0/16 overlaps the mesh CIDR 10.201.0.0/24"* ]]
+}
+
+@test "resolve_mode: a service CIDR overlapping the container CIDR dies" {
+  SERVICE_CIDR_ARG=10.200.8.0/22
+  run resolve_mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"service CIDR 10.200.8.0/22 overlaps the container CIDR 10.200.0.0/16"* ]]
+  CONTAINER_CIDR_ARG=10.201.0.0/20 SERVICE_CIDR_ARG=""
+  run resolve_mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"overlaps the container CIDR 10.201.0.0/20"* ]]
+  CONTAINER_CIDR_ARG=10.210.0.0/16 SERVICE_CIDR_ARG=10.211.0.0/16
+  resolve_mode
+  [ "$SERVICE_CIDR" = 10.211.0.0/16 ]
+}
+
+@test "dry-run: configured node + --service-cidr dies before any package command" {
+  make_stub_path
+  mkdir -p "$FABER_STATE_DIR"
+  echo '{}' > "$FABER_STATE_DIR/identity.json"
+  install_run --dry-run --service-cidr 10.77.0.0/16
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--service-cidr only applies to a new mesh"* ]]
+  [[ "$output" != *"apt-get"* ]]
+}
+
+@test "dry-run: --service-cidr overlapping the mesh CIDR dies before any package command" {
+  make_stub_path
+  install_run --dry-run --service-cidr 10.99.128.0/17
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"overlaps the mesh CIDR"* ]]
+  [[ "$output" != *"apt-get"* ]]
+}
+
+@test "real run (new mesh): FABER_SERVICE_CIDR is always written, then stripped once created" {
+  setup_full_run systemd
+  touch "$TMP/init-fails"
+  install_run --service-cidr 10.77.0.0/16
+  [ "$status" -eq 1 ]
+  grep -qxF 'FABER_SERVICE_CIDR=10.77.0.0/16' "$FABER_ETC/fabercp.env"
+  rm "$TMP/init-fails" "$TMP/executed"
+  install_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cluster: created"* ]]
+  run grep -q 'FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
+  [ "$status" -eq 1 ]
+  install_run --service-cidr 10.77.0.0/16
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--service-cidr only applies to a new mesh"* ]]
+}
+
+@test "real run: unfinished new mesh refuses another --service-cidr" {
+  setup_full_run systemd
+  touch "$TMP/init-fails"
+  install_run --service-cidr 10.77.0.0/16
+  [ "$status" -eq 1 ]
+  install_run --service-cidr 10.78.0.0/16
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--service-cidr 10.77.0.0/16"* ]]
+  rm "$TMP/init-fails"
+  install_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cluster: created"* ]]
+}
+
+@test "real run (join): no FABER_SERVICE_CIDR in the env file" {
+  setup_full_run systemd
+  touch "$TMP/joined"
+  install_run --join "$TOKEN"
+  [ "$status" -eq 0 ]
+  run grep -q 'FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
+  [ "$status" -eq 1 ]
 }

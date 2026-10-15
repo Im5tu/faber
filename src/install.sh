@@ -21,8 +21,8 @@
 # Mesh and services (see docs/contract.md for the paths, modes and names):
 #   - $FABER_ETC (root:faber 0750) with fabercp.env (root:faber 0640). Until
 #     the bootstrap has finished the env file also carries FABER_NEW_MESH,
-#     FABER_MESH_CIDR, FABER_NODE_NAME and (with --container-cidr)
-#     FABER_CONTAINER_CIDR (new mesh) or FABER_JOIN_TOKEN_FILE (--join), and
+#     FABER_MESH_CIDR, FABER_SERVICE_CIDR, FABER_NODE_NAME and (with
+#     --container-cidr) FABER_CONTAINER_CIDR (new mesh) or FABER_JOIN_TOKEN_FILE (--join), and
 #     the token goes to $FABER_ETC/join.token (root:faber 0640).
 #   - The founder's node name comes from --name (new mesh only), else from
 #     the short hostname in lower case. It must be a DNS label; a hostname
@@ -196,6 +196,19 @@ readonly DEFAULT_MESH_CIDR="10.99.0.0/16"
 # overlap check; the env file carries a container CIDR only with the flag.
 readonly DEFAULT_CONTAINER_CIDR="10.200.0.0/16"
 readonly CONTAINER_CIDR_MAX_PREFIX=24
+# fabercp's default service range (virtual IPs); always written to the env file
+# of a new mesh. fabercp refuses a prefix longer than /30.
+readonly DEFAULT_SERVICE_CIDR="10.201.0.0/16"
+readonly SERVICE_CIDR_MAX_PREFIX=30
+# Host uid range that pods may map: [min, max). Must equal UID_RANGE_START and
+# UID_RANGE_END in src/fabercp/src/raft/store/place.rs.
+readonly NODE_UID_MIN=1048576
+readonly NODE_UID_MAX=2147483648
+# faber-node's default socket (DEFAULT_SOCKET in src/faber-node/src/config.rs).
+readonly DEFAULT_NODE_SOCKET="/run/faber/node.sock"
+readonly MIN_CONTAINERD_MAJOR=2
+readonly MIN_KERNEL_MAJOR=6
+readonly MIN_KERNEL_MINOR=3
 readonly CONTAINER_BRIDGE="faberbr0"
 readonly CNI_CONFLIST="10-faber.conflist"
 # fabercp's marker for "remove the identity and the raft data at the next
@@ -205,12 +218,23 @@ readonly MANAGED_MARKER="# managed by faber"
 readonly TOKEN_RE='^faber1\.[A-Za-z0-9_-]+$'
 readonly TOKEN_MAX_LEN=65536
 readonly FABERCP_UNIT="fabercp.service"
+readonly FABER_NODE_UNIT="faber-node.service"
 readonly RELOAD_PATH_UNIT="faber-containerd-reload.path"
 readonly RELOAD_SERVICE_UNIT="faber-containerd-reload.service"
 
 CNI_BIN_DIR="${CNI_BIN_DIR:-/opt/cni/bin}"
 FABER_HOME="${FABER_HOME:-/opt/faber}"
 FABER_CLI_DIR="${FABER_CLI_DIR:-/usr/local/bin}"
+# faber-node runs as root, so it never lives under $FABER_HOME (faber's).
+FABER_NODE_INSTALL_DIR="${FABER_NODE_INSTALL_DIR:-/usr/local/sbin}"
+FABER_NODE_SOCKET="${FABER_NODE_SOCKET:-$DEFAULT_NODE_SOCKET}"
+# Where faber-node finds mount, mountpoint, chmod, umount and mkfs.ext4.
+FABER_NODE_BIN_DIR="${FABER_NODE_BIN_DIR:-/usr/bin}"
+FABER_NODE_SBIN_DIR="${FABER_NODE_SBIN_DIR:-/usr/sbin}"
+FABER_NODE_STATE_DIR="${FABER_NODE_STATE_DIR:-/var/lib/faber-node}"
+FABER_KERNEL_RELEASE="${FABER_KERNEL_RELEASE:-}"
+SUBUID_FILE="${SUBUID_FILE:-/etc/subuid}"
+SUBGID_FILE="${SUBGID_FILE:-/etc/subgid}"
 FABER_ETC="${FABER_ETC:-/etc/faber}"
 FABER_STATE_DIR="${FABER_STATE_DIR:-/var/lib/faber}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
@@ -236,6 +260,7 @@ JOIN_TOKEN=""
 ENDPOINT_ARG=""
 MESH_CIDR_ARG=""
 CONTAINER_CIDR_ARG=""
+SERVICE_CIDR_ARG=""
 NODE_NAME_ARG=""
 RESET_REQUESTED=0
 # Resolved in preflight.
@@ -248,6 +273,7 @@ RESUME=0        # 1: continuing the bootstrap recorded in the env file
 REPLACED_JOIN_NODE_ID=""
 MESH_CIDR=""
 CONTAINER_CIDR=""  # empty: not given, fabercp uses its default
+SERVICE_CIDR=""    # new mesh only: the range given, stored or the default
 NODE_NAME=""       # new mesh only: the founder's node name
 RESET_IDENTITY=0   # 1: --reset discards the identity this node has
 WG_ENDPOINT=""
@@ -261,6 +287,8 @@ TOKEN_CHANGED=0
 ROOT_CONFIG_CHANGED=0
 UNITS_CHANGED=0
 FABERCP_UNIT_CHANGED=0
+NODE_UNIT_CHANGED=0
+NODE_ENV_CHANGED=0
 CLUSTER_RESULT=""
 
 # --- logging ----------------------------------------------------------------
@@ -319,7 +347,11 @@ Options:
                           node (default ${DEFAULT_CONTAINER_CIDR}); prefix length
                           at most ${CONTAINER_CIDR_MAX_PREFIX}; must not overlap the mesh range; not
                           with --join
-  --name <name>           Name of this node in a new mesh: a DNS label (1 to 63
+  --service-cidr <cidr>   Service (virtual IP) address range for a new mesh
+                          (default ${DEFAULT_SERVICE_CIDR}); prefix length at
+                          most ${SERVICE_CIDR_MAX_PREFIX}; must not overlap the mesh or container range;
+                          not with --join
+  --name <name>          Name of this node in a new mesh: a DNS label (1 to 63
                           characters of a-z, 0-9 and '-', not starting or
                           ending with '-'). Default: the short hostname in
                           lower case. Not with --join (the invite names a
@@ -387,12 +419,12 @@ parse_args() {
       --dry-run) DRY_RUN=1 ;;
       --check) CHECK=1 ;;
       --reset) RESET_REQUESTED=1 ;;
-      --join | --endpoint | --mesh-cidr | --container-cidr | --name)
+      --join | --endpoint | --mesh-cidr | --container-cidr | --service-cidr | --name)
         (($# >= 2)) || usage_error "$1 needs a value"
         set_option "$1" "$2"
         shift
         ;;
-      --join=* | --endpoint=* | --mesh-cidr=* | --container-cidr=* | --name=*) set_option "${1%%=*}" "${1#*=}" ;;
+      --join=* | --endpoint=* | --mesh-cidr=* | --container-cidr=* | --service-cidr=* | --name=*) set_option "${1%%=*}" "${1#*=}" ;;
       -h | --help)
         usage
         exit 0
@@ -420,6 +452,7 @@ set_option() {
     --endpoint) ENDPOINT_ARG="$value" ;;
     --mesh-cidr) MESH_CIDR_ARG="$value" ;;
     --container-cidr) CONTAINER_CIDR_ARG="$value" ;;
+    --service-cidr) SERVICE_CIDR_ARG="$value" ;;
     --name) NODE_NAME_ARG="$value" ;;
   esac
 }
@@ -431,6 +464,9 @@ validate_args() {
   fi
   if [[ "$JOIN_REQUESTED" == 1 && -n "$CONTAINER_CIDR_ARG" ]]; then
     usage_error "--join and --container-cidr cannot be combined (a joining node gets its container subnet from the cluster)"
+  fi
+  if [[ "$JOIN_REQUESTED" == 1 && -n "$SERVICE_CIDR_ARG" ]]; then
+    usage_error "--join and --service-cidr cannot be combined (a joining node gets the service range from the cluster)"
   fi
   if [[ "$JOIN_REQUESTED" == 1 && -n "$NODE_NAME_ARG" ]]; then
     usage_error "--join and --name cannot be combined (a joining node's name is set by its invite)"
@@ -448,6 +484,9 @@ validate_args() {
   fi
   if [[ -n "$CONTAINER_CIDR_ARG" ]] && ! valid_container_cidr "$CONTAINER_CIDR_ARG"; then
     usage_error "--container-cidr must be an IPv4 CIDR that is a network address (no host bits set) with a prefix length of at most /$CONTAINER_CIDR_MAX_PREFIX, such as $DEFAULT_CONTAINER_CIDR"
+  fi
+  if [[ -n "$SERVICE_CIDR_ARG" ]] && ! valid_service_cidr "$SERVICE_CIDR_ARG"; then
+    usage_error "--service-cidr must be an IPv4 CIDR that is a network address (no host bits set) with a prefix length of at most /$SERVICE_CIDR_MAX_PREFIX, such as $DEFAULT_SERVICE_CIDR"
   fi
   if [[ -n "$NODE_NAME_ARG" ]] && ! valid_node_name "$NODE_NAME_ARG"; then
     usage_error "--name must be a DNS label: 1 to 63 characters of a-z, 0-9 and '-', not starting or ending with '-'"
@@ -531,6 +570,13 @@ valid_mesh_cidr() {
 # bits at cluster creation, and by then the env file is written.
 valid_container_cidr() {
   valid_mesh_cidr "$1" && ((10#${1#*/} <= CONTAINER_CIDR_MAX_PREFIX)) &&
+    cidr_is_network "$1"
+}
+
+# valid_service_cidr VALUE: like valid_container_cidr, with the longest prefix
+# fabercp accepts for the service range ($SERVICE_CIDR_MAX_PREFIX).
+valid_service_cidr() {
+  valid_mesh_cidr "$1" && ((10#${1#*/} <= SERVICE_CIDR_MAX_PREFIX)) &&
     cidr_is_network "$1"
 }
 
@@ -1035,7 +1081,7 @@ pending_bootstrap() {
     echo none
   elif grep -q '^FABER_JOIN_TOKEN_FILE=' "$f" 2>/dev/null; then
     echo join
-  elif grep -Eq '^FABER_(NEW_MESH|MESH_CIDR|NODE_NAME|CONTAINER_CIDR)=' "$f" 2>/dev/null; then
+  elif grep -Eq '^FABER_(NEW_MESH|MESH_CIDR|NODE_NAME|CONTAINER_CIDR|SERVICE_CIDR)=' "$f" 2>/dev/null; then
     echo new
   else
     echo none
@@ -1077,6 +1123,16 @@ stored_container_cidr() {
   fi
 }
 
+# stored_service_cidr: FABER_SERVICE_CIDR from the env file when it is
+# well-formed.
+stored_service_cidr() {
+  local value
+  value="$(env_file_value FABER_SERVICE_CIDR)"
+  if [[ -n "$value" ]] && valid_service_cidr "$value"; then
+    printf '%s\n' "$value"
+  fi
+}
+
 # stored_node_name: FABER_NODE_NAME from the env file when it is well-formed.
 stored_node_name() {
   local value
@@ -1114,9 +1170,16 @@ hostname_node_name() {
 # --container-cidr the range is fabercp's default.
 check_cidr_overlap() {
   local container="${CONTAINER_CIDR:-$DEFAULT_CONTAINER_CIDR}"
+  local service="${SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}"
   [[ "$MODE" == new && -n "$MESH_CIDR" ]] || return 0
   if cidrs_overlap "$container" "$MESH_CIDR"; then
     die "container CIDR $container overlaps the mesh CIDR $MESH_CIDR; pick ranges that do not overlap with --container-cidr or --mesh-cidr"
+  fi
+  if cidrs_overlap "$service" "$MESH_CIDR"; then
+    die "service CIDR $service overlaps the mesh CIDR $MESH_CIDR; pick ranges that do not overlap with --service-cidr or --mesh-cidr"
+  fi
+  if cidrs_overlap "$service" "$container"; then
+    die "service CIDR $service overlaps the container CIDR $container; pick ranges that do not overlap with --service-cidr or --container-cidr"
   fi
 }
 
@@ -1142,12 +1205,13 @@ check_node_removed() {
 # MESH_CIDR, CONTAINER_CIDR, NODE_NAME, RESET_IDENTITY and
 # REPLACED_JOIN_NODE_ID.
 resolve_mode() {
-  local stored_cidr stored_container stored_name
+  local stored_cidr stored_container stored_service stored_name
   CONFIGURED="$(node_configured)"
   PENDING="$(pending_bootstrap)"
   RESUME=0
   MESH_CIDR=""
   CONTAINER_CIDR=""
+  SERVICE_CIDR=""
   NODE_NAME=""
   RESET_IDENTITY=0
   REPLACED_JOIN_NODE_ID=""
@@ -1156,6 +1220,7 @@ resolve_mode() {
   fi
   stored_cidr="$(stored_mesh_cidr)"
   stored_container="$(stored_container_cidr)"
+  stored_service="$(stored_service_cidr)"
   stored_name="$(stored_node_name)"
   check_node_removed
 
@@ -1169,6 +1234,9 @@ resolve_mode() {
     if [[ -n "$CONTAINER_CIDR_ARG" && -n "$stored_container" && "$CONTAINER_CIDR_ARG" != "$stored_container" ]]; then
       die "this node already started a new mesh with --container-cidr $stored_container; re-run without --container-cidr to finish it"
     fi
+    if [[ -n "$SERVICE_CIDR_ARG" && -n "$stored_service" && "$SERVICE_CIDR_ARG" != "$stored_service" ]]; then
+      die "this node already started a new mesh with --service-cidr $stored_service; re-run without --service-cidr to finish it"
+    fi
     if [[ -n "$NODE_NAME_ARG" && -n "$stored_name" && "$NODE_NAME_ARG" != "$stored_name" ]]; then
       die "this node already started a new mesh with --name $stored_name; re-run without --name to finish it"
     fi
@@ -1176,6 +1244,7 @@ resolve_mode() {
     RESUME=1
     MESH_CIDR="${stored_cidr:-${MESH_CIDR_ARG:-$DEFAULT_MESH_CIDR}}"
     CONTAINER_CIDR="${stored_container:-$CONTAINER_CIDR_ARG}"
+    SERVICE_CIDR="${stored_service:-${SERVICE_CIDR_ARG:-$DEFAULT_SERVICE_CIDR}}"
     NODE_NAME="${stored_name:-$NODE_NAME_ARG}"
   elif [[ "$CONFIGURED" == yes && "$PENDING" == join ]]; then
     if [[ -n "$MESH_CIDR_ARG" ]]; then
@@ -1183,6 +1252,9 @@ resolve_mode() {
     fi
     if [[ -n "$CONTAINER_CIDR_ARG" ]]; then
       die "this node is joining a mesh ($(identity_file) exists); --container-cidr only applies to a new mesh"
+    fi
+    if [[ -n "$SERVICE_CIDR_ARG" ]]; then
+      die "this node is joining a mesh ($(identity_file) exists); --service-cidr only applies to a new mesh"
     fi
     if [[ -n "$NODE_NAME_ARG" ]]; then
       die "this node is joining a mesh ($(identity_file) exists); --name only applies to a new mesh"
@@ -1218,6 +1290,9 @@ resolve_mode() {
     if [[ -n "$CONTAINER_CIDR_ARG" ]]; then
       die "this node is already configured; --container-cidr only applies to a new mesh"
     fi
+    if [[ -n "$SERVICE_CIDR_ARG" ]]; then
+      die "this node is already configured; --service-cidr only applies to a new mesh"
+    fi
     if [[ -n "$NODE_NAME_ARG" ]]; then
       die "this node is already configured; --name only applies to a new mesh"
     fi
@@ -1235,7 +1310,7 @@ resolve_mode() {
       RESUME=0
       RESET_IDENTITY=1
     fi
-  elif [[ "$PENDING" == join && -z "$MESH_CIDR_ARG" && -z "$CONTAINER_CIDR_ARG" && -z "$NODE_NAME_ARG" ]]; then
+  elif [[ "$PENDING" == join && -z "$MESH_CIDR_ARG" && -z "$CONTAINER_CIDR_ARG" && -z "$SERVICE_CIDR_ARG" && -z "$NODE_NAME_ARG" ]]; then
     stored_token_usable ||
       die "a join was started on this node but $(token_file) is missing; re-run with --join <token>, or with --mesh-cidr <cidr> to create a new mesh instead"
     MODE="join"
@@ -1243,11 +1318,12 @@ resolve_mode() {
     log "continuing the join recorded in $(env_file) (pass --join for a new token, or --mesh-cidr to create a new mesh instead)"
   else
     MODE="new"
-    if [[ "$PENDING" == new && -z "$MESH_CIDR_ARG" && -z "$CONTAINER_CIDR_ARG" && -z "$NODE_NAME_ARG" ]]; then
+    if [[ "$PENDING" == new && -z "$MESH_CIDR_ARG" && -z "$CONTAINER_CIDR_ARG" && -z "$SERVICE_CIDR_ARG" && -z "$NODE_NAME_ARG" ]]; then
       RESUME=1
     fi
     MESH_CIDR="${MESH_CIDR_ARG:-${stored_cidr:-$DEFAULT_MESH_CIDR}}"
     CONTAINER_CIDR="${CONTAINER_CIDR_ARG:-$stored_container}"
+    SERVICE_CIDR="${SERVICE_CIDR_ARG:-${stored_service:-$DEFAULT_SERVICE_CIDR}}"
     NODE_NAME="${NODE_NAME_ARG:-$stored_name}"
   fi
   if [[ "$MODE" == new && -z "$NODE_NAME" ]]; then
@@ -1434,6 +1510,7 @@ render_env() {
         if [[ -n "$CONTAINER_CIDR" ]]; then
           printf 'FABER_CONTAINER_CIDR=%s\n' "$CONTAINER_CIDR"
         fi
+        printf 'FABER_SERVICE_CIDR=%s\n' "${SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}"
         ;;
       join) printf 'FABER_JOIN_TOKEN_FILE=%s\n' "$(token_file)" ;;
     esac
