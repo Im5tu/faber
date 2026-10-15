@@ -124,7 +124,7 @@ When the mesh answers a register or join request with `invite_invalid`, `invite_
 
 1. logs an error that says how to recover,
 2. refuses raft RPCs from then on (see "Joining with an invite"),
-3. stops the host reconcile loop, removes `10-faber.conflist` if there is one (`ContainerRuntime::remove_pod_network`, which leaves the containerd drop-in alone and works before any settings have replicated), deletes the WireGuard interface (`ip link show faber0`, then `ip link del faber0` if it exists) and removes `/var/lib/faber/iface`. If the delete fails, the record stays and the log says to remove the interface by hand. A conflist that cannot be removed is logged and the interface goes all the same,
+3. stops the host reconcile loop, removes `10-faber.conflist` if there is one (a `remove_cni_config` request to faber-node, which leaves the containerd drop-in alone), removes the cluster key file, deletes the WireGuard interface (`ip link show faber0`, then `ip link del faber0` if it exists) and removes `/var/lib/faber/iface`. If the delete fails, the record stays and the log says to remove the interface by hand. A conflist that cannot be removed is logged and the interface goes all the same,
 4. writes `invite_rejected` to `/var/lib/faber/bootstrap-error`,
 5. creates `/var/lib/faber/join-failed` and deletes `identity.json` straight away,
 6. stays up but idle. It does not exit, so systemd does not restart it in a loop, and it does not recreate the identity from the old token while it runs.
@@ -194,11 +194,13 @@ For install.sh this means `--join <different token>` is safe to accept while `id
 | `token_expired` | startup, the join token has expired | no identity: idle, no listeners. Pending join kept: running, still joining |
 | `token_invalid` | startup, the join token does not decode or does not hold a valid identity. With a pending join kept, also a token whose endpoint differs from `FABER_WG_ENDPOINT` | as above |
 | `invite_rejected` | the mesh answered a register or join request with `invite_*` | idle, listeners up, no `identity.json`, no WireGuard interface, no conflist. After a restart without a token: idle, no listeners |
+| `key_mismatch` | the joiner was sent a cluster key whose id is not the one raft records (see "Encryption") | as for `invite_rejected` |
+| `key_unavailable` | the cluster sent no cluster key in ten answers to the registration | as for `invite_rejected` |
 | `node_removed` | the mesh removed this node: the leader answered a lease renewal or a join request with `mesh_node_removed`, or the raft membership this node has applied no longer has it as a voter | as for `invite_rejected` |
 
 fabercp writes the file with mode 0600 through a temp file and a rename, so a reader sees a whole code or no file. For `invite_rejected` and `node_removed` the file is on disk before `identity.json` is deleted. fabercp removes the file at the next start that loads or creates an identity, unless that start wrote it about a replacement token (see "Replacing a pending join"), and when a pending join completes. A start that stays idle for want of a token leaves it in place.
 
-install.sh reads it as root, so it must not trust the file further than this: read it only if it is a regular file and not a symlink, read at most 64 bytes, and compare the content with the four codes. Anything else counts as no marker. install.sh reads the file when a join fails, and in preflight of a run without `--join` (see "Removed node"). It ignores one that is older than `join.token`, because that file is about an earlier token. For `node_removed` it tells the admin to create a new invite and rejoin with `--join <token> --reset`.
+install.sh reads it as root, so it must not trust the file further than this: read it only if it is a regular file and not a symlink, read at most 64 bytes, and compare the content with the codes it knows (`token_expired`, `token_invalid`, `invite_rejected` and `node_removed`; it does not know the two key codes). Anything else counts as no marker. install.sh reads the file when a join fails, and in preflight of a run without `--join` (see "Removed node"). It ignores one that is older than `join.token`, because that file is about an earlier token. For `node_removed` it tells the admin to create a new invite and rejoin with `--join <token> --reset`.
 
 ## Replicated state (`sm_data`)
 
@@ -620,6 +622,7 @@ Host/Origin guard:
 | `mesh_lease_expired` | 409 | a lease renewal for a node the mesh still has, whose lease has expired. It is no proof of removal, and the node does not tear down |
 | `forbidden` | 403 | Host/Origin guard; a raft RPC, endpoint change, lease renewal, invite, lease change or workload write from an address that may not make it; a lease renewal by another machine than the one the node is registered to |
 | `not_ready` | 503 | retry later. The status is 503 whether the service or apply returns it. Returned by a register or a join when the leader cannot confirm within 5 s that it has applied everything committed. Returned by a join for a node that has not registered, or that is already a learner and has not replicated the leader's log within 5 s. Returned by a register that takes over a name while the node that holds it is still in the raft membership: too few voters have caught up within 5 s to remove it, the membership change failed, or the holder was the leader and has just removed itself. Returned by apply for `RemoveNode` while the node's lease is live or the node is still a raft member. Also returned for raft RPCs by a node that has not registered. |
+| `key_unavailable` | 503 | the cluster key is missing, unreadable or not the one raft records on the node that has to seal or open env values, or a stored data key cannot be opened with it. A deploy needs it on the leader and `?reveal=true` on the answering node |
 | `unavailable` | 503 | `GET /api/v1/health` only: the raft core has stopped or the storage is closed |
 | `project_exists` | 409 | a project create for a name that is taken, or an environment add for an environment the project has |
 | `not_empty` | 409 | removing a project while one of its environments holds a workload, or an environment while it holds one. Remove the workloads first |
@@ -642,27 +645,25 @@ Existing codes (`bad_request`, `already_initialized`, `not_found`, …) keep the
 - `faber project rm <NAME>`: prints `removed project <NAME>`, in JSON mode `{"removed": "<NAME>"}`. Fails with `not_empty` while an environment holds a workload.
 - `faber project env add <PROJECT> <ENV>`: adds an environment and prints the project.
 - `faber project env rm <PROJECT> <ENV>`: prints `removed environment <ENV> from <PROJECT>`, in JSON mode `{"project": "<PROJECT>", "removed": "<ENV>"}`.
-- `faber deploy compose [FILE]`, `faber deploy k8s <FILE|DIR|->...` and `faber deploy spec <FILE|->` all take `--project <PROJECT>` and `--env <ENV>`. Both are required, and neither has a default or reads an environment variable. They also take:
+- `faber mesh status-interval [--set <duration>]`: without `--set` it prints the status report interval, in text mode as `status_interval: 5s`. `--set` takes seconds or a number with `s` or `m`, from 1 s to 300 s, and prints the new value. JSON mode prints `{"status_interval_secs": N}`.
+- `faber cluster key export [--file <PATH>]`: prints the cluster key, base64 on one line, so `$(faber cluster key export)` captures it. It sends no request. It reads the file named by `--file`, by `FABER_CLUSTER_KEY_FILE`, or `/var/lib/faber/cluster.key`, so it must run as root or as the faber user. The path must be a regular file, checked with `lstat`, so a symlink is refused even when it points at a regular file, and the file opened must be the one that was checked (`not a regular file`). At most 4096 bytes are read (`too large`). The content, trimmed, must be standard base64 of exactly 32 bytes (`valid cluster key`; an empty file says `empty`). Errors name the path and never hold file content. JSON mode prints `{"cluster_key": "..."}`. The key is a secret: whoever has it can open every env value of the cluster.
+- `faber deploy spec <FILE|->` takes `--project <PROJECT>` and `--env <ENV>`. Both are required, and neither has a default or reads an environment variable. `FILE` is a JSON object that maps workload names to `WorkloadSpec`s, or `-` for stdin. A name that is in the object twice is an error: `the workload "web" is defined twice`. It also takes:
   - `--expose <WORKLOAD>`, which may be repeated: sets `expose` to `cluster` on that workload. A name the input does not have is an error.
-  - `--prune`: also removes the workloads of the environment that the input does not have. Without it a deploy leaves them alone. Two cases are refused before anything is sent, because the input does not say what the environment should hold. An input with no workloads at all would remove every workload: `--prune: the input has no workloads, so every workload of the environment would be removed`. A compose file with services that their profiles left out would remove those: `--prune: these services were skipped by their profiles and would be removed: <names>; pass their --profile, or drop --prune`.
-  - `--dry-run`: converts, validates, prints and sends nothing.
-- `faber deploy spec <FILE|->`: a JSON object that maps workload names to `WorkloadSpec`s. This is what `--dry-run` prints in text mode, so the output of a dry run can be reviewed, saved and deployed later. A name that is in the object twice is an error: `the workload "web" is defined twice`.
+  - `--prune`: also removes the workloads of the environment that the input does not have. Without it a deploy leaves them alone. An input with no workloads at all is refused before anything is sent, because it would remove every workload: `--prune: the input has no workloads, so every workload of the environment would be removed`. Without `--prune` the same input is refused as `<source>: nothing to deploy: the input has no workloads`.
+  - `--dry-run`: validates, prints and sends nothing. In text mode stdout has the workloads as pretty JSON, which `deploy spec` reads back, so the output of a dry run can be reviewed, saved and deployed later.
 - Every file a deploy reads must be a regular file of at most 8 MiB. A device or a socket is refused as `not a regular file`. Stdin is read up to 8 MiB too. Messages and the `read:` lines show a file by its real path, with symlinks resolved, relative to the current directory when the file is below it.
-- An input without a workload is an error unless `--prune` is given, which has its own refusal: `<source>: nothing to deploy: the input has no workloads`.
 - What a deploy prints, in text mode:
   - stdout has the result, one aligned line each: `project:`, `environment:`, `generation:`, `created:`, `updated:`, `unchanged:` and `removed:`. The last four are names separated by `, `, or `-` for none.
-  - stderr has one line per finding, in this order: `warning: <source>: <path>: <message>` for what the conversion skipped, `uses variable: <NAME>` for every variable of the caller whose value the compose conversion read, and `note: <message>` for things that are no fault of the input. A `uses variable:` line has the name and never the value.
-  - All of this is printed before the request is sent. The warnings are on the screen even when the API then refuses the deploy.
-  - With `--dry-run`, stdout has the workloads as pretty JSON and nothing else. stderr has the warnings, then the `uses variable:` lines, then one `read: <path>` for every file the command read, then the notes. The file list is there because a compose deploy can pull in `.env` and every `env_file`, and their values end up in the output. Stdin is `-`.
-- What a deploy prints, in JSON mode: one document on stdout and nothing on stderr. A deploy prints `{"result": DeployResponse, "warnings": [{"source", "path", "message"}], "notes": [...], "variables": [...]}`. A dry run prints `{"project", "environment", "spec", "warnings", "notes", "variables", "files"}`, where `spec` is the workloads map. `variables` is the sorted names behind the `uses variable:` lines, and is empty for `deploy k8s` and `deploy spec`. That document is not input for `deploy spec`. Only its `spec` field is. When the API refuses a deploy that was sent, stdout gets no document. stderr then has one line of JSON, `{"warnings", "notes", "variables"}`, and after it the `error:` line.
-- When the input cannot be converted or breaks a rule of the model, stderr has every warning, then every error as `error: <source>: <path>: <message>`, then `error: nothing was deployed`. Nothing is sent and the exit code is 1, in both output modes. The converters collect every error of the input before they stop.
-- Two notes exist. One says that containers get no Linux capabilities unless the input adds them. It appears when no container of the deploy adds any. The other says that env values are stored unencrypted and are readable by local users on every node. It appears when the name of an env variable contains `PASSWORD`, `PASSWD`, `SECRET`, `TOKEN`, `API_KEY` or `PRIVATE_KEY`, in any case.
-- `faber app ls [--project <PROJECT>] [--env <ENV>]`: a table with the columns `NAME`, `PROJECT`, `ENVIRONMENT`, `SCALE`, `EXPOSE` and `FQDN`. `SCALE` is a number or `per-node`. Both flags are optional filters. Without them it lists every workload of the cluster. JSON mode prints the `WorkloadListResponse`.
-- `faber app show <WORKLOAD> --project <PROJECT> --env <ENV> [--show-env]`: one workload. Text mode prints every field that changes how the workload runs:
-  - `name`, `fqdn`, `project`, `environment`, `revision`, `generation`, `scale`, `restart`, `expose`, `node` (`-` without a placement) and `stop_grace` (`(runner default)` when unset).
-  - `volumes:` with one line per volume, mounted or not: `host path <PATH>` with `, create`, `named <NAME>` with `, per-replica`, or `ephemeral` with `, memory` and the size in bytes. `-` when there is none.
-  - `containers:` and for each one `image`, `command`, `args`, `working_dir` and `user` (`(image default)` when unset), `env`, `ports`, `mounts` with `read-only` and the sub-path, `resources`, `capabilities`, `read_only_root_fs` and the three probes.
-  - Env values are `***` unless `--show-env` is given, and the values of HTTP probe headers are never printed. JSON mode prints the `WorkloadResponse` and is never masked. Masking is for a screen that someone else can see. It keeps nothing from a user who can run the command.
+  - stderr has one `note: <message>` line for each thing that is no fault of the input, printed before the request is sent, so it is on the screen even when the API then refuses the deploy. With `--dry-run` stderr also has one `read: <path>` for every file the command read, before the notes. Stdin is `-`.
+- What a deploy prints, in JSON mode: one document on stdout and nothing on stderr. A deploy prints `{"result": DeployResponse, "notes": [...], "variables": [...]}`. A dry run prints `{"project", "environment", "spec", "notes", "variables", "files"}`, where `spec` is the workloads map. `variables` is always empty. That document is not input for `deploy spec`. Only its `spec` field is. When the API refuses a deploy that was sent, stdout gets no document. stderr then has one line of JSON, `{"notes", "variables"}`, and after it the `error:` line.
+- When the input cannot be read or breaks a rule of the model, stderr has every error as `error: <source>: <path>: <message>`, then `error: nothing was deployed`. Nothing is sent and the exit code is 1, in both output modes.
+- Two notes exist. One says that containers get no Linux capabilities unless the input adds them. It appears when no container of the deploy adds any. The other appears when the name of an env variable contains `PASSWORD`, `PASSWD`, `SECRET`, `TOKEN`, `API_KEY` or `PRIVATE_KEY`, in any case.
+- `faber app ls [--project <PROJECT>] [--env <ENV>]`: a table with the columns `NAME`, `PROJECT`, `ENVIRONMENT`, `SCALE`, `AVAILABLE`, `EXPOSE` and `FQDN`. `SCALE` is `<count> (<strategy>)` or `daemon`. `AVAILABLE` is `available/desired`, taken from the list alone: the command makes one request, not one per row. Both flags are optional filters. Without them it lists every workload of the cluster. JSON mode prints the `WorkloadListResponse`.
+- `faber app show <WORKLOAD> --project <PROJECT> --env <ENV>`: one workload. The CLI always sends `reveal=true`, so env values are always printed in clear, and the command fails with `key_unavailable` on a node that cannot open them. Masking is for the API. It keeps nothing from a user who can run the command. Text mode prints every field that changes how the workload runs:
+  - `name`, `fqdn`, `project`, `environment`, `revision`, `generation`, `scale`, `restart`, `expose`, `nodes` (`-` without a pin) and `stop_grace` (`(runner default)` when unset).
+  - `replicas:` with a table of `REPLICA`, `NODE`, `REVISION`, `STATE`, `POD IP` and `REASON`, or `-` before the leader has placed the workload. `NODE` is `-` while a replica is unplaced, and `REASON` then says why (see "Placement").
+  - `volumes:` with one line per volume, mounted or not: the name, `block` or `ramdisk` and the size in bytes. `-` when there is none.
+  - `containers:` and for each one `image`, `command`, `args`, `working_dir` and `user` (`(image default)` when unset), `env`, `ports`, `mounts` with the kind and size of the volume and `read-only`, `resources`, `capabilities`, `read_only_root_fs` and `probe`. The values of HTTP probe headers are never printed. JSON mode prints the `WorkloadResponse`.
 - `faber app rm <WORKLOAD>... --project <PROJECT> --env <ENV>`: removes the workloads one after the other and prints `removed <fqdn>` for each, in JSON mode `{"removed": ["<fqdn>", ...]}`. It stops at the first failure, still prints what it removed before that, and exits 1.
 - Text output replaces control characters in names and messages with `\xNN` or `\u{NN}`, so a name cannot move the cursor or recolour the terminal. Unicode format characters are replaced the same way: the bidirectional controls and the zero-width characters, which could reorder or hide part of a line.
 - Exit codes: 0 on success. 1 for every failure, with `error: <text>` on stderr. For an answer from the API the text is `<code>: <message>`, or the code alone when the body has no message. An unknown project prints `error: not_found: project "nope" does not exist`. 2 for a usage error, from the argument parser.
@@ -680,6 +681,183 @@ Existing codes (`bad_request`, `already_initialized`, `not_found`, …) keep the
 - `faber health` exits non-zero when the node answers 503, and prints `unavailable: <message>`. The 503 body has the fields of `HealthResponse` and of the error body, so a client that reads either shape can decode it.
 - `install.sh` stages the `faber` CLI in the parent of `FABER_CLI_DIR` and refuses a parent that root does not own or that is group/world-writable. `/usr/local` is `root:staff 2775` on some Debian releases. The error names the way out: run with `FABER_CLI_DIR` set to a directory whose parent only root can write, for example `FABER_CLI_DIR=/usr/bin`.
 - The `faber` client (`FaberClient`) gives up on a connection after 5 s. `health`, `cluster status` and `mesh lease` time out after 30 s. `cluster init`, `cluster join`, `mesh invite` and `mesh lease --set` time out after 150 s, because the server waits up to 120 s for a join and 10 s more for the node to see the result. The project and workload commands follow the same split: `project ls`, `project show`, `app ls` and `app show` are reads and time out after 30 s, and every command that writes times out after 150 s.
+
+## Encryption
+
+Every container env value is encrypted at rest. The scheme is envelope encryption, in `faber_crypto`:
+
+- The **cluster key** is 32 random bytes. It lives in a file on each node, `/var/lib/faber/cluster.key` (`--cluster-key-file`, `FABER_CLUSTER_KEY_FILE`), as base64 with a newline, owned by the faber user with mode 0600. It never enters raft, the invite token or a log.
+- A **data key** is 32 random bytes, one per scope: `cluster` or `<project>/<environment>`. It is stored in raft as `keys/data/<scope>`, wrapped under the cluster key. A deploy to an environment that has none makes one. Nothing makes the `cluster` data key yet.
+- Both seal with XChaCha20-Poly1305 and a random 24-byte nonce. The associated data is length-prefixed and starts with a label of its own for each use, so a wrapped key cannot pass as a sealed value. A data key is wrapped with its scope as associated data, so it opens only for that scope. An env value is sealed with the project, environment, workload, container and variable name, so a value cannot be moved to another variable.
+- `CreateDataKey` is first-writer-wins. A proposer that loses reads the stored key back and seals again with it.
+- The cluster key has an id: the first 8 bytes of an HMAC-SHA256 of a fixed label under the key, in hex. Raft records it once (`keys/cluster-id`), so a node whose key file holds another key is detected and refuses to seal or open (`key_unavailable`).
+- The leader seals the env before it proposes, so neither the log nor a snapshot holds a plaintext value. A stored workload keeps its spec with empty `env`, and a `SealedEnv{digest, values}` per container. The `digest` is an HMAC of the plaintext env under the data key, with its location. It tells that an env is unchanged without comparing ciphertexts, which differ on every seal, and without a guessable hash of a low-entropy secret. A redeploy of an unchanged env keeps the stored ciphertext and the revision.
+- Key material is zeroized on drop and prints as `[redacted]`.
+
+**Masking.** An API read of a workload shows every env value as `***`, with the variable names. `?reveal=true` opens them with the cluster key of the node that answers, and writes one log line that names the workload and no value. `faber app show` always asks for `reveal=true`.
+
+**Creation.** `faber cluster init` makes the cluster key file if it is missing, never replacing one, and has raft record its id. A leader without a recorded id records the id of its own key file at start and after every election.
+
+**Delivery to a joiner.** The key is not in the join token, which can be copied. It is in the 200 answer to `POST /raft/cluster/register`, and only when the node that received the request sees it come from the mesh IP the invite is bound to. A request that a follower forwarded, or that arrives on a listener that skips source checks, gets none. The joiner checks the id of the key it was sent against the id raft records, stores it before it becomes a voter, and only then records the registration. If the id differs, the join fails with `key_mismatch`. If ten answers hold no key, it fails with `key_unavailable`. Both are written to `bootstrap-error`, and the node discards its identity and key file like one whose invite was rejected. A node that leaves the cluster removes its key file.
+
+**The join token is a bearer secret.** Whoever registers with an invite first receives the cluster key, and can join the cluster anyway. Treat a token like the key: it is single-use and expires, so create it close to its use, send it over a private channel and do not log it. There is no operator approval before the key is released.
+
+**Key export.** `faber cluster key export` prints the key from the file, with no request (see "CLI"). Keep a copy somewhere safe: without the key file on the nodes, no env can be opened, and a cluster whose every key file is lost cannot read its env values.
+
+**Limits.** On a node that runs a replica, root can read the cluster key and the replica's env, and so can any local user through the loopback API with `?reveal=true`. A follower forwards a deploy to the leader with the env in clear over the mesh, which WireGuard encrypts. The key file is not rotated; there is no re-keying.
+
+## faber-node
+
+`faber-node` (`src/faber-node`) is a root service on each node. fabercp runs unprivileged, and faber-node does the work that needs root: CRI calls to containerd, mounts, chown, and the containerd and CNI config. It is the trust boundary. Nothing in a request is taken on trust, so a compromised fabercp can start containers only inside faber-node's limits.
+
+**Socket.** `/run/faber/node.sock` (`FABER_NODE_SOCKET`, `--node-socket` of fabercp), created by faber-node as `root:faber` 0660 in a root-owned directory that group and others cannot write. faber-node refuses a socket directory that is not root's alone. It checks the caller with `SO_PEERCRED` and serves root and the configured faber uid only. fabercp checks that the process on the socket is owned by root before it sends anything.
+
+**Protocol** (`faber-node-protocol`, `PROTOCOL_VERSION` 1). A frame is a `u32` big-endian length and that many bytes of JSON, at most 4 MiB (`MAX_FRAME_BYTES`). One request frame gets one response frame. The first request on a connection must be `version`. A connection idle for 60 s is dropped, and at most 64 are served at once. A request is a typed enum with an unknown-field refusal, tagged `type`:
+
+| Request | Does |
+|---|---|
+| `version{client_version}` | the handshake. A client version faber-node does not speak is `version_mismatch` |
+| `pull_image{image}` | pulls a public image |
+| `ensure_sandbox{replica, uid_base, dns, ports}` | creates the replica's pod sandbox, or returns the ready one |
+| `create_container{replica, sandbox_id, container, env, uid_base}` | creates a container. `env` replaces the spec's, which is ignored |
+| `start_container`, `stop_container{container_id, grace_secs}`, `remove_container`, `remove_sandbox` | lifecycle. Only containers and sandboxes that faber made are touched |
+| `ensure_volume{replica, volume_name, kind, size_bytes, uid_base}`, `remove_volume{replica, volume_name}` | see "Volumes" |
+| `list_replicas`, `list_volumes` | what is on the node |
+| `configure_runtime{pod_network}`, `remove_cni_config` | see "containerd and CNI config" |
+
+A `ReplicaRef` is `{project, env, workload, revision, replica_index}`. The names are DNS labels, and `revision` is 4 to 32 lower-case hex characters. fabercp sends the stored revision as 16 hex digits (`{:016x}`). Env values are wiped from memory after use, and no `Debug` output holds them.
+
+Responses are `version`, `image`, `sandbox`, `container`, `done`, `changed`, `replicas`, `volumes` and `error{code, message}`. The codes are `invalid_request`, `forbidden`, `not_found`, `version_mismatch`, `runtime` and `internal`.
+
+**Trust checks**, on every request, whatever fabercp sends:
+
+- The model's validation is run again on the container, and the request's env is checked with it.
+- Capabilities outside `ALLOWED_CAPABILITIES` are `forbidden`.
+- The container is never privileged. All capabilities are dropped and only the listed ones are added. `no_new_privs` is set, the runtime's default seccomp profile applies, and the pod runs in a user namespace (see below).
+- Mounts are `nosuid,nodev`.
+- A volume path comes only from (project, env, workload, replica index, volume) under faber-node's own volume root. All are DNS labels or numbers. A raw path is never accepted.
+- `uid_base` must be exactly the start of a 65536-wide block (`USERNS_LENGTH`), a multiple of 65536, not 0, and inside the range faber-node owns (`FABER_NODE_UID_MIN` to `FABER_NODE_UID_MAX`, in its root-owned env file). The same check covers the owner of a block volume. A compromised fabercp therefore cannot map container root to host root.
+- `create_container` is refused unless the sandbox carries the replica's labels and the same `uid_base`.
+- The pod runs in a user namespace (CRI `userns_options`, POD mode) that maps container root to `uid_base` for 65536 ids, so root in a container is an unprivileged host user. It needs containerd 2.x and Linux 6.3 or later.
+- Sandboxes are placed in `faber-<project>-<env>-<workload>.slice` (a dash inside a name becomes `_`), which the systemd cgroup driver needs.
+- DNS: at most 3 nameservers and 6 search names, valid DNS names, no loopback, unspecified or multicast nameserver.
+- The runtime config is the one in "containerd and CNI config".
+
+**Config.** `/etc/faber/faber-node.env` (`--env-file`, `FABER_NODE_ENV_FILE`), `KEY=VALUE` lines. faber-node reads it by path and refuses it unless root alone can write it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `FABER_NODE_UID_MIN`, `FABER_NODE_UID_MAX` | required | the host ids pods may map, `[min, max)`. The floor is one block. The installer writes 1048576 and 2147483648, the range placement hands out |
+| `FABER_NODE_FABER_UID`, `FABER_NODE_FABER_GID` | required | the faber user. Must lie outside the pod range. The group owns the socket and block volumes |
+| `FABER_NODE_SOCKET` | `/run/faber/node.sock` | |
+| `FABER_NODE_VOLUME_ROOT` | `/var/lib/faber-node/volumes` | must be root-owned and not writable by others |
+| `FABER_NODE_CONTAINERD_SOCKET` | containerd's | |
+| `FABER_NODE_RUNTIME_HANDLER` | empty | CRI runtime handler |
+| `FABER_NODE_BIN_DIR`, `FABER_NODE_SBIN_DIR` | `/usr/bin`, `/usr/sbin` | where `mount`, `umount`, `mountpoint`, `chmod` and `mkfs.ext4` are run from, by absolute path |
+| `FABER_NODE_CONTAINERD_CONF_DIR`, `FABER_NODE_CNI_CONF_DIR`, `FABER_NODE_CNI_BIN_DIR` | `/etc/containerd/conf.d`, `/etc/cni/net.d`, `/opt/cni/bin` | see "containerd and CNI config" |
+| `FABER_NODE_SANDBOX_IMAGE` | `registry.k8s.io/pause:3.10` | the pause image |
+| `FABER_NODE_MESH_INTERFACE` | `faber0` | the WireGuard interface. Must match fabercp's `FABER_WG_INTERFACE` |
+
+**Unit.** `faber-node.service` runs as root, `After=containerd.service`. It has `NoNewPrivileges`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native`, `RestrictAddressFamilies=AF_UNIX AF_NETLINK` and `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE`. It deliberately has no `ProtectSystem`, `ReadWritePaths`, `PrivateTmp` or `MountFlags`: each puts the unit in its own mount namespace, systemd.exec(5) says mounts made there do not propagate to the host, and `MountFlags=shared` does not restore that, so containerd would never see the volumes faber-node mounts. The hardening is limited to what needs no mount namespace.
+
+faber-node runs on Linux only. Its tests and the Linux-only code of the other crates are built on Linux.
+
+## Volumes
+
+faber-node makes volumes under `<volume root>/<project>/<env>/<workload>/<replica index>/<volume>/`, one per replica, so each replica of a service has its own on its own node.
+
+- A **block** volume is a sparse ext4 image (`disk.img`, made with `mkfs.ext4`) loop-mounted with `nosuid,nodev`. The root of the filesystem is owned on disk by `uid_base:faber_gid`, mode 0770. The pod's user namespace maps container root to `uid_base`, so the container can write, no other service's range can reach it, and the faber group can read it from the host. It is a plain bind mount into the container, not an idmapped mount. A volume that exists with another size is refused, so there is no resize. The runner never removes a block volume: it outlives the pod and the replica, and the disk stays until someone removes it by hand.
+- A **ramdisk** is a tmpfs of `size_bytes`, mode 0770, owned like a block volume. It lasts until `remove_volume`. The containers step removes the ramdisks of replicas that are no longer on the node, found with `list_volumes`.
+- A marker file records the kind and `uid_base` of a volume. `list_volumes` finds volumes by walking the root, never following a symlink.
+
+## Status reporting
+
+Each node reports on one interval: `faber mesh status-interval` and `PUT /api/v1/mesh/status-interval` set it for the cluster, 1 s to 300 s, 5 s by default.
+
+- Once per interval a node sends one `ReportNode` through the leader (`POST /raft/cluster/status`): its capacity (CPU in millicores from the available CPUs, `MemTotal`, and the free space of the file system under `--data-dir`) and every replica its runner knows, at most 100. Capacity is measured at most once a minute.
+- A replica is `{project, environment, workload, revision, replica_index, state, pod_ip?, detail?}`. `state` is `deploying`, `available` or `unavailable`. `detail` says why, in at most 200 bytes. `pod_ip` must lie in the reporter's own container subnet and not be its gateway.
+- The node sends no time. Apply stamps the record with the lease clock (`MeshState.clock`), so a node's wall clock cannot lie. Status and lease renewals share one instance-id check, so another machine cannot report for a node.
+- A report replaces the whole record of its node under `status/<node_id>` and writes nothing else, so no environment generation moves and the host loop sees no change.
+- A record counts as stale when it is older than three intervals plus one tick of the lease clock (5 to 60 s). A replica on a stale node reads `unavailable` whatever it last said, and does not count as `available`. Nothing writes when a node goes quiet: staleness is worked out when the record is read. When the interval changes, readers use the larger of the new and the previous interval until reports made under the old one have gone stale.
+- A node that reports nothing is not removed. Replicas move only when its lease expires (see "Placement").
+
+## Placement
+
+The leader decides which node runs each replica and stores the result in raft. It runs the planner when the replicated state changes: a deploy, a node report, a lease expiry. The plan is a pure function of the environments, the nodes (name, lease, last reported capacity) and the stored plan, so the same input gives the same plan and the leader proposes only when something changed.
+
+- Candidates are nodes with a live lease and a capacity report, narrowed to `placement.nodes` when the workload lists any.
+- An assignment is kept while its node is alive, still a candidate and the capacity still fits. A replica moves only when its node's lease has expired or the node is gone, never because its status went stale.
+- `spread` prefers the node that runs the fewest replicas of the workload, then a node that already hosts the environment, then the least loaded. `pack` prefers a node that already runs the workload, then a node that hosts the environment, then the most loaded one that still fits. An environment's workloads therefore stay together while capacity allows. `daemon` is one replica per candidate node.
+- Each replica reserves the sum of its containers' `cpu_millis` and `memory_bytes`, and the sizes of its block volumes against the reported disk, so resources are maximums that placement promises. Ramdisks count as memory.
+- A replica of a workload with a block volume never moves once placed. If its node is removed, it stays unplaced with `volume_lost` until the workload is removed. There is no command to discard a lost volume.
+- A replica with no node is `unavailable` and carries a `reason`. A reason is a prefix, optionally followed by detail, at most 64 bytes in all: `insufficient_capacity` (no candidate has the CPU, memory or disk left), `volume_lost`, `pinned_node_unknown: <names>` (`placement.nodes` names a node the cluster does not have, followed by the unknown names) and `no_node_available` (no allowed node is alive). Match on the prefix.
+- The command is `PlaceReplicas{project, environment, generation, basis, workloads}`. Apply refuses a plan for another generation than the environment's, and one made from state older than the stored plan, and stores nothing else. `basis` is the index of the last entry the leader had applied when it read the state.
+- Each workload gets a host uid range of 65536 ids from `[1048576, 2147483648)`, aligned to 65536, allocated in raft (`place-uids`) when the workload is first placed and released when it is removed. The lowest free range goes first. It is the `uid_base` of its pods. All replicas of a workload share it, and no two workloads share one.
+
+## Virtual IPs
+
+Each service (a workload) gets a virtual IP from the **service CIDR**, default `10.201.0.0/16`, set when the mesh is created (`--service-cidr`, `FABER_SERVICE_CIDR`, `install.sh --service-cidr`) and fixed after that. It must have no host bits, a prefix of /30 or shorter, and must not overlap the mesh or the container range. fabercp checks it at startup with `--new-mesh`, as it checks `--container-cidr`, and `InitCluster` rejects the same ranges with `bad_request`.
+
+- The leader's planner proposes `AllocateServiceIp` for a workload that has no address, never more than there are free addresses, and `ReleaseServiceIp` for an address whose workload is gone. Addresses go out in a ring starting at the first host address, so a released address is reused only after the ring has gone round. A workload keeps its address across revisions, so a deploy does not wait on a DNS cache. A full range answers `mesh_exhausted`.
+- Every node programs every service into nftables, so a container reaches a service from any node without an extra hop.
+- A **backend** is a replica that is placed, reported `available`, has a pod IP and is on a node whose report is not stale. The service serves the ports its containers declare, on the same port numbers.
+- **Active revision.** The newest revision (not newer than the stored one) whose placed replicas are all available. Otherwise the newest revision with at least one available replica. A new revision takes over only when it is complete, so the backends switch from the old revision to the new in one step (blue/green). Open connections keep their conntrack entry to the old replicas, which stop after the drain period.
+- A replica that fails a probe leaves the backends at once.
+- The services step runs after the network and runtime steps. Its desired value is, per service with an address, the address and the sorted `(pod_ip, port, protocol)` list, with no timestamps, so a status tick that changes nothing causes no update.
+- A node without nftables nat support fails to start.
+
+nftables chains (see "nftables") do the work:
+
+- `prerouting` (hook prerouting, priority dstnat), `output` (hook output, priority -100) and `postrouting` (priority srcnat) are nat chains in `inet faber`, present when container networking is on.
+- Per service and per (protocol, port): `ip daddr <vip> <proto> dport <port> dnat ip to numgen random mod N map { 0 : <ip>, ... }`. In `prerouting` it applies only to packets from the bridge, and in `output` to the host's own. A port with no backend gets no rule.
+- Hairpin: in `postrouting`, `oifname <bridge> ip saddr <b> ip daddr <b> ct status dnat masquerade` for each backend `b` in the local subnet, so a container that reaches its own service sees a source that is not itself.
+- A host connection to a service that reaches a pod on another node is masqueraded to the tunnel address: `oifname <iface> ip saddr != <container cidr> ip daddr <container cidr> ct status dnat masquerade`.
+- Two filter chains, `service_reject_prerouting` (from the bridge) and `service_reject_output`, reject any packet still addressed to the service range after the nat chains: an address with no backend, or one no service holds.
+- The forward chain needs no new rule: container-to-container traffic across nodes is already allowed, and `br_netfilter`, which install.sh loads, makes bridged traffic pass these chains.
+- `NetworkManager::set_services` keeps the service rules, so a network reload keeps them.
+
+## DNS
+
+fabercp answers DNS for the cluster on every mesh node, from its own server.
+
+- **Zone.** `faber.local`. A service is `<svc>.<env>.<project>.faber.local`: exactly five labels, each a DNS label, matched case-insensitively.
+- **Listen address.** The node's bridge gateway (the first host address of the node's container subnet), UDP and TCP, port 5300 (`DNS_REDIRECT_PORT`, `dns::DEFAULT_PORT`). The server binds with `IP_FREEBIND` because the bridge may not exist yet. nftables redirects port 53 on the gateway to it, from the bridge, so fabercp needs no privileged port: `iifname <bridge> ip daddr <gateway> udp dport 53 redirect to :5300`, and the same for tcp. Pods get the gateway as their only nameserver and `<env>.<project>.faber.local` as their search domain, set in CRI `dns_config` by `ensure_sandbox`.
+- **Answers** for a name under `faber.local` are authoritative (AA set, no SOA): a service with a virtual IP and type A is NOERROR with one A record, TTL 30 s. Another type (AAAA, TXT, ANY) is NOERROR with an empty answer. Any other name under `faber.local`, including `faber.local` itself, a wrong label count, an invalid label or an unknown service, is NXDOMAIN. A class other than IN is REFUSED. If the store cannot be read, SERVFAIL.
+- **Other names** are relayed unchanged to the host's upstream resolvers and the answer is relayed back. UDP clients are forwarded over UDP, TCP over TCP. Each upstream gets 1 s, and the whole forward is bounded by 2 s (`UPSTREAM_TIMEOUT`). A reply counts only if its id and question match. If none answers, SERVFAIL. Upstreams are the `nameserver` lines of `/etc/resolv.conf` (or `/run/systemd/resolve/resolv.conf` when that leaves none), port 53, skipping loopback, unspecified and scoped addresses, the node's bridge address and any address inside the container or service range.
+- **Limits.** UDP replies over the client's EDNS size (512 bytes without EDNS) are cut to the question with TC set. Other opcodes get NOTIMP, a query that does not hold exactly one question gets FORMERR, and a packet with the QR bit set is dropped. At most 512 forwarded UDP queries and 256 TCP connections are handled at once, and a TCP connection closes after 10 s idle, 30 s in all or 100 queries.
+- The server follows the replicated mesh, starts once the node has a container subnet and restarts when the subnet or the ranges change.
+- This DNS layer is expected to be replaced later. `expose` is not enforced: DNS answers for every service.
+
+## The runner
+
+The runner runs the replicas that placement put on this node, through faber-node. It has two parts. The **containers step** is in the reconcile loop and makes sandboxes and containers match placement. The **supervisor** is its own task on its own ticker, independent of the 300 s resync. fabercp runs the probes itself, because it reaches the pod IPs over the bridge. The step order is network, runtime, services, containers. Services runs before containers so that a long image pull never delays a virtual IP update, and the containers step is not applied at startup: the loop does it on its first pass.
+
+**What the containers step sends**, per placed replica in this order: `ensure_volume` for each declared volume in name order, `pull_image` for each distinct image, `ensure_sandbox` (the DNS above, and every port of every container), then `create_container` and `start_container` for each container that does not exist yet. Container names are `<workload>-<revision>-<container>` with the revision as 16 hex digits. `stop_container` carries the workload's `stop_grace_secs`, 30 s when unset (`DEFAULT_STOP_GRACE_SECS`). The env is fetched when a container is made, and the runner holds none. A workload whose env cannot be opened (no cluster key, the wrong key, no data key) is held: its pods are neither started nor removed, and a warning is logged.
+
+**The supervisor** polls `list_replicas` every second (`POLL_INTERVAL`), so an exit is noticed within one poll.
+
+- **Probes** go to the pod IP, only inside this node's container subnet. The first probe is one `interval_secs` after the container is seen up. One failure makes the replica report `unavailable`. Three in a row stop the container (`stop_container`), and it then restarts under the restart policy as if it had exited with code 137, so `never` leaves it stopped.
+- **Restart policy.** `always` restarts on any exit. `on_failure` restarts on an exit code other than 0, and a container that vanished counts as a failure. `never` does not restart. There is no retry limit.
+- **Backoff** per container starts at 100 ms (`BACKOFF_MIN`), doubles on each restart up to 60 s (`BACKOFF_MAX`), and goes back to 100 ms when the previous run was up for at least 10 s (`BACKOFF_RESET_AFTER`). A restart is `ensure_sandbox`, `remove_container` of the old one, `create_container`, `start_container`.
+- **Replica state** in a report: `deploying` until the step has started the replica and while a container is up and its first probe has not passed, `available` when every container is up and every probe passed (or it has no probe), `unavailable` otherwise. `pod_ip` is the sandbox address. A report holds every replica the runner knows, including older revisions that are draining, at most 100.
+
+**Stop order.** Every stop of a replica, whether placement removed it, the workload was scaled down, a newer revision replaced it or a probe failed three times, goes in this order: the replica reports `unavailable` at once, which removes it from the virtual IP's backends, then the supervisor waits the drain period, then it sends `stop_container`, then `remove_sandbox`, then removes its ramdisks. The drain period is 10 s (`DRAIN_PERIOD`), so connections that are open finish. Probe-triggered and removal stops run off the supervisor tick.
+
+**New revisions.** When placement has a newer revision of a workload on this node, replicas of older revisions are marked superseded and keep running. Once every replica of the newest revision on this node reports `available`, the older ones run for the drain period and are then stopped. The virtual IP's backends switch in that window. If the newer revision never becomes available, the older one runs on.
+
+> **Block volumes and downtime.** For a workload with a block volume, revisions do not overlap: the old replica of a slot is stopped, after the drain period, before the new one starts, because they would share the volume. The slot is not running in between, and in this version every replica of the workload is replaced at the same moment, so a deploy that changes the pod template can make the whole service unavailable for the length of a stop and a start. Run several replicas, on different nodes, so that losing one replica or one node does not take the service down, and plan a template change to such a workload as a short outage.
+
+## containerd and CNI config
+
+faber-node writes the containerd drop-in and the CNI network config. fabercp does not, and has no setting for either, so a compromised fabercp has no path to config that root loads.
+
+- **Requests.** `configure_runtime{pod_network}` is answered with `changed{changed}`. `pod_network` is `{subnet, mtu}`, or null to remove the CNI config. `remove_cni_config` removes the CNI config and nothing else, for a node that is leaving the mesh. Unknown fields are refused, so no path, file body, bridge name, image or cgroup setting can be sent.
+- **faber-node alone decides** the pause image (`FABER_NODE_SANDBOX_IMAGE`), `SystemdCgroup = true`, the bridge name (`faberbr0`, `POD_BRIDGE`, which fabercp also uses for the firewall), the CNI plugin directory and both config directories.
+- **Checks on `configure_runtime`.** The subnet follows the rule that fabercp also applies to the container CIDR (`check_container_subnet`): no host bits, a prefix of at most /30, no overlap with `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4` or `240.0.0.0/4`. It is also checked against the host, read with `ip -j -4 addr show` and `ip -j -4 route show table all` by absolute path: refused (`forbidden`, "the subnet is not allowed on this host") when it overlaps an address of an interface other than `faberbr0`, or holds a longer route on another interface, or conflicts with a `blackhole`, `unreachable`, `prohibit` or `throw` route in any table. It must lie inside a route of the mesh interface or the bridge, so it can never sit only inside `default` or a LAN route. fabercp installs `ip route replace <container range> dev <wg iface>` in the network step, which runs first, and if that route failed the runtime step is refused and the loop retries. `mtu` is 576 to 9000.
+- **Ownership.** `/etc/containerd/conf.d/` and `/etc/cni/net.d/` are `root:root` 0755. `faber.toml` and `10-faber.conflist` are written by faber-node, mode 0644. At startup and before every write, faber-node checks the containerd conf dir, the CNI conf dir and the CNI bin dir, and every directory above each: owned by root, not writable by group or others, and the leaf not a symlink. A missing conf dir is created `root 0755` at startup, a missing bin dir stops faber-node, and a directory that fails the check answers `forbidden` and nothing is written. Every regular file in the CNI bin dir must be owned by root and not writable by group or others. A symlink there is followed only to such a file in a directory whose path passes the check, and a dangling one stops runtime writes (fail closed).
+- **Writes** go to a temp file with a random name (`O_EXCL|O_NOFOLLOW`), the target is read with `O_NOFOLLOW` (a symlink there is replaced, not followed), then fsync, rename and fsync of the directory.
+- **Accepted limit.** fabercp holds `CAP_NET_ADMIN`, so it can change host routes itself. The subnet check guards the CNI path only.
+- The runtime step is not required at startup, since faber-node may start later. The loop applies it, and applies nothing while the mesh is not replicated.
 
 ## systemd units
 
