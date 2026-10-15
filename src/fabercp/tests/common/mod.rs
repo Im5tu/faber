@@ -27,7 +27,13 @@ pub fn fast_config(node_id: u64, dir: &Path) -> Config {
     // the data keys the leader made.
     std::fs::create_dir_all(dir).unwrap();
     let key_file = dir.join("cluster.key");
-    std::fs::write(&key_file, test_cluster_key().to_base64()).unwrap();
+    std::fs::write(&key_file, test_cluster_key().to_base64().as_str()).unwrap();
+    // The node refuses a key file that others can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     c.cluster_key_file = Some(key_file);
     c.heartbeat_ms = 50;
     c.election_min_ms = 150;

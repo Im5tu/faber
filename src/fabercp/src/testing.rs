@@ -20,7 +20,13 @@ pub fn fast_config(node_id: u64, dir: &std::path::Path) -> Config {
     let mut c = Config::new(node_id, dir);
     std::fs::create_dir_all(dir).unwrap();
     let key_file = dir.join("cluster.key");
-    std::fs::write(&key_file, test_cluster_key().to_base64()).unwrap();
+    std::fs::write(&key_file, test_cluster_key().to_base64().as_str()).unwrap();
+    // The node refuses a key file that others can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     c.cluster_key_file = Some(key_file);
     c.heartbeat_ms = 50;
     c.election_min_ms = 150;
@@ -76,5 +82,45 @@ impl TestNode {
         } = self;
         drop(service);
         handle.shutdown().await.unwrap();
+    }
+}
+
+/// What a test subscriber wrote, to search for log lines.
+#[derive(Clone, Default)]
+pub struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuf {
+    /// A subscriber at INFO that writes here. Run a future under it with
+    /// `tracing::instrument::WithSubscriber::with_subscriber`, which also
+    /// covers the worker threads that poll the future.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish()
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
     }
 }

@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +28,8 @@ use serde::Serialize;
 
 use crate::dto::{
     PeerEndpointRequest, PeerInviteRequest, PeerInviteResponse, PeerJoinRequest, PeerLeaseRequest,
-    PeerRegisterRequest, PeerRenewRequest, PeerStatusIntervalRequest, ReplicationStatus,
+    PeerRegisterRequest, PeerRegisterResponse, PeerRenewRequest, PeerStatusIntervalRequest,
+    ReplicationStatus,
 };
 use crate::lease;
 use crate::mesh::identity::FOUNDER_NODE_ID;
@@ -161,6 +163,9 @@ struct Inner {
     /// The clocks of the lease task, set once at startup. Readers of node
     /// status need the length of a tick of the lease clock.
     lease_timing: OnceLock<lease::LeaseTiming>,
+    /// Set when the log line about a cluster key that is not the cluster's
+    /// has been written, so that it is written once.
+    key_mismatch_logged: AtomicBool,
 }
 
 impl FaberService {
@@ -189,6 +194,7 @@ impl FaberService {
                 mesh,
                 strict_peer_source,
                 lease_timing: OnceLock::new(),
+                key_mismatch_logged: AtomicBool::new(false),
             }),
             cluster_keys: Arc::new(NoClusterKey),
         })
@@ -199,6 +205,12 @@ impl FaberService {
     pub fn with_cluster_keys(mut self, provider: Arc<dyn ClusterKeyProvider>) -> Self {
         self.cluster_keys = provider;
         self
+    }
+
+    /// True the first time it is called: the caller logs a cluster key
+    /// mismatch then and not again.
+    pub(crate) fn first_key_mismatch(&self) -> bool {
+        !self.inner.key_mismatch_logged.swap(true, Ordering::Relaxed)
     }
 
     pub(crate) fn cluster_keys(&self) -> &Arc<dyn ClusterKeyProvider> {
@@ -372,6 +384,18 @@ impl FaberService {
             });
         }
 
+        // The key file is there before the cluster is, so that a restart
+        // between the two finds it and keeps it.
+        let fresh = self
+            .metrics()
+            .membership_config
+            .membership()
+            .nodes()
+            .next()
+            .is_none();
+        if fresh {
+            self.create_cluster_key_file().await?;
+        }
         let nodes = BTreeMap::from([(id, Node::new(&self.inner.peer_addr))]);
         match self.inner.raft.initialize(nodes).await {
             Ok(()) => {}
@@ -410,6 +434,7 @@ impl FaberService {
                 Err(e) => return Err(e),
             }
         }
+        self.create_and_record_cluster_key().await?;
         Ok(self.status().await)
     }
 
@@ -1258,23 +1283,30 @@ impl FaberService {
     /// the invite token) to register `invite_id` to this machine,
     /// `instance_id`. `endpoint` must be the invite's. Safe to repeat: the
     /// same machine registering again is accepted, any other is refused with
-    /// `invite_used`.
+    /// `invite_used`. The answer may carry the cluster key
+    /// ([`Self::accept_cluster_key`]).
     pub async fn register_invited(
         &self,
         peer: &str,
         invite_id: &str,
         endpoint: SocketAddr,
         instance_id: &str,
-    ) -> ServiceResult<()> {
+    ) -> ServiceResult<PeerRegisterResponse> {
         let body = PeerRegisterRequest {
             invite_id: invite_id.to_string(),
             node_id: self.inner.node_id,
             endpoint: endpoint.to_string(),
             instance_id: instance_id.to_string(),
         };
-        self.post_peer(peer, "/raft/cluster/register", &body, false)
-            .await
-            .map(drop)
+        let bytes = self
+            .post_peer(peer, "/raft/cluster/register", &body, false)
+            .await?;
+        // A leader that does not send a body has no key to give.
+        if bytes.is_empty() {
+            return Ok(PeerRegisterResponse::default());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ServiceError::Internal(format!("bad register response from {peer}: {e}")))
     }
 
     /// Second step: asks `peer` to add this node, which has registered
@@ -2462,6 +2494,186 @@ mod tests {
                 .as_deref(),
             Some(MACHINE)
         );
+        node.shutdown().await;
+    }
+
+    fn source(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 40_000)
+    }
+
+    fn with_test_key(svc: FaberService) -> FaberService {
+        svc.with_cluster_keys(Arc::new(crate::secrets::StaticClusterKey(
+            crate::testing::test_cluster_key(),
+        )))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cluster_key_goes_only_to_the_machine_the_invite_is_bound_to() {
+        let node = TestNode::start_initialized().await;
+        let invite_id = invited(&node).await;
+        let invitee = node.service.read_mesh().unwrap().unwrap().invites[&invite_id].mesh_ip;
+        let strict = with_test_key(strict_mesh_service_at(
+            &node,
+            "10.99.0.1",
+            &[],
+            &JoinPending::new(false),
+        ));
+        let key = crate::testing::test_cluster_key();
+        let expected = PeerRegisterResponse {
+            cluster_key: Some(crate::dto::WireKey::new(key.to_base64())),
+            key_id: Some(faber_crypto::key_id(&key)),
+        };
+        let register = |forwarded, from: &str, machine| {
+            strict.peer_register_for(register_req(&invite_id, machine), forwarded, source(from))
+        };
+
+        // Another address, with the right instance id: registered, no key.
+        let got = register(false, "10.99.0.9", MACHINE).await.unwrap();
+        assert_eq!(got, PeerRegisterResponse::default());
+        // A forwarded request shows the forwarder's address: no key.
+        let got = register(true, &invitee.to_string(), MACHINE).await.unwrap();
+        assert_eq!(got, PeerRegisterResponse::default());
+        // Another machine holding a copy of the token: refused.
+        let err = register(false, &invitee.to_string(), OTHER_MACHINE)
+            .await
+            .unwrap_err();
+        assert_eq!(err.mesh_code(), Some(error_code::INVITE_USED));
+        // The invite's own address, and again after a lost answer.
+        for _ in 0..2 {
+            let got = register(false, &invitee.to_string(), MACHINE)
+                .await
+                .unwrap();
+            assert_eq!(got, expected);
+        }
+        let mapped = format!("::ffff:{invitee}");
+        assert_eq!(register(false, &mapped, MACHINE).await.unwrap(), expected);
+
+        // A loopback listener cannot tell nodes apart and releases nothing.
+        let loopback = with_test_key(node.service.clone());
+        let got = loopback
+            .peer_register_for(
+                register_req(&invite_id, MACHINE),
+                false,
+                source(&invitee.to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, PeerRegisterResponse::default());
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_without_a_key_file_releases_no_key() {
+        let node = TestNode::start_initialized().await;
+        let invite_id = invited(&node).await;
+        let invitee = node.service.read_mesh().unwrap().unwrap().invites[&invite_id].mesh_ip;
+        let strict = strict_mesh_service_at(&node, "10.99.0.1", &[], &JoinPending::new(false));
+        let got = strict
+            .peer_register_for(
+                register_req(&invite_id, MACHINE),
+                false,
+                source(&invitee.to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, PeerRegisterResponse::default());
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_join_token_never_holds_the_cluster_key() {
+        let node = TestNode::start_initialized().await;
+        seed_mesh(&node).await;
+        let invite = node
+            .service
+            .invite(CreateInviteRequest {
+                name: "node-2".into(),
+                endpoint: "198.51.100.2".into(),
+                ttl_secs: None,
+            })
+            .await
+            .unwrap();
+        let key = crate::testing::test_cluster_key();
+        let text = key.to_base64();
+        let token = InviteToken::decode(&invite.token).unwrap();
+        let decoded = serde_json::to_vec(&token).unwrap();
+        let has =
+            |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+        for needle in [text.as_bytes(), &[7u8; 32][..]] {
+            assert!(!has(invite.token.as_bytes(), needle));
+            assert!(!has(&decoded, needle));
+        }
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_joiner_stores_the_key_and_refuses_one_that_is_not_the_clusters() {
+        let node = TestNode::start_initialized().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        let joiner = node
+            .service
+            .clone()
+            .with_cluster_keys(Arc::new(crate::secrets::FileClusterKey::new(&path)));
+        let key = crate::testing::test_cluster_key();
+        let id = faber_crypto::key_id(&key);
+        let sent = |key: &faber_crypto::ClusterKey, key_id: Option<&str>| PeerRegisterResponse {
+            cluster_key: Some(crate::dto::WireKey::new(key.to_base64())),
+            key_id: key_id.map(String::from),
+        };
+
+        // A key of another id than the leader names is not stored.
+        let other = faber_crypto::ClusterKey::from_bytes([1; faber_crypto::KEY_LEN]);
+        let err = joiner
+            .accept_cluster_key(&sent(&other, Some(&id)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::secrets::KeyDeliveryError::Mismatch { .. }),
+            "{err:?}"
+        );
+        // Nor one that disagrees with the id in this node's own raft.
+        let err = joiner
+            .accept_cluster_key(&sent(&other, None))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::secrets::KeyDeliveryError::Mismatch { .. }
+        ));
+        assert!(!path.exists());
+        let err = joiner
+            .accept_cluster_key(&PeerRegisterResponse {
+                cluster_key: Some(crate::dto::WireKey::new("not a key".to_string().into())),
+                key_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::secrets::KeyDeliveryError::Malformed));
+
+        // The right one is written, private, before anything else happens.
+        joiner
+            .accept_cluster_key(&sent(&key, Some(&id)))
+            .await
+            .unwrap();
+        use crate::secrets::ClusterKeyProvider as _;
+        assert_eq!(
+            crate::secrets::FileClusterKey::new(&path)
+                .cluster_key()
+                .unwrap(),
+            key
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A cluster with no key to give is no error.
+        joiner
+            .accept_cluster_key(&PeerRegisterResponse::default())
+            .await
+            .unwrap();
         node.shutdown().await;
     }
 

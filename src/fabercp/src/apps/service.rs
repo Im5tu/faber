@@ -216,6 +216,15 @@ impl FaberService {
         check_name("project", project)?;
         check_name("environment", environment)?;
         check_name("workload", workload)?;
+        if reveal {
+            // The audit line names the place and never a value.
+            tracing::info!(
+                project,
+                environment,
+                workload,
+                "revealed the env of a workload"
+            );
+        }
         let record = self.read_environment(project, environment)?;
         let found = record.and_then(|mut record| {
             let stored = record.workloads.remove(workload)?;
@@ -536,11 +545,38 @@ impl FaberService {
     }
 
     /// The cluster key of this node. The file is read on a blocking thread.
-    async fn cluster_key(&self) -> ServiceResult<ClusterKey> {
+    ///
+    /// Once raft records the id of the cluster's key, a file that holds
+    /// another key is refused: `key_unavailable`, and one log line.
+    pub(crate) async fn cluster_key(&self) -> ServiceResult<ClusterKey> {
         let provider = self.cluster_keys().clone();
         let read = tokio::task::spawn_blocking(move || provider.cluster_key()).await;
-        read.map_err(|e| ServiceError::Internal(format!("reading the cluster key: {e}")))?
-            .map_err(|e| key_unavailable(e.to_string()))
+        let key = read
+            .map_err(|e| ServiceError::Internal(format!("reading the cluster key: {e}")))?
+            .map_err(|e| key_unavailable(e.to_string()))?;
+        if let Some(recorded) = self.recorded_key_id()? {
+            let local = key_id(&key);
+            if recorded != local {
+                if self.first_key_mismatch() {
+                    tracing::error!(
+                        local = %local,
+                        recorded = %recorded,
+                        "this node's cluster key file is not the cluster's key; deploys and \
+                         reveals fail until the right key is put in place"
+                    );
+                }
+                return Err(key_unavailable(
+                    "this node's cluster key is not the one the cluster records",
+                ));
+            }
+        }
+        Ok(key)
+    }
+
+    /// Checks the cluster key against the id in raft, so that a node whose
+    /// key is wrong says so once at start and not at the first deploy.
+    pub async fn check_cluster_key(&self) {
+        let _ = self.cluster_key().await;
     }
 
     /// The data key of an environment, opened with the cluster key. With
@@ -894,7 +930,7 @@ fn unsealed() -> ServiceError {
 
 /// The error for a cluster key that is missing or does not fit. The
 /// message never holds key material.
-fn key_unavailable(message: impl Into<String>) -> ServiceError {
+pub(crate) fn key_unavailable(message: impl Into<String>) -> ServiceError {
     ServiceError::Rejected {
         code: error_code::KEY_UNAVAILABLE.into(),
         message: message.into(),
@@ -2106,6 +2142,77 @@ mod tests {
                 .workloads
                 .is_empty()
         );
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_that_is_not_the_clusters_blocks_deploys_and_is_logged_once() {
+        use tracing::instrument::WithSubscriber;
+
+        let node = shop().await;
+        let other = faber_crypto::ClusterKey::from_bytes([1; faber_crypto::KEY_LEN]);
+        let wrong = node
+            .service
+            .clone()
+            .with_cluster_keys(std::sync::Arc::new(crate::secrets::StaticClusterKey(other)));
+        let logs = crate::testing::LogBuf::default();
+        let before = next_index(&node).await;
+        async {
+            // What start does, then two deploys.
+            wrong.check_cluster_key().await;
+            for _ in 0..2 {
+                let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+                let err = wrong.deploy("shop", "staging", web).await.unwrap_err();
+                assert!(
+                    matches!(&err, ServiceError::Rejected { code, .. } if code == error_code::KEY_UNAVAILABLE),
+                    "{err:?}"
+                );
+            }
+        }
+        .with_subscriber(logs.subscriber())
+        .await;
+        let text = logs.text();
+        assert_eq!(text.matches("not the cluster's key").count(), 1, "{text}");
+        assert!(!text.contains(MARKER));
+        // Nothing was written, and no data key was made.
+        assert_eq!(next_index(&node).await, before + 1);
+        assert_eq!(node.state().data_key("shop/staging").unwrap(), None);
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revealing_read_leaves_an_audit_line_without_values() {
+        use tracing::instrument::WithSubscriber;
+
+        let node = shop().await;
+        let web = deploy_req(&[("web", with_token("nginx", MARKER))], false);
+        node.service.deploy("shop", "staging", web).await.unwrap();
+
+        let logs = crate::testing::LogBuf::default();
+        async {
+            node.service
+                .workload("shop", "staging", "web", false)
+                .await
+                .unwrap();
+        }
+        .with_subscriber(logs.subscriber())
+        .await;
+        assert!(!logs.text().contains("revealed"), "{}", logs.text());
+
+        async {
+            node.service
+                .workload("shop", "staging", "web", true)
+                .await
+                .unwrap();
+        }
+        .with_subscriber(logs.subscriber())
+        .await;
+        let text = logs.text();
+        assert_eq!(text.matches("revealed").count(), 1, "{text}");
+        for part in ["shop", "staging", "web"] {
+            assert!(text.contains(part), "{part} in {text}");
+        }
+        assert!(!text.contains(MARKER));
         node.shutdown().await;
     }
 

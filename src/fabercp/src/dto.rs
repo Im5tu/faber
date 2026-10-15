@@ -7,7 +7,8 @@ use std::net::Ipv4Addr;
 
 use faber_api_types::workload::{DeployResponse, ProjectResponse, WorkloadSpec};
 use ipnet::Ipv4Net;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 use crate::mesh::TokenPeer;
 
@@ -41,6 +42,57 @@ pub struct PeerRegisterRequest {
     pub endpoint: String,
     /// 32 lowercase hex characters, made by the joining machine.
     pub instance_id: String,
+}
+
+/// A cluster key in transit: standard base64, wiped on drop. It prints as
+/// `[redacted]`.
+#[derive(Clone)]
+pub struct WireKey(Zeroizing<String>);
+
+impl WireKey {
+    pub fn new(base64: Zeroizing<String>) -> Self {
+        Self(base64)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq for WireKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl std::fmt::Debug for WireKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WireKey([redacted])")
+    }
+}
+
+impl Serialize for WireKey {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WireKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d).map(|s| Self(Zeroizing::new(s)))
+    }
+}
+
+/// 200 body of `POST /raft/cluster/register`. The key goes only to the
+/// machine the invite is bound to, over the mesh, and never into the join
+/// token. Both fields are absent when this node does not release a key.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PeerRegisterResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_key: Option<WireKey>,
+    /// The id of the cluster key recorded in raft, if one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 /// `POST /raft/cluster/invites` (internal, leader only; a follower forwards it
@@ -231,6 +283,27 @@ mod tests {
         let partial = serde_json::json!({"invite_id": "ab".repeat(16), "node_id": 2,
                                          "endpoint": "198.51.100.2:51820"});
         assert!(serde_json::from_value::<PeerRegisterRequest>(partial).is_err());
+    }
+
+    #[test]
+    fn a_wire_key_never_prints() {
+        let key = faber_crypto::ClusterKey::generate().unwrap();
+        let text = key.to_base64();
+        let resp = PeerRegisterResponse {
+            cluster_key: Some(WireKey::new(key.to_base64())),
+            key_id: Some("ab".into()),
+        };
+        assert!(!format!("{resp:?}").contains(text.as_str()));
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(text.as_str()));
+        assert_eq!(
+            serde_json::from_str::<PeerRegisterResponse>(&json).unwrap(),
+            resp
+        );
+        assert_eq!(
+            serde_json::to_string(&PeerRegisterResponse::default()).unwrap(),
+            "{}"
+        );
     }
 
     #[test]

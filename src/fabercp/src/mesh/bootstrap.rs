@@ -28,15 +28,18 @@ pub enum BootstrapError {
     /// The mesh removed this node after it had joined: its lease ran out,
     /// or another machine took over its name.
     NodeRemoved,
+    /// The cluster key the cluster sent is not the one raft records.
+    KeyMismatch,
 }
 
 impl BootstrapError {
     /// Every code, for readers that match the marker against the fixed set.
-    pub const ALL: [BootstrapError; 4] = [
+    pub const ALL: [BootstrapError; 5] = [
         BootstrapError::TokenExpired,
         BootstrapError::TokenInvalid,
         BootstrapError::InviteRejected,
         BootstrapError::NodeRemoved,
+        BootstrapError::KeyMismatch,
     ];
 
     pub fn code(self) -> &'static str {
@@ -45,6 +48,7 @@ impl BootstrapError {
             BootstrapError::TokenInvalid => "token_invalid",
             BootstrapError::InviteRejected => "invite_rejected",
             BootstrapError::NodeRemoved => "node_removed",
+            BootstrapError::KeyMismatch => "key_mismatch",
         }
     }
 }
@@ -98,11 +102,12 @@ mod tests {
             (BootstrapError::TokenExpired, "token_expired\n"),
             (BootstrapError::TokenInvalid, "token_invalid\n"),
             (BootstrapError::InviteRejected, "invite_rejected\n"),
+            (BootstrapError::KeyMismatch, "key_mismatch\n"),
         ] {
             write(dir.path(), error).unwrap();
             assert_eq!(fs::read_to_string(path(dir.path())).unwrap(), text);
         }
-        assert_eq!(BootstrapError::ALL.len(), 4);
+        assert_eq!(BootstrapError::ALL.len(), 5);
         // Only the marker is left in the directory.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }

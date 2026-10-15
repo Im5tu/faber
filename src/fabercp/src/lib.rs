@@ -74,6 +74,7 @@ use crate::raft::types::{Node, NodeId, Raft};
 use crate::raft::{rpc, store};
 use crate::reconcile::step::{StepList, StepRunner, StepValue};
 use crate::reconcile::{HostReconciler, NetworkStep, ReconcileTiming, RuntimeStep};
+use crate::secrets::KeyDeliveryError;
 use crate::service::{MeshLocal, now_secs};
 
 /// How long shutdown waits for in-flight HTTP requests and for storage to close.
@@ -165,6 +166,8 @@ impl NodeHandle {
     /// What made this node take itself out of the mesh, once it has; `None`
     /// while it is a member or still joining. One of:
     /// - `invite_rejected`: the mesh refused the invite during the join;
+    /// - `key_mismatch`: the cluster key the cluster sent is not the one
+    ///   raft records;
     /// - `join_refused`: the mesh had removed the node before it finished
     ///   joining;
     /// - `renewal_refused`: the leader answered a lease renewal with
@@ -497,6 +500,9 @@ pub async fn start_with(
         config.cluster_key_path(),
     )));
     service.set_lease_timing(config.lease_timing);
+    // A key that is not the cluster's is said once at start, not at the
+    // first deploy.
+    service.check_cluster_key().await;
     let cancel = CancellationToken::new();
 
     let mcp = mcp::service(config.allowed_mcp_hosts(peer_addr), cancel.child_token());
@@ -1042,6 +1048,7 @@ async fn mesh_membership(ctx: MeshMembership, mut identity: Identity, host: Opti
             JoinOutcome::Rejected(reason) => {
                 let because = match reason {
                     BootstrapError::NodeRemoved => "join_refused",
+                    BootstrapError::KeyMismatch => "key_mismatch",
                     _ => "invite_rejected",
                 };
                 leave_mesh(ctx, host, reason, because).await;
@@ -1563,7 +1570,32 @@ async fn finish_join(ctx: &MeshMembership, identity: &mut Identity) -> JoinOutco
                     ) => r,
                 };
                 match attempt {
-                    Ok(()) => {
+                    Ok(delivered) => {
+                        // The key is on disk before this node can become a
+                        // voter, and before the registration is recorded.
+                        match service.accept_cluster_key(&delivered).await {
+                            Ok(()) => {}
+                            Err(e @ KeyDeliveryError::Mismatch { .. }) => {
+                                tracing::error!(
+                                    via = %addr,
+                                    error = %e,
+                                    "the cluster key this node was sent is not the cluster's, so \
+                                     it will not join. Its identity is being discarded and its \
+                                     WireGuard interface removed. Create a new invite on a mesh \
+                                     node (`faber mesh invite`) once the cluster key is sound, \
+                                     and run `install.sh --join <token>` here."
+                                );
+                                return JoinOutcome::Rejected(BootstrapError::KeyMismatch);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    via = %addr,
+                                    error = %e,
+                                    "could not store the cluster key; retrying"
+                                );
+                                continue;
+                            }
+                        }
                         if let Err(e) = mark_registered(&ctx.state_dir, identity).await {
                             tracing::error!(
                                 error = %e,

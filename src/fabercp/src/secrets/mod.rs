@@ -11,13 +11,19 @@
 //! key file on demand ([`FileClusterKey`]); tests inject a key
 //! ([`StaticClusterKey`]).
 
+pub mod delivery;
+
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use faber_api_types::workload::WorkloadSpec;
 use faber_crypto::{ClusterKey, CryptoError, DataKey, env_digest, open, seal};
+use zeroize::Zeroizing;
 
 use crate::apps::{SealedEnv, StoredWorkload, WorkloadRecord};
+use crate::mesh::files::write_atomic;
+pub use delivery::KeyDeliveryError;
 
 /// What a masked read shows in place of an env value.
 pub const MASK: &str = "***";
@@ -31,6 +37,15 @@ pub enum ClusterKeyError {
     Unreadable(PathBuf),
     #[error("the cluster key file {} is not 32 bytes of base64", .0.display())]
     Malformed(PathBuf),
+    #[error(
+        "the cluster key file {} must be a regular file owned by the faber user with mode 0600",
+        .0.display()
+    )]
+    Insecure(PathBuf),
+    #[error("the cluster key file {} cannot be written", .0.display())]
+    Unwritable(PathBuf),
+    #[error("the system has no randomness for a cluster key")]
+    NoRandomness,
     #[error("this node has no cluster key")]
     NotConfigured,
 }
@@ -39,6 +54,17 @@ pub enum ClusterKeyError {
 /// arrives or changes on disk is picked up without a restart.
 pub trait ClusterKeyProvider: Send + Sync + std::fmt::Debug {
     fn cluster_key(&self) -> Result<ClusterKey, ClusterKeyError>;
+
+    /// The key, made and stored first if the node has none. Never replaces
+    /// a key that exists, even a malformed one.
+    fn create_if_missing(&self) -> Result<ClusterKey, ClusterKeyError> {
+        self.cluster_key()
+    }
+
+    /// Stores the key the founder delivered, replacing the one on disk.
+    fn store(&self, _key: &ClusterKey) -> Result<(), ClusterKeyError> {
+        Err(ClusterKeyError::NotConfigured)
+    }
 }
 
 /// Reads the key from a file of base64, e.g. `/var/lib/faber/cluster.key`.
@@ -53,13 +79,77 @@ impl FileClusterKey {
     }
 }
 
+impl FileClusterKey {
+    /// Reads the file into a buffer that is wiped on drop. On unix the file
+    /// must be a regular file of the process's user with no group or other
+    /// permission bits; the checks run on the open file, not on its path.
+    fn read(&self) -> Result<Zeroizing<Vec<u8>>, ClusterKeyError> {
+        let path = &self.path;
+        let missing_or_unreadable = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::NotFound => ClusterKeyError::Missing(path.clone()),
+            _ => ClusterKeyError::Unreadable(path.clone()),
+        };
+        let mut file = std::fs::File::open(path).map_err(missing_or_unreadable)?;
+        let meta = file.metadata().map_err(missing_or_unreadable)?;
+        if !meta.is_file() || !permissions_are_private(&meta) {
+            return Err(ClusterKeyError::Insecure(path.clone()));
+        }
+        // A key is 44 characters; do not read an arbitrary file whole.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(64));
+        file.by_ref()
+            .take(4096)
+            .read_to_end(&mut bytes)
+            .map_err(missing_or_unreadable)?;
+        Ok(bytes)
+    }
+}
+
+/// Whether only the owner, who is the process's user, may touch the file.
+#[cfg(unix)]
+fn permissions_are_private(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.mode() & 0o077 == 0 && meta.uid() == nix::unistd::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn permissions_are_private(_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
 impl ClusterKeyProvider for FileClusterKey {
     fn cluster_key(&self) -> Result<ClusterKey, ClusterKeyError> {
-        let text = std::fs::read_to_string(&self.path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ClusterKeyError::Missing(self.path.clone()),
-            _ => ClusterKeyError::Unreadable(self.path.clone()),
-        })?;
-        ClusterKey::from_base64(&text).map_err(|_| ClusterKeyError::Malformed(self.path.clone()))
+        let bytes = self.read()?;
+        let malformed = || ClusterKeyError::Malformed(self.path.clone());
+        let text = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+        ClusterKey::from_base64(text).map_err(|_| malformed())
+    }
+
+    fn create_if_missing(&self) -> Result<ClusterKey, ClusterKeyError> {
+        match self.cluster_key() {
+            Err(ClusterKeyError::Missing(_)) => {
+                let key = ClusterKey::generate().map_err(|_| ClusterKeyError::NoRandomness)?;
+                self.store(&key)?;
+                Ok(key)
+            }
+            other => other,
+        }
+    }
+
+    fn store(&self, key: &ClusterKey) -> Result<(), ClusterKeyError> {
+        let unwritable = || ClusterKeyError::Unwritable(self.path.clone());
+        let dir = match self.path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => std::path::Path::new("."),
+        };
+        let Some(name) = self.path.file_name().and_then(|n| n.to_str()) else {
+            return Err(unwritable());
+        };
+        let text = Zeroizing::new(format!(
+            "{}
+",
+            &*key.to_base64()
+        ));
+        write_atomic(dir, name, text.as_bytes(), Some(0o600)).map_err(|_| unwritable())
     }
 }
 
@@ -105,7 +195,11 @@ pub fn seal_workload(
     let mut env = BTreeMap::new();
     let mut cleared = spec.clone();
     for container in &mut cleared.containers {
-        let digest = env_digest(key, &container.env);
+        let digest = env_digest(
+            key,
+            [project, environment, name, &container.name],
+            &container.env,
+        );
         let kept = previous
             .and_then(|p| p.env.get(&container.name))
             .filter(|stored| stored.digest == digest);
@@ -264,10 +358,12 @@ mod tests {
         ));
 
         let key = ClusterKey::generate().unwrap();
-        std::fs::write(&path, format!("{}\n", key.to_base64())).unwrap();
+        provider.store(&key).unwrap();
         assert_eq!(provider.cluster_key().unwrap(), key);
 
+        provider.store(&key).unwrap();
         std::fs::write(&path, "not a key").unwrap();
+        make_private(&path);
         assert!(matches!(
             provider.cluster_key(),
             Err(ClusterKeyError::Malformed(_))
@@ -276,5 +372,96 @@ mod tests {
             NoClusterKey.cluster_key(),
             Err(ClusterKeyError::NotConfigured)
         ));
+    }
+
+    fn make_private(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    #[test]
+    fn the_key_is_made_once_and_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        let provider = FileClusterKey::new(&path);
+        let first = provider.create_if_missing().unwrap();
+        assert_eq!(provider.cluster_key().unwrap(), first);
+        // A restart finds the key and keeps it.
+        assert_eq!(provider.create_if_missing().unwrap(), first);
+        assert_eq!(FileClusterKey::new(&path).cluster_key().unwrap(), first);
+
+        // Even a damaged file is left for the operator.
+        std::fs::write(&path, "garbage").unwrap();
+        make_private(&path);
+        assert!(matches!(
+            provider.create_if_missing(),
+            Err(ClusterKeyError::Malformed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "garbage");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        let provider = FileClusterKey::new(&path);
+        provider.create_if_missing().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        let provider = FileClusterKey::new(&path);
+        provider.create_if_missing().unwrap();
+        for mode in [0o644, 0o640, 0o604, 0o660] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(provider.cluster_key(), Err(ClusterKeyError::Insecure(_))),
+                "{mode:o}"
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(provider.cluster_key().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_that_is_not_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            FileClusterKey::new(&path).cluster_key(),
+            Err(ClusterKeyError::Insecure(_))
+        ));
+    }
+
+    #[test]
+    fn the_digest_is_bound_to_the_workload() {
+        let key = DataKey::generate().unwrap();
+        let plain = spec(&[("A", "1")]);
+        let digest = |project, env, name| {
+            seal_workload(&key, project, env, name, &plain, None)
+                .unwrap()
+                .env["app"]
+                .digest
+        };
+        let web = digest("shop", "staging", "web");
+        assert_eq!(web, digest("shop", "staging", "web"));
+        assert_ne!(web, digest("shop", "staging", "api"));
+        assert_ne!(web, digest("shop", "production", "web"));
+        assert_ne!(web, digest("blog", "staging", "web"));
     }
 }

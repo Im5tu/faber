@@ -3,7 +3,7 @@
 //!
 //! | route | does | leader only | source must be |
 //! |---|---|---|---|
-//! | `POST /raft/cluster/register` | turns an invite into a node | forwards once | anyone the firewall admits |
+//! | `POST /raft/cluster/register` | turns an invite into a node; answers with the cluster key | forwards once | anyone the firewall admits |
 //! | `POST /raft/cluster/join` | adds a node as a voter | forwards once | anyone the firewall admits |
 //! | `POST /raft/cluster/invites` | reserves an invite | forwards once | a registered node |
 //! | `POST /raft/cluster/endpoint` | replaces a node's WireGuard endpoint | forwards once | the node itself, or a registered node forwarding |
@@ -39,8 +39,8 @@ use faber_api_types::{FORWARDED_HEADER, LeaseResponse, StatusIntervalResponse};
 
 use crate::dto::{
     PeerEndpointRequest, PeerInviteRequest, PeerInviteResponse, PeerJoinRequest, PeerLeaseRequest,
-    PeerRegisterRequest, PeerRenewRequest, PeerStatusIntervalRequest, PeerWorkloadRequest,
-    PeerWorkloadResponse, ReplicationStatus,
+    PeerRegisterRequest, PeerRegisterResponse, PeerRenewRequest, PeerStatusIntervalRequest,
+    PeerWorkloadRequest, PeerWorkloadResponse, ReplicationStatus,
 };
 use crate::error::ApiJson;
 use crate::raft::store::status::ReportNode;
@@ -72,17 +72,21 @@ fn forwarded(headers: &HeaderMap) -> bool {
     headers.contains_key(FORWARDED_HEADER)
 }
 
-/// 204 once the invite is registered to the machine that asked. Leader only;
-/// forwards once. 503 `not_ready` while a node that holds the invite's name
+/// 200 once the invite is registered to the machine that asked. Leader only;
+/// forwards once. The body carries the cluster key when the request comes
+/// from the mesh IP of the invite, and is empty otherwise. 503 `not_ready` while a node that holds the invite's name
 /// is still leaving the raft membership. An invite the mesh does not know is
 /// refused without a raft write.
 async fn register(
     State(svc): State<FaberService>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ApiJson(req): ApiJson<PeerRegisterRequest>,
-) -> ServiceResult<StatusCode> {
-    svc.peer_register(req, forwarded(&headers)).await?;
-    Ok(StatusCode::NO_CONTENT)
+) -> ServiceResult<Json<PeerRegisterResponse>> {
+    let resp = svc
+        .peer_register_for(req, forwarded(&headers), source)
+        .await?;
+    Ok(Json(resp))
 }
 
 /// 204 once `node_id` is a voter. Forwards once to the leader if needed.
