@@ -40,7 +40,9 @@
 #      `faber deploy spec` (2 replicas, block volume, ramdisk, probe): both
 #      replicas available, its name resolves to the virtual IP and answers
 #      PING from containers on both nodes, a killed redis comes back with
-#      its data, and a redeploy with a changed env keeps the virtual IP.
+#      its data, and a redeploy with a changed env keeps the virtual IP and
+#      rolls one replica at a time: the name keeps answering PING and the
+#      replicas are never both down on the old revision.
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -1839,6 +1841,59 @@ m_cx() {
 # m_redis_cid NODE: the id of the redis container on NODE.
 m_redis_cid() { dx "$1" "crictl ps -q --name '^redis-' | head -n 1"; }
 
+# Rolling deploy check. redis has a block volume, so a roll replaces one
+# replica index at a time and the other replica keeps serving. While the
+# redeploy runs, a loop in the client container resolves and PINGs M_NAME twice
+# a second, and the test samples `faber app show` once a second.
+#   M_ROLL_GAP_MAX: the longest the service may go without an answer, in
+#   seconds between two PONGs. The tolerance covers the 2 s ping timeout, the
+#   probe interval (2 s) and the virtual IP update reaching the node. A real
+#   outage of both replicas lasts a container restart, well beyond it.
+M_ROLL_GAP_MAX=6
+M_ROLL_PING_LOG="/tmp/e2e-roll-ping.log"
+
+# m_roll_ping_start NODE CID: start the ping loop in the background on NODE.
+# It runs until the stop file appears in the container or 900 iterations pass.
+m_roll_ping_start() {
+  local n="$1" cid="$2"
+  dx "$n" "rm -f $M_ROLL_PING_LOG; crictl exec $cid rm -f /tmp/roll-stop" >/dev/null
+  docker exec -d "$n" bash -c "crictl exec $cid sh -c 'i=0; while [ ! -e /tmp/roll-stop ] && [ \$i -lt 900 ]; do echo \"\$(date +%s) \$(timeout 2 redis-cli -h $M_NAME ping 2>&1 | head -n 1)\"; i=\$((i+1)); sleep 0.5; done' >$M_ROLL_PING_LOG 2>&1"
+}
+
+# m_roll_ping_stop NODE CID: stop the loop.
+m_roll_ping_stop() {
+  dx "$1" "crictl exec $2 touch /tmp/roll-stop" >/dev/null
+  sleep 2
+}
+
+# m_roll_gap FILE: the longest gap in seconds between two PONG lines of FILE
+# ("epoch answer"), and the number of PONGs: "GAP COUNT".
+m_roll_gap() {
+  awk '$2 == "PONG" { n++; if (last && $1 - last > max) max = $1 - last; last = $1 } END { print max + 0, n + 0 }' "$1"
+}
+
+# m_roll_stopped_samples FILE: the number of samples in FILE ("epoch index
+# revision state", one row per replica) in which no replica was available at
+# all. With the old replicas stopped together that is what a roll that took
+# both down at once looks like.
+m_roll_stopped_samples() {
+  awk '
+    function flush() { if (cur != "" && up == 0) bad++; up = 0 }
+    $1 != cur { flush(); cur = $1 }
+    $4 == "available" { up++ }
+    END { flush(); print bad + 0 }' "$1"
+}
+
+# m_roll_old_down_samples FILE REV: the number of samples in which every
+# replica ran a revision other than REV (the new one) and none was available.
+m_roll_old_down_samples() {
+  awk -v r="$2" '
+    function flush() { if (cur != "" && n > 0 && old == n && up == 0) bad++; n = 0; old = 0; up = 0 }
+    $1 != cur { flush(); cur = $1 }
+    { n++; if ($3 != r) old++; if ($4 == "available") up++ }
+    END { flush(); print bad + 0 }' "$1"
+}
+
 phase_m() {
   local out rc rev1 rev2 vip1 vip2 cid_a cid_b ca cb ip_a ip_b pid pid2 pfx_a n seen who
   section "M: redis from Docker Hub behind a virtual IP, on $NODE_A and $NODE_B"
@@ -1942,6 +1997,9 @@ phase_m() {
 
   # A redeploy with a changed env var.
   vip1="$(m_vip "$NODE_A")"
+  rm -f "$LOG_DIR/m-roll-samples.log"
+  m_roll_ping_start "$NODE_A" "$ca"
+  sleep 2
   m_deploy two
   out="$M_OUT"
   rc="$M_RC"
@@ -1949,11 +2007,35 @@ phase_m() {
   assert_has "M the redeploy updated redis" "$out" '^updated: +redis$'
   rev2="$(m_revision "$NODE_A")"
   assert_ne "M the redeploy made a new revision (was $rev1)" "$rev2" "$rev1"
-  if m_wait_available 300 "$NODE_A" "$rev2"; then
+  # Sample the replicas once a second until both run the new revision.
+  local deadline=$((SECONDS + 300)) ts rolled=0
+  while ((SECONDS < deadline)); do
+    ts="$(date +%s)"
+    out="$(m_replicas "$NODE_A")"
+    [[ -n "$out" ]] && awk -v t="$ts" '{ print t, $1, $3, $4 }' <<<"$out" >>"$LOG_DIR/m-roll-samples.log"
+    if [[ "$(m_available "$NODE_A" "$rev2")" == 2 ]]; then rolled=1; break; fi
+    sleep 1
+  done
+  sleep 3
+  m_roll_ping_stop "$NODE_A" "$ca"
+  docker cp "$NODE_A:$M_ROLL_PING_LOG" "$LOG_DIR/m-roll-ping.log" >/dev/null 2>&1
+  if ((rolled)); then
     pass "M both replicas become available on the new revision $rev2"
   else
     fail "M both replicas become available on the new revision $rev2 (300 s)" "$(m_show "$NODE_A")"$'\n'"$(dx "$NODE_A" 'journalctl -u fabercp --no-pager -o cat | grep -v INFO | tail -n 3 | cut -c1-600')"
   fi
+  touch "$LOG_DIR/m-roll-samples.log" "$LOG_DIR/m-roll-ping.log"
+  read -r seen who <<<"$(m_roll_gap "$LOG_DIR/m-roll-ping.log")"
+  evidence "ping gap $seen s, $who answers; $(wc -l <"$LOG_DIR/m-roll-samples.log") replica rows sampled"
+  assert_ne "M rolling: the service answered PING while it rolled ($who PONGs)" "$who" "0"
+  if ((seen <= M_ROLL_GAP_MAX)); then
+    pass "M rolling: never more than $M_ROLL_GAP_MAX s without an answer from $M_NAME (longest $seen s)"
+  else
+    fail "M rolling: never more than $M_ROLL_GAP_MAX s without an answer from $M_NAME (longest $seen s)" "$(tail -n 80 "$LOG_DIR/m-roll-ping.log")"
+  fi
+  assert_eq "M rolling: no sample had both replicas down at once (none available)" "$(m_roll_stopped_samples "$LOG_DIR/m-roll-samples.log")" "0"
+  assert_eq "M rolling: the two replicas were never both on the old revision and down" "$(m_roll_old_down_samples "$LOG_DIR/m-roll-samples.log" "$rev2")" "0"
+  assert_ne "M rolling: the samples saw replicas on the old revision" "$(grep -c " $rev1 " "$LOG_DIR/m-roll-samples.log")" "0"
   assert_has "M the new revision has GREETING=two" "$(m_show "$NODE_A")" 'GREETING=two'
   vip2="$(m_vip "$NODE_A")"
   assert_eq "M the virtual IP did not change on $NODE_A" "$vip2" "$vip1"
