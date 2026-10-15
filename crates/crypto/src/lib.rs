@@ -22,7 +22,7 @@ use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Bytes in a key.
 pub const KEY_LEN: usize = 32;
@@ -32,7 +32,7 @@ const NONCE_LEN: usize = 24;
 const WRAP_LABEL: &str = "faber/wrap/v1";
 const SEAL_LABEL: &str = "faber/seal/v1";
 const KEY_ID_LABEL: &[u8] = b"faber/key-id/v1";
-const DIGEST_LABEL: &[u8] = b"faber/env-digest/v1";
+const DIGEST_LABEL: &[u8] = b"faber/env-digest/v2";
 /// Bytes of the HMAC kept in a key id.
 const KEY_ID_BYTES: usize = 8;
 
@@ -78,9 +78,10 @@ macro_rules! key_type {
                 bytes.map(Self).map_err(|_| CryptoError::Malformed)
             }
 
-            /// The standard base64 of the key. The result is a secret.
-            pub fn to_base64(&self) -> String {
-                STANDARD.encode(self.0)
+            /// The standard base64 of the key. The result is a secret and
+            /// is wiped when dropped.
+            pub fn to_base64(&self) -> Zeroizing<String> {
+                Zeroizing::new(STANDARD.encode(self.0))
             }
         }
 
@@ -280,11 +281,20 @@ pub fn key_id(cluster_key: &ClusterKey) -> String {
 }
 
 /// An HMAC-SHA256 under `data_key` of a canonical, length-prefixed encoding
-/// of `env`. Equal maps give equal digests whatever order they were built
-/// in; a changed name or value gives another.
-pub fn env_digest(data_key: &DataKey, env: &BTreeMap<String, String>) -> [u8; 32] {
+/// of `location` (project, environment, workload, container) and `env`.
+/// Equal maps at one location give equal digests whatever order they were
+/// built in; a changed name or value, or another location, gives another.
+pub fn env_digest(
+    data_key: &DataKey,
+    location: [&str; 4],
+    env: &BTreeMap<String, String>,
+) -> [u8; 32] {
     let mut mac = hmac(&data_key.0);
     mac.update(DIGEST_LABEL);
+    for part in location {
+        mac.update(&(part.len() as u64).to_be_bytes());
+        mac.update(part.as_bytes());
+    }
     mac.update(&(env.len() as u64).to_be_bytes());
     for (name, value) in env {
         mac.update(&(name.len() as u64).to_be_bytes());
@@ -392,6 +402,8 @@ mod tests {
         assert_eq!(key_id(&a).len(), KEY_ID_BYTES * 2);
     }
 
+    const AT: [&str; 4] = ["shop", "staging", "web", "app"];
+
     #[test]
     fn the_digest_ignores_order_and_follows_content() {
         let dk = DataKey::generate().unwrap();
@@ -403,20 +415,39 @@ mod tests {
         };
         let one = build(&[("A", "1"), ("B", "2")]);
         let two = build(&[("B", "2"), ("A", "1")]);
-        assert_eq!(env_digest(&dk, &one), env_digest(&dk, &two));
+        assert_eq!(env_digest(&dk, AT, &one), env_digest(&dk, AT, &two));
         assert_ne!(
-            env_digest(&dk, &one),
-            env_digest(&dk, &build(&[("A", "2"), ("B", "2")]))
+            env_digest(&dk, AT, &one),
+            env_digest(&dk, AT, &build(&[("A", "2"), ("B", "2")]))
         );
         // Moving a byte between name and value changes it.
         assert_ne!(
-            env_digest(&dk, &build(&[("AB", "")])),
-            env_digest(&dk, &build(&[("A", "B")]))
+            env_digest(&dk, AT, &build(&[("AB", "")])),
+            env_digest(&dk, AT, &build(&[("A", "B")]))
         );
         assert_ne!(
-            env_digest(&dk, &one),
-            env_digest(&DataKey::generate().unwrap(), &one)
+            env_digest(&dk, AT, &one),
+            env_digest(&DataKey::generate().unwrap(), AT, &one)
         );
+    }
+
+    #[test]
+    fn the_digest_is_bound_to_its_location() {
+        let dk = DataKey::generate().unwrap();
+        let env = BTreeMap::from([("A".to_string(), "1".to_string())]);
+        let same = env_digest(&dk, AT, &env);
+        assert_eq!(same, env_digest(&dk, AT, &env.clone()));
+        for other in [
+            ["blog", "staging", "web", "app"],
+            ["shop", "production", "web", "app"],
+            ["shop", "staging", "api", "app"],
+            ["shop", "staging", "web", "db"],
+            // Parts are length-prefixed, so moving a byte between two
+            // parts changes the digest.
+            ["shops", "taging", "web", "app"],
+        ] {
+            assert_ne!(same, env_digest(&dk, other, &env), "{other:?}");
+        }
     }
 
     #[test]
@@ -440,6 +471,7 @@ mod tests {
     fn keys_encode_as_base64_and_never_print() {
         let ck = cluster();
         let text = ck.to_base64();
+        let text: &str = &text;
         assert_eq!(ClusterKey::from_base64(&format!("{text}\n")).unwrap(), ck);
         assert_eq!(
             ClusterKey::from_base64("AAAA").unwrap_err(),
