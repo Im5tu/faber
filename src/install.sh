@@ -14,6 +14,9 @@
 #                        faber:faber 0750)
 #   - faber CLI         (from next to this script -> $FABER_CLI_DIR/faber,
 #                        root:root 0755)
+#   - faber-node        (from next to this script ->
+#                        $FABER_NODE_INSTALL_DIR/faber-node, root:root 0755;
+#                        the root helper fabercp talks to over a socket)
 # It creates the 'faber' system user/group (nologin, no home created) and the
 # $FABER_HOME directory (faber:faber 0750, enforced every run), and writes
 # kernel module / sysctl prerequisites.
@@ -45,8 +48,22 @@
 #     traffic between nodes is forwarded between faber0 and the bridge
 #     faberbr0, so the script warns when `nft list ruleset` shows a forward
 #     chain with policy drop. It never changes the host firewall.
-#   - systemd units fabercp.service, faber-containerd-reload.path and
-#     faber-containerd-reload.service.
+#   - faber-node: $FABER_ETC/faber-node.env (root:root 0640; faber-node reads
+#     it by path and refuses it unless root alone can write it) with the pod
+#     uid range FABER_NODE_UID_MIN/MAX (1048576, 2147483648: the range
+#     placement allocates from), FABER_NODE_FABER_UID/GID of the faber user,
+#     FABER_NODE_BIN_DIR/SBIN_DIR and, for a custom $FABER_NODE_SOCKET,
+#     FABER_NODE_SOCKET (also written to fabercp.env). faber-node.service runs
+#     as root after containerd under ProtectSystem=strict; its socket is
+#     /run/faber/node.sock (root:faber 0660, made by faber-node). fabercp
+#     starts after it and gains no capability from it.
+#   - --service-cidr (new mesh only, default 10.201.0.0/16) goes to fabercp as
+#     FABER_SERVICE_CIDR and must not overlap the mesh or container range.
+#   - Preflight refuses a kernel older than 6.3, and (once the packages are
+#     in) containerd older than 2.0. It warns, without failing, when
+#     /etc/subuid, /etc/subgid or systemd-nspawn ids overlap the pod range.
+#   - systemd units fabercp.service, faber-node.service,
+#     faber-containerd-reload.path and faber-containerd-reload.service.
 #   - With systemd: daemon-reload when a unit changed, try-restart of
 #     containerd/fabercp when their config or binary changed, then
 #     enable --now. Without systemd these steps and the bootstrap are skipped.
@@ -178,7 +195,9 @@
 # FABER_BIN_SRC_DIR, FABER_HOME, FABER_CLI_DIR, FABER_ETC, FABER_STATE_DIR,
 # SYSTEMD_UNIT_DIR, SYSTEMD_RUN_DIR, CONTAINERD_ROOT_CONFIG,
 # CONTAINERD_CONF_DIR, CNI_CONF_DIR, MODULES_LOAD_FILE, SYSCTL_FILE,
-# FABER_HEALTH_TIMEOUT, FABER_JOIN_TIMEOUT, FABER_POLL_INTERVAL.
+# FABER_HEALTH_TIMEOUT, FABER_JOIN_TIMEOUT, FABER_POLL_INTERVAL,
+# FABER_NODE_INSTALL_DIR, FABER_NODE_SOCKET, FABER_NODE_BIN_DIR,
+# FABER_NODE_SBIN_DIR, FABER_KERNEL_RELEASE, SUBUID_FILE, SUBGID_FILE.
 
 set -euo pipefail
 
@@ -186,9 +205,9 @@ readonly DEFAULT_CNI_VERSION="v1.9.1"
 readonly CNI_RELEASES_URL="https://github.com/containernetworking/plugins/releases/download"
 readonly DOCKER_CE_EL_REPO="https://download.docker.com/linux/centos/docker-ce.repo"
 readonly KERNEL_MODULES=(overlay br_netfilter wireguard)
-readonly COMPONENTS=(containerd wireguard nftables cni fabercp faber)
+readonly COMPONENTS=(containerd wireguard nftables cni fabercp faber faber-node)
 readonly FABER_USER="faber"
-readonly FABER_BINARIES=(fabercp faber)
+readonly FABER_BINARIES=(fabercp faber faber-node)
 readonly WG_INTERFACE="faber0"
 readonly WG_PORT=51820
 readonly DEFAULT_MESH_CIDR="10.99.0.0/16"
@@ -206,6 +225,8 @@ readonly NODE_UID_MIN=1048576
 readonly NODE_UID_MAX=2147483648
 # faber-node's default socket (DEFAULT_SOCKET in src/faber-node/src/config.rs).
 readonly DEFAULT_NODE_SOCKET="/run/faber/node.sock"
+# Its default volume root is $NODE_STATE_DIR/volumes (DEFAULT_VOLUME_ROOT).
+readonly NODE_STATE_DIR="/var/lib/faber-node"
 readonly MIN_CONTAINERD_MAJOR=2
 readonly MIN_KERNEL_MAJOR=6
 readonly MIN_KERNEL_MINOR=3
@@ -231,7 +252,6 @@ FABER_NODE_SOCKET="${FABER_NODE_SOCKET:-$DEFAULT_NODE_SOCKET}"
 # Where faber-node finds mount, mountpoint, chmod, umount and mkfs.ext4.
 FABER_NODE_BIN_DIR="${FABER_NODE_BIN_DIR:-/usr/bin}"
 FABER_NODE_SBIN_DIR="${FABER_NODE_SBIN_DIR:-/usr/sbin}"
-FABER_NODE_STATE_DIR="${FABER_NODE_STATE_DIR:-/var/lib/faber-node}"
 FABER_KERNEL_RELEASE="${FABER_KERNEL_RELEASE:-}"
 SUBUID_FILE="${SUBUID_FILE:-/etc/subuid}"
 SUBGID_FILE="${SUBGID_FILE:-/etc/subgid}"
@@ -315,13 +335,17 @@ Installs:
   \$FABER_HOME                            faber:faber 0750
   fabercp                                \$FABER_HOME/fabercp, faber:faber 0750
   faber                                  \$FABER_CLI_DIR/faber, root:root 0755
+  faber-node                             \$FABER_NODE_INSTALL_DIR/faber-node,
+                                         root:root 0755
   \$FABER_ETC/fabercp.env                 root:faber 0640
+  \$FABER_ETC/faber-node.env              root:root 0640
   containerd root config                 imports \$CONTAINERD_CONF_DIR/*.toml
   \$CNI_CONF_DIR                          faber:faber 0755 (fabercp writes the
                                          CNI network config there)
-  systemd units                          ${FABERCP_UNIT}, ${RELOAD_PATH_UNIT},
-                                         ${RELOAD_SERVICE_UNIT}
-fabercp and faber must be next to this script (or in \$FABER_BIN_SRC_DIR).
+  systemd units                          ${FABERCP_UNIT}, ${FABER_NODE_UNIT},
+                                         ${RELOAD_PATH_UNIT}, ${RELOAD_SERVICE_UNIT}
+fabercp, faber and faber-node must be next to this script (or in
+\$FABER_BIN_SRC_DIR). Needs Linux ${MIN_KERNEL_MAJOR}.${MIN_KERNEL_MINOR} or newer and containerd ${MIN_CONTAINERD_MAJOR}.0 or newer.
 
 On a node that is not bootstrapped yet the script bootstraps the cluster:
 'faber cluster init' for a new mesh, or waits for the join to finish with
@@ -368,6 +392,8 @@ Environment:
   CNI_BIN_DIR             CNI plugin directory (default: /opt/cni/bin)
   FABER_ARCH              Machine architecture (default: uname -m)
   FABER_BIN_SRC_DIR       Directory holding fabercp and faber (default: script dir)
+  FABER_NODE_INSTALL_DIR  Directory for faber-node (default: /usr/local/sbin)
+  FABER_NODE_SOCKET       faber-node socket (default: ${DEFAULT_NODE_SOCKET})
   FABER_HOME              Faber home directory (default: /opt/faber)
   FABER_CLI_DIR           Directory for the faber CLI (default: /usr/local/bin)
   FABER_ETC               fabercp config directory (default: /etc/faber)
@@ -723,7 +749,7 @@ component_version() {
         echo missing
       fi
       ;;
-    fabercp | faber)
+    fabercp | faber | faber-node)
       binary_version "$(binary_state_of "$1")" "$(bin_src_dir)/$1"
       ;;
     *) die "unknown component: $1" ;;
@@ -1500,6 +1526,9 @@ render_env() {
   printf 'FABER_MANAGE_HOST=1\n'
   printf 'FABER_CONTAINERD_CONF_DIR=%s\n' "$CONTAINERD_CONF_DIR"
   printf 'FABER_CNI_CONF_DIR=%s\n' "$CNI_CONF_DIR"
+  if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
+    printf 'FABER_NODE_SOCKET=%s\n' "$FABER_NODE_SOCKET"
+  fi
   if [[ "$bootstrap" == 1 ]]; then
     case "$MODE" in
       new)
@@ -1527,8 +1556,8 @@ render_fabercp_unit() {
 $MANAGED_MARKER
 [Unit]
 Description=Faber control plane
-After=network-online.target containerd.service
-Wants=network-online.target
+After=network-online.target containerd.service $FABER_NODE_UNIT
+Wants=network-online.target $FABER_NODE_UNIT
 
 [Service]
 User=$FABER_USER
@@ -1548,6 +1577,89 @@ ReadWritePaths=$CNI_CONF_DIR
 ProtectHome=yes
 PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+node_env_file() { printf '%s\n' "$FABER_ETC/faber-node.env"; }
+
+# faber_account_id -u|-g: the faber user's uid or gid. Before the user exists
+# (--dry-run) it prints a placeholder.
+faber_account_id() {
+  local value
+  if value="$(id "$1" "$FABER_USER" 2>/dev/null)" && [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  elif [[ "$DRY_RUN" == 1 ]]; then
+    printf '<%s of %s>\n' "${1#-}id" "$FABER_USER"
+  else
+    die "cannot read the numeric ${1#-}id of $FABER_USER"
+  fi
+}
+
+# resolve_faber_ids: set FABER_ACCOUNT_UID and FABER_ACCOUNT_GID. Not done in
+# render_node_env, which runs in a command substitution where a die would not
+# stop the script.
+resolve_faber_ids() {
+  FABER_ACCOUNT_UID="$(faber_account_id -u)" || exit 1
+  FABER_ACCOUNT_GID="$(faber_account_id -g)" || exit 1
+}
+
+# render_node_env: faber-node's own env file (it reads the file named by
+# --env-file, not the process environment; call resolve_faber_ids first). The uid range must match the one
+# fabercp's placement hands out. Optional keys (SOCKET, VOLUME_ROOT,
+# CONTAINERD_SOCKET, RUNTIME_HANDLER) appear only when this run changes them
+# from faber-node's defaults; the volume root is faber-node's default.
+render_node_env() {
+  printf '%s\n' "$MANAGED_MARKER"
+  printf 'FABER_NODE_UID_MIN=%s\n' "$NODE_UID_MIN"
+  printf 'FABER_NODE_UID_MAX=%s\n' "$NODE_UID_MAX"
+  printf 'FABER_NODE_FABER_UID=%s\n' "$FABER_ACCOUNT_UID"
+  printf 'FABER_NODE_FABER_GID=%s\n' "$FABER_ACCOUNT_GID"
+  printf 'FABER_NODE_BIN_DIR=%s\n' "$FABER_NODE_BIN_DIR"
+  printf 'FABER_NODE_SBIN_DIR=%s\n' "$FABER_NODE_SBIN_DIR"
+  if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
+    printf 'FABER_NODE_SOCKET=%s\n' "$FABER_NODE_SOCKET"
+  fi
+}
+
+# render_faber_node_unit: faber-node runs as root (it mounts, chowns and talks
+# CRI for fabercp). It writes only its state directory (the volumes) and the
+# directory of its socket, so those are the only ReadWritePaths. The default
+# socket directory /run/faber comes from RuntimeDirectory= with mode 0755:
+# faber-node refuses a socket directory that is not root's alone, and the
+# faber user must still be able to reach the socket (root:faber 0660, set by
+# faber-node). A custom socket's directory is made by the installer.
+# MountFlags=shared lets the volume mounts reach containerd's mount namespace.
+render_faber_node_unit() {
+  local sock_dir
+  sock_dir="$(dirname "$FABER_NODE_SOCKET")"
+  cat <<EOF
+$MANAGED_MARKER
+[Unit]
+Description=Faber node helper (root)
+After=containerd.service
+Wants=containerd.service
+
+[Service]
+User=root
+ExecStart=$FABER_NODE_INSTALL_DIR/faber-node --env-file $(node_env_file)
+Restart=always
+RestartSec=2
+StateDirectory=faber-node
+StateDirectoryMode=0755
+EOF
+  if [[ "$FABER_NODE_SOCKET" == "$DEFAULT_NODE_SOCKET" ]]; then
+    printf 'RuntimeDirectory=faber\nRuntimeDirectoryMode=0755\n'
+  fi
+  cat <<EOF
+ProtectSystem=strict
+ReadWritePaths=$NODE_STATE_DIR
+ReadWritePaths=$sock_dir
+MountFlags=shared
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -1591,6 +1703,13 @@ configure_faber_etc() {
   run_cmd install -d -o root -g "$FABER_USER" -m 0750 "$FABER_ETC"
   write_file "$(env_file)" "$(render_env 1)" root "$FABER_USER" 0640
   ENV_CHANGED="$FILE_CHANGED"
+  # root-only: faber-node trusts this file with the pod uid range.
+  resolve_faber_ids
+  write_file "$(node_env_file)" "$(render_node_env)" root root 0640
+  NODE_ENV_CHANGED="$FILE_CHANGED"
+  if [[ "$FABER_NODE_SOCKET" != "$DEFAULT_NODE_SOCKET" ]]; then
+    run_cmd install -d -o root -g root -m 0755 "$(dirname "$FABER_NODE_SOCKET")"
+  fi
   TOKEN_CHANGED=0
   if [[ "$MODE" == join ]]; then
     if [[ "$JOIN_REQUESTED" == 1 ]]; then
@@ -1684,6 +1803,9 @@ install_units() {
   write_file "$SYSTEMD_UNIT_DIR/$FABERCP_UNIT" "$(render_fabercp_unit)" root root 0644
   FABERCP_UNIT_CHANGED="$FILE_CHANGED"
   ((FILE_CHANGED)) && UNITS_CHANGED=1
+  write_file "$SYSTEMD_UNIT_DIR/$FABER_NODE_UNIT" "$(render_faber_node_unit)" root root 0644
+  NODE_UNIT_CHANGED="$FILE_CHANGED"
+  ((FILE_CHANGED)) && UNITS_CHANGED=1
   write_file "$SYSTEMD_UNIT_DIR/$RELOAD_PATH_UNIT" "$(render_reload_path_unit)" root root 0644
   ((FILE_CHANGED)) && UNITS_CHANGED=1
   write_file "$SYSTEMD_UNIT_DIR/$RELOAD_SERVICE_UNIT" "$(render_reload_service_unit)" root root 0644
@@ -1736,17 +1858,20 @@ reset_node_identity() {
 # what changed (try-restart only touches running services, and runs before
 # enable --now so a service is never started twice), then enable and start.
 manage_services() {
-  local restart_containerd="$1" restart_fabercp="$2"
+  local restart_containerd="$1" restart_fabercp="$2" restart_node="${3:-0}"
   if [[ "$UNITS_CHANGED" == 1 ]]; then
     run_cmd systemctl daemon-reload
   fi
   if [[ "$restart_containerd" == 1 ]]; then
     run_cmd systemctl try-restart containerd
   fi
+  if [[ "$restart_node" == 1 ]]; then
+    run_cmd systemctl try-restart faber-node
+  fi
   if [[ "$restart_fabercp" == 1 ]]; then
     run_cmd systemctl try-restart fabercp
   fi
-  run_cmd systemctl enable --now containerd "$RELOAD_PATH_UNIT" fabercp
+  run_cmd systemctl enable --now containerd "$RELOAD_PATH_UNIT" faber-node fabercp
 }
 
 # poll_until TIMEOUT CMD...: run CMD until it succeeds or TIMEOUT seconds pass.
@@ -2019,6 +2144,7 @@ binary_spec() {
   case "$1" in
     fabercp) printf '%s %s %s %s\n' "$FABER_HOME/fabercp" "$FABER_USER" "$FABER_USER" 0750 ;;
     faber) printf '%s %s %s %s\n' "$FABER_CLI_DIR/faber" root root 0755 ;;
+    faber-node) printf '%s %s %s %s\n' "$FABER_NODE_INSTALL_DIR/faber-node" root root 0755 ;;
     *) die "unknown binary: $1" ;;
   esac
 }
@@ -2054,9 +2180,75 @@ check_faber_account() {
   fi
 }
 
+# kernel_release: what `uname -r` prints, unless FABER_KERNEL_RELEASE is set.
+kernel_release() { printf '%s\n' "${FABER_KERNEL_RELEASE:-$(uname -r)}"; }
+
+# check_kernel_version: refuse a kernel older than $MIN_KERNEL_MAJOR.$MIN_KERNEL_MINOR
+# (user-namespace pods need idmapped mounts on tmpfs). An unreadable release
+# string only warns.
+check_kernel_version() {
+  local release major minor
+  release="$(kernel_release)"
+  if [[ ! "$release" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    warn "cannot read the kernel version from '$release'; faber needs Linux $MIN_KERNEL_MAJOR.$MIN_KERNEL_MINOR or newer"
+    return 0
+  fi
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  if ((major < MIN_KERNEL_MAJOR || (major == MIN_KERNEL_MAJOR && minor < MIN_KERNEL_MINOR))); then
+    die "kernel $release is older than $MIN_KERNEL_MAJOR.$MIN_KERNEL_MINOR; faber needs Linux $MIN_KERNEL_MAJOR.$MIN_KERNEL_MINOR or newer for user-namespace pods. Upgrade the kernel and re-run"
+  fi
+}
+
+# check_containerd_version: refuse containerd older than $MIN_CONTAINERD_MAJOR.0
+# (pod user namespaces need containerd 2). Runs after the packages are
+# installed, because the install may bring containerd up to date; in --dry-run
+# nothing is installed, so it only warns. A missing or unreadable version is
+# left alone.
+check_containerd_version() {
+  local version major
+  version="$(component_version containerd)"
+  [[ "$version" =~ ^([0-9]+)\. ]] || return 0
+  major=$((10#${BASH_REMATCH[1]}))
+  if ((major >= MIN_CONTAINERD_MAJOR)); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == 1 ]]; then
+    warn "containerd $version is older than $MIN_CONTAINERD_MAJOR.0; unless the install upgrades it, a real run stops here"
+    return 0
+  fi
+  die "containerd $version is older than $MIN_CONTAINERD_MAJOR.0; faber needs containerd $MIN_CONTAINERD_MAJOR.0 or newer for user-namespace pods. Install a newer containerd (for example containerd.io from Docker's repository) and re-run"
+}
+
+# warn_uid_range_overlaps: pods get host ids from [NODE_UID_MIN, NODE_UID_MAX).
+# Warn (never fail) when an /etc/subuid or /etc/subgid entry, or the range
+# systemd-nspawn picks container ids from, overlaps it: an id that two owners
+# share is an id they can both write files as. DynamicUser uses 61184-65519,
+# below the range, so it needs no check.
+warn_uid_range_overlaps() {
+  local file name start count
+  for file in "$SUBUID_FILE" "$SUBGID_FILE"; do
+    [[ -f "$file" && -r "$file" ]] || continue
+    while IFS=: read -r name start count _; do
+      [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ ]] || continue
+      start=$((10#$start))
+      count=$((10#$count))
+      if ((start < NODE_UID_MAX && start + count > NODE_UID_MIN)); then
+        warn "$file: '$name' has ids $start-$((start + count - 1)), which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)) that faber maps pods into; narrow the entry"
+      fi
+    done <"$file"
+  done
+  if have systemd-nspawn; then
+    # systemd-nspawn -U picks from 524288-1878982655 (systemd UIDS-GIDS docs).
+    warn "systemd-nspawn is installed and picks container ids from 524288-1878982655, which overlap the pod id range $NODE_UID_MIN-$((NODE_UID_MAX - 1)); do not run both on this node"
+  fi
+}
+
 # preflight: checks that must pass before anything is changed.
 preflight() {
   verify_binaries
+  check_kernel_version
+  warn_uid_range_overlaps
   check_faber_home
   check_faber_account
   check_config_paths
@@ -2161,6 +2353,9 @@ check_stage_parent() {
     if [[ "$name" == faber ]]; then
       hint="; to install the faber CLI somewhere else, re-run with FABER_CLI_DIR set to a directory whose parent only root can write, for example FABER_CLI_DIR=/usr/bin"
     fi
+    if [[ "$name" == faber-node ]]; then
+      hint="; to install faber-node somewhere else, re-run with FABER_NODE_INSTALL_DIR set to a directory whose parent only root can write, for example FABER_NODE_INSTALL_DIR=/usr/sbin"
+    fi
     die "$dir must be owned by uid $EUID and not group/world-writable (used to stage binaries)$hint"
   fi
 }
@@ -2232,12 +2427,13 @@ install_binary() {
 # computed when omitted).
 install_faber_binaries() {
   local src name dest owner group mode
-  local -a states=("${1:-}" "${2:-}")
+  local -a states=("${1:-}" "${2:-}" "${3:-}")
   local i=0
   src="$(bin_src_dir)"
   ensure_faber_user
   ensure_faber_home
   [[ -d "$FABER_CLI_DIR" ]] || run_cmd install -d -m 0755 "$FABER_CLI_DIR"
+  [[ -d "$FABER_NODE_INSTALL_DIR" ]] || run_cmd install -d -m 0755 "$FABER_NODE_INSTALL_DIR"
   for name in "${FABER_BINARIES[@]}"; do
     read -r dest owner group mode < <(binary_spec "$name")
     install_binary "$src/$name" "$dest" "$owner" "$group" "$mode" "${states[i]}"
@@ -2342,7 +2538,7 @@ check_report() {
 # --- main -------------------------------------------------------------------
 
 main() {
-  local family arch comp restart_containerd=0 restart_fabercp=0
+  local family arch comp restart_containerd=0 restart_fabercp=0 restart_node=0
   local cni_target="$DEFAULT_CNI_VERSION"
   local -A before=() after=() status=() bin_state=()
 
@@ -2368,10 +2564,11 @@ main() {
   done
 
   install_packages "$family"
+  check_containerd_version
   resolve_deferred_endpoint
   check_deferred_wg_interface
   install_cni "$cni_target" "$arch"
-  install_faber_binaries "${bin_state[fabercp]}" "${bin_state[faber]}"
+  install_faber_binaries "${bin_state[fabercp]}" "${bin_state[faber]}" "${bin_state[faber-node]}"
 
   for comp in "${COMPONENTS[@]}"; do
     if [[ "$DRY_RUN" == 1 ]]; then
@@ -2406,9 +2603,17 @@ main() {
     restart_fabercp=1
   fi
 
+  case "${bin_state[faber-node]}" in
+    same | unknown) ;;
+    *) restart_node=1 ;;
+  esac
+  if [[ "$NODE_ENV_CHANGED" == 1 || "$NODE_UNIT_CHANGED" == 1 || "$restart_containerd" == 1 ]]; then
+    restart_node=1
+  fi
+
   reset_node_identity
   if systemd_present; then
-    manage_services "$restart_containerd" "$restart_fabercp"
+    manage_services "$restart_containerd" "$restart_fabercp" "$restart_node"
     bootstrap_cluster
   else
     warn "systemd not detected; skipping service start and cluster bootstrap (start containerd and fabercp yourself)"

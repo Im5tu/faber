@@ -15,6 +15,10 @@ setup() {
   export FABER_ARCH=x86_64
   export FABER_HOME="$TMP/opt/faber"
   export FABER_CLI_DIR="$TMP/usr/local/bin"
+  export FABER_NODE_INSTALL_DIR="$TMP/usr/local/sbin"
+  # A kernel that passes preflight, whatever the host runs, and no sub-id files.
+  export FABER_KERNEL_RELEASE="6.8.0-test"
+  export SUBUID_FILE="$TMP/etc/subuid" SUBGID_FILE="$TMP/etc/subgid"
   export FABER_BIN_SRC_DIR="$TMP/src"
   export FABER_ETC="$TMP/etc/faber"
   export FABER_STATE_DIR="$TMP/var/lib/faber"
@@ -31,6 +35,7 @@ setup() {
   TOKEN="faber1.eyJ2IjoxLCJwcml2YXRlX2tleSI6IlNFQ1JFVCJ9_TOPSECRET-xyz"
   make_fake_binary "$FABER_BIN_SRC_DIR/fabercp" "fabercp 0.1.0"
   make_fake_binary "$FABER_BIN_SRC_DIR/faber" "faber 0.1.0"
+  make_fake_binary "$FABER_BIN_SRC_DIR/faber-node" "faber-node 0.1.0"
   # The default node name comes from `hostname`; see set_hostname.
   export HOSTNAME_STUB_DIR="$TMP/hostname-stub"
   export -f hostname
@@ -453,7 +458,7 @@ EOF
 # stub_pkg_versions: containerd/wg/nft on PATH so a real run sees them installed.
 stub_pkg_versions() {
   mkdir -p "$TMP/bin"
-  printf '#!/bin/sh\necho "containerd github.com/containerd/containerd %s "\n' "${1:-1.7.24}" > "$TMP/bin/containerd"
+  printf '#!/bin/sh\necho "containerd github.com/containerd/containerd %s "\n' "${1:-2.0.2}" > "$TMP/bin/containerd"
   printf '#!/bin/sh\necho "wireguard-tools v1.0.20210914 - https://git.zx2c4.com/wireguard-tools/"\n' > "$TMP/bin/wg"
   printf '#!/bin/sh\necho "nftables v1.0.9 (Old Doc Yak #3)"\n' > "$TMP/bin/nft"
   chmod +x "$TMP/bin/containerd" "$TMP/bin/wg" "$TMP/bin/nft"
@@ -524,7 +529,7 @@ stub_faber_user() {
     wronggroup) rc=0 group=users ;;
   esac
   mkdir -p "$TMP/bin"
-  printf '#!/bin/sh\n[ %s = 0 ] || exit %s\n[ "$1" = -gn ] && echo %s\nexit 0\n' \
+  printf '#!/bin/sh\n[ %s = 0 ] || exit %s\n[ "$1" = -gn ] && echo %s\n[ "$1" = -u ] && echo 990\n[ "$1" = -g ] && echo 989\nexit 0\n' \
     "$rc" "$rc" "$group" > "$TMP/bin/id"
   printf '#!/bin/sh\nexit %s\n' "$rc" > "$TMP/bin/getent"
   chmod +x "$TMP/bin/id" "$TMP/bin/getent"
@@ -1547,8 +1552,8 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
 @test "render_fabercp_unit: contract directives" {
   run render_fabercp_unit
   local line
-  for line in '[Unit]' 'After=network-online.target containerd.service' \
-    'Wants=network-online.target' '[Service]' 'User=faber' 'Group=faber' \
+  for line in '[Unit]' 'After=network-online.target containerd.service faber-node.service' \
+    'Wants=network-online.target faber-node.service' '[Service]' 'User=faber' 'Group=faber' \
     "EnvironmentFile=$FABER_ETC/fabercp.env" "ExecStart=$FABER_HOME/fabercp" \
     'Restart=always' 'RestartSec=2' 'AmbientCapabilities=CAP_NET_ADMIN' \
     'CapabilityBoundingSet=CAP_NET_ADMIN' 'NoNewPrivileges=yes' \
@@ -1692,12 +1697,12 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     [ "$(stat -c '%U:%G %a' "$SYSTEMD_UNIT_DIR/$u")" = "root:root 644" ]
   done
   [ "$(count_calls 'systemctl daemon-reload')" = 1 ]
-  [ "$(count_calls 'systemctl enable --now containerd faber-containerd-reload.path fabercp')" = 1 ]
+  [ "$(count_calls 'systemctl enable --now containerd faber-containerd-reload.path faber-node fabercp')" = 1 ]
   [ "$(count_calls 'faber health')" -ge 1 ]
   [ "$(count_calls 'faber cluster init')" = 1 ]
   [[ "$output" == *"cluster: created"* ]]
   [ -z "$(ls -A "$TMP/etc/containerd" | grep -v -e '^config.toml$' -e '^conf.d$')" ]
-  [ -z "$(ls -A "$FABER_ETC" | grep -v '^fabercp.env$')" ]
+  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^faber-node.env$')" ]
 }
 
 @test "real run (new mesh): env file holds bootstrap vars until identity exists" {
@@ -1795,7 +1800,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ "$(stat -c '%U:%G %a' "$FABER_ETC/join.token")" = "root:faber 640" ]
   [ "$(cat "$FABER_ETC/join.token")" = "$TOKEN" ]
   grep -qxF "FABER_JOIN_TOKEN_FILE=$FABER_ETC/join.token" "$FABER_ETC/fabercp.env"
-  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^join.token$')" ]
+  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^faber-node.env$' -e '^join.token$')" ]
   [[ "$output" != *"$TOKEN"* ]]
 }
 
@@ -1869,7 +1874,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [[ "$output" == *"+ write $FABER_ETC/fabercp.env"* ]]
   [[ "$output" == *"+ write $SYSTEMD_UNIT_DIR/fabercp.service"* ]]
   [[ "$output" == *"+ systemctl daemon-reload"* ]]
-  [[ "$output" == *"+ systemctl enable --now containerd faber-containerd-reload.path fabercp"* ]]
+  [[ "$output" == *"+ systemctl enable --now containerd faber-containerd-reload.path faber-node fabercp"* ]]
   [[ "$output" == *"+ $FABER_CLI_DIR/faber health"* ]]
   [[ "$output" == *"+ $FABER_CLI_DIR/faber -o json cluster status"* ]]
   [[ "$output" == *"cluster: would-join"* ]]
@@ -2267,7 +2272,7 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ "$(count_calls 'faber cluster init')" = 0 ]
   [ ! -e "$FABER_ETC/join.token" ]
   ! grep -q 'FABER_JOIN_TOKEN_FILE' "$FABER_ETC/fabercp.env"
-  [ -z "$(ls -A "$FABER_ETC" | grep -v '^fabercp.env$')" ]
+  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^faber-node.env$')" ]
   [[ "$output" != *"$other"* ]]
   [[ "$output" != *"$TOKEN"* ]]
   ! grep -qF "$other" "$TMP/executed"
@@ -2374,7 +2379,7 @@ write_identity() {
   grep -qxF "FABER_JOIN_TOKEN_FILE=$FABER_ETC/join.token" "$FABER_ETC/fabercp.env"
   # the endpoint of the old invite does not carry over to the new one
   ! grep -q 'FABER_WG_ENDPOINT' "$FABER_ETC/fabercp.env"
-  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^join.token$')" ]
+  [ -z "$(ls -A "$FABER_ETC" | grep -v -e '^fabercp.env$' -e '^faber-node.env$' -e '^join.token$')" ]
   install_run --join "$TOKEN" --endpoint 198.51.100.3
   [ "$status" -eq 1 ]
   [ "$(cat "$FABER_ETC/join.token")" = "$TOKEN" ]
@@ -2796,7 +2801,7 @@ write_identity() {
   [[ "$output" == *"FABER_CLI_DIR set to a directory whose parent only root can write"* ]]
   [[ "$output" == *"FABER_CLI_DIR=/usr/bin"* ]]
   # the workaround works: the parent of that directory is root-only
-  FABER_CLI_DIR="$TMP/usr/bin" run check_stage_parents
+  FABER_CLI_DIR="$TMP/usr/bin" FABER_NODE_INSTALL_DIR="$TMP/usr/bin" run check_stage_parents
   chmod 0755 "$TMP/usr/local"
   [ "$status" -eq 0 ]
   # fabercp is not installed through FABER_CLI_DIR, so its parent gets no such hint
@@ -2812,17 +2817,19 @@ write_identity() {
   # nothing exists yet: the parents are created later by root
   run check_stage_parents
   [ "$status" -eq 0 ]
-  mkdir -p "$FABER_CLI_DIR" "$FABER_HOME"
+  mkdir -p "$FABER_CLI_DIR" "$FABER_HOME" "$FABER_NODE_INSTALL_DIR"
   chmod 0777 "$TMP/usr/local"
   run check_stage_parents
   [ "$status" -eq 1 ]
   [[ "$output" == *"writable"* ]]
   # an up-to-date binary is not staged, so its parent is not checked
   install -m 0755 "$TMP/src/faber" "$FABER_CLI_DIR/faber"
+  install -m 0755 "$TMP/src/faber-node" "$FABER_NODE_INSTALL_DIR/faber-node"
   binary_spec() {
     case "$1" in
       fabercp) printf '%s %s %s %s\n' "$FABER_HOME/fabercp" "$(id -u)" "$(id -g)" 0750 ;;
       faber) printf '%s %s %s %s\n' "$FABER_CLI_DIR/faber" "$(id -u)" "$(id -g)" 0755 ;;
+      faber-node) printf '%s %s %s %s\n' "$FABER_NODE_INSTALL_DIR/faber-node" "$(id -u)" "$(id -g)" 0755 ;;
     esac
   }
   run check_stage_parents
@@ -4259,4 +4266,302 @@ removed_node() {
   [ "$status" -eq 0 ]
   run grep -q 'FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
   [ "$status" -eq 1 ]
+}
+
+# --- faber-node -----------------------------------------------------------
+
+@test "binary_spec: faber-node is root:root 0755 outside FABER_HOME" {
+  run binary_spec faber-node
+  [ "$output" = "$FABER_NODE_INSTALL_DIR/faber-node root root 0755" ]
+  [[ "$output" != "$FABER_HOME"* ]]
+}
+
+@test "verify_binaries: a missing faber-node is refused" {
+  rm "$FABER_BIN_SRC_DIR/faber-node"
+  run verify_binaries
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"missing faber binary"*"faber-node"* ]]
+}
+
+@test "render_node_env: uid range, faber ids and tool dirs" {
+  FABER_ACCOUNT_UID=990 FABER_ACCOUNT_GID=989 run render_node_env
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '%s\n' \
+    '# managed by faber' \
+    'FABER_NODE_UID_MIN=1048576' \
+    'FABER_NODE_UID_MAX=2147483648' \
+    'FABER_NODE_FABER_UID=990' \
+    'FABER_NODE_FABER_GID=989' \
+    'FABER_NODE_BIN_DIR=/usr/bin' \
+    'FABER_NODE_SBIN_DIR=/usr/sbin')" ]
+}
+
+@test "render_node_env: the uid range is the one placement allocates from" {
+  local place="$REPO_ROOT/src/fabercp/src/raft/store/place.rs"
+  grep -qE "UID_RANGE_START: u32 = 1_048_576;" "$place"
+  grep -qE "UID_RANGE_END: u32 = 2_147_483_648;" "$place"
+  [ "$NODE_UID_MIN" = 1048576 ]
+  [ "$NODE_UID_MAX" = 2147483648 ]
+}
+
+@test "render_node_env: a custom socket and tool dirs are written, the default socket is not" {
+  FABER_ACCOUNT_UID=990 FABER_ACCOUNT_GID=989
+  FABER_NODE_SOCKET=/srv/faber/node.sock FABER_NODE_BIN_DIR=/bin FABER_NODE_SBIN_DIR=/sbin \
+    run render_node_env
+  grep -qxF 'FABER_NODE_SOCKET=/srv/faber/node.sock' <<<"$output"
+  grep -qxF 'FABER_NODE_BIN_DIR=/bin' <<<"$output"
+  grep -qxF 'FABER_NODE_SBIN_DIR=/sbin' <<<"$output"
+  run render_node_env
+  [[ "$output" != *"FABER_NODE_SOCKET"* ]]
+}
+
+@test "resolve_faber_ids: dry-run before the faber user exists shows placeholders, a real run dies" {
+  stub_faber_user absent
+  DRY_RUN=1 PATH="$TMP/bin:$PATH" resolve_faber_ids
+  [ "$FABER_ACCOUNT_UID" = "<uid of faber>" ]
+  DRY_RUN=0 PATH="$TMP/bin:$PATH" run resolve_faber_ids
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot read the numeric uid of faber"* ]]
+}
+
+@test "render_faber_node_unit: root, after containerd, strict sandbox, explicit paths" {
+  run render_faber_node_unit
+  [ "$status" -eq 0 ]
+  local line
+  for line in '[Unit]' 'After=containerd.service' 'Wants=containerd.service' \
+    '[Service]' 'User=root' \
+    "ExecStart=$FABER_NODE_INSTALL_DIR/faber-node --env-file $FABER_ETC/faber-node.env" \
+    'Restart=always' 'StateDirectory=faber-node' 'StateDirectoryMode=0755' \
+    'RuntimeDirectory=faber' 'RuntimeDirectoryMode=0755' \
+    'ProtectSystem=strict' 'ReadWritePaths=/var/lib/faber-node' \
+    'ReadWritePaths=/run/faber' 'MountFlags=shared' \
+    '[Install]' 'WantedBy=multi-user.target'; do
+    grep -qxF -- "$line" <<<"$output"
+  done
+  [[ "$output" != *"PrivateDevices"* ]]
+  [[ "$output" != *"User=faber"* ]]
+}
+
+@test "render_faber_node_unit: a custom socket directory is writable and has no RuntimeDirectory" {
+  FABER_NODE_SOCKET=/srv/faber/node.sock run render_faber_node_unit
+  grep -qxF 'ReadWritePaths=/srv/faber' <<<"$output"
+  [[ "$output" != *"RuntimeDirectory"* ]]
+  [[ "$output" != *"ReadWritePaths=/run/faber"* ]]
+}
+
+@test "render_fabercp_unit: starts after faber-node and gains no capability" {
+  run render_fabercp_unit
+  grep -qxF 'After=network-online.target containerd.service faber-node.service' <<<"$output"
+  grep -qxF 'Wants=network-online.target faber-node.service' <<<"$output"
+  grep -qxF 'AmbientCapabilities=CAP_NET_ADMIN' <<<"$output"
+  grep -qxF 'CapabilityBoundingSet=CAP_NET_ADMIN' <<<"$output"
+}
+
+@test "render_env: FABER_NODE_SOCKET only for a non-default socket" {
+  MODE=existing WG_ENDPOINT=""
+  run render_env 0
+  [[ "$output" != *"FABER_NODE_SOCKET"* ]]
+  FABER_NODE_SOCKET=/srv/faber/node.sock run render_env 0
+  grep -qxF 'FABER_NODE_SOCKET=/srv/faber/node.sock' <<<"$output"
+}
+
+@test "real run: faber-node binary, env file and unit are installed with their modes" {
+  setup_full_run systemd
+  install_run
+  [ "$status" -eq 0 ]
+  [ "$(stat -c '%U:%G %a' "$FABER_NODE_INSTALL_DIR/faber-node")" = "root:root 755" ]
+  [ "$(stat -c '%U:%G %a' "$FABER_ETC/faber-node.env")" = "root:root 640" ]
+  [ "$(stat -c '%U:%G %a' "$SYSTEMD_UNIT_DIR/faber-node.service")" = "root:root 644" ]
+  grep -qxF 'FABER_NODE_UID_MIN=1048576' "$FABER_ETC/faber-node.env"
+  grep -qxF 'FABER_NODE_UID_MAX=2147483648' "$FABER_ETC/faber-node.env"
+  grep -qxF 'FABER_NODE_FABER_UID=990' "$FABER_ETC/faber-node.env"
+  grep -qxF 'FABER_NODE_FABER_GID=989' "$FABER_ETC/faber-node.env"
+  grep -qxF 'FABER_NODE_BIN_DIR=/usr/bin' "$FABER_ETC/faber-node.env"
+  grep -qxF 'FABER_NODE_SBIN_DIR=/usr/sbin' "$FABER_ETC/faber-node.env"
+  [[ "$output" == *"faber-node "* ]]
+  [ "$(count_calls 'systemctl enable --now containerd faber-containerd-reload.path faber-node fabercp')" = 1 ]
+  run grep -q 'FABER_NODE_SOCKET' "$FABER_ETC/fabercp.env"
+  [ "$status" -eq 1 ]
+}
+
+@test "real run: a custom socket reaches both env files and its directory is made" {
+  setup_full_run systemd
+  FABER_NODE_SOCKET="$TMP/srv/faber/node.sock" install_run
+  [ "$status" -eq 0 ]
+  grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/fabercp.env"
+  grep -qxF "FABER_NODE_SOCKET=$TMP/srv/faber/node.sock" "$FABER_ETC/faber-node.env"
+  [ "$(stat -c '%U:%G %a' "$TMP/srv/faber")" = "root:root 755" ]
+  grep -qxF "ReadWritePaths=$TMP/srv/faber" "$SYSTEMD_UNIT_DIR/faber-node.service"
+}
+
+@test "real run: a changed faber-node binary or env restarts only faber-node, a re-run restarts nothing" {
+  setup_full_run systemd
+  install_run
+  [ "$status" -eq 0 ]
+  rm "$TMP/executed"
+  install_run
+  [ "$status" -eq 0 ]
+  [ "$(count_calls try-restart)" = 0 ]
+  [ "$(count_calls daemon-reload)" = 0 ]
+  make_fake_binary "$FABER_BIN_SRC_DIR/faber-node" "faber-node 0.2.0"
+  install_run
+  [ "$status" -eq 0 ]
+  [ "$(count_calls 'systemctl try-restart faber-node')" = 1 ]
+  [ "$(count_calls 'systemctl try-restart fabercp')" = 0 ]
+  rm "$TMP/executed"
+  printf 'x\n' > "$FABER_ETC/faber-node.env"
+  install_run
+  [ "$(count_calls 'systemctl try-restart faber-node')" = 1 ]
+}
+
+@test "dry-run: faber-node is staged and its units are planned" {
+  make_stub_path
+  install_run --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$FABER_NODE_INSTALL_DIR/faber-node"* ]]
+  [[ "$output" == *"faber-node.env"* ]]
+  [ ! -e "$FABER_NODE_INSTALL_DIR/faber-node" ]
+}
+
+# --- preflight: kernel, containerd, id ranges -----------------------------
+
+@test "check_kernel_version: older than 6.3 is refused with a clear message" {
+  local release
+  for release in 5.15.0-91-generic 6.2.16 6.0 4.19.1; do
+    FABER_KERNEL_RELEASE="$release" run check_kernel_version
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kernel $release is older than 6.3"* ]]
+  done
+}
+
+@test "check_kernel_version: 6.3 and newer pass" {
+  local release
+  for release in 6.3.0 6.3 6.8.0-test 6.10.2 7.0.1 10.0; do
+    FABER_KERNEL_RELEASE="$release" run check_kernel_version
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+  done
+}
+
+@test "check_kernel_version: an unreadable release warns but does not fail" {
+  FABER_KERNEL_RELEASE="weird" run check_kernel_version
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN"*"cannot read the kernel version"* ]]
+}
+
+@test "check_kernel_version: uses uname -r when FABER_KERNEL_RELEASE is empty" {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\necho 5.10.0\n' > "$TMP/bin/uname"
+  chmod +x "$TMP/bin/uname"
+  FABER_KERNEL_RELEASE="" PATH="$TMP/bin:$PATH" run check_kernel_version
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"kernel 5.10.0 is older than 6.3"* ]]
+}
+
+@test "dry-run: an old kernel dies before any package command" {
+  make_stub_path
+  FABER_KERNEL_RELEASE=5.15.0 install_run --dry-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"older than 6.3"* ]]
+  [[ "$output" != *"apt-get"* ]]
+}
+
+@test "real run: an old kernel changes nothing" {
+  setup_full_run systemd
+  FABER_KERNEL_RELEASE=6.1.0 install_run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"older than 6.3"* ]]
+  [ ! -e "$TMP/executed" ]
+  [ ! -e "$FABER_ETC" ]
+}
+
+@test "check_containerd_version: older than 2.0 is refused" {
+  stub_pkg_versions 1.7.24
+  PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"containerd 1.7.24 is older than 2.0"* ]]
+  stub_pkg_versions 1.6.33
+  PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 1 ]
+}
+
+@test "check_containerd_version: 2.0 and newer, or none yet, pass" {
+  stub_pkg_versions 2.0.0
+  PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 0 ]
+  stub_pkg_versions 2.1.3
+  PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 0 ]
+  PATH="$TMP/empty" run check_containerd_version
+  [ "$status" -eq 0 ]
+}
+
+@test "check_containerd_version: --dry-run only warns" {
+  stub_pkg_versions 1.7.24
+  DRY_RUN=1 PATH="$TMP/bin:$PATH" run check_containerd_version
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN"*"containerd 1.7.24 is older than 2.0"* ]]
+}
+
+@test "real run: containerd older than 2.0 after the install stops before any faber write" {
+  setup_full_run systemd
+  stub_pkg_versions 1.7.24
+  install_run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"containerd 1.7.24 is older than 2.0"* ]]
+  [ ! -e "$FABER_ETC" ]
+  [ "$(count_calls 'systemctl')" = 0 ]
+}
+
+@test "warn_uid_range_overlaps: subuid and subgid entries inside the pod range warn" {
+  mkdir -p "$TMP/etc"
+  printf 'alice:100000:65536\nbob:1048576:65536\n' > "$SUBUID_FILE"
+  printf 'carol:1000000:65536\ndave:2147483648:65536\n' > "$SUBGID_FILE"
+  run warn_uid_range_overlaps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$SUBUID_FILE: 'bob' has ids 1048576-1114111"* ]]
+  [[ "$output" == *"$SUBGID_FILE: 'carol' has ids 1000000-1065535"* ]]
+  [[ "$output" != *"alice"* ]]
+  [[ "$output" != *"dave"* ]]
+}
+
+@test "warn_uid_range_overlaps: nothing to warn about, missing files and junk lines" {
+  mkdir -p "$TMP/etc"
+  printf 'alice:100000:65536\n# comment\nbroken\nx:y:z\n' > "$SUBUID_FILE"
+  run warn_uid_range_overlaps
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  rm "$SUBUID_FILE"
+  run warn_uid_range_overlaps
+  [ -z "$output" ]
+}
+
+@test "warn_uid_range_overlaps: a range that ends just below, or starts at the end, does not warn" {
+  mkdir -p "$TMP/etc"
+  printf 'a:983040:65536\nb:2147483648:1\n' > "$SUBUID_FILE"
+  run warn_uid_range_overlaps
+  [ -z "$output" ]
+  printf 'c:983041:65536\nd:2147483647:5\n' > "$SUBUID_FILE"
+  run warn_uid_range_overlaps
+  [[ "$output" == *"'c'"* ]]
+  [[ "$output" == *"'d'"* ]]
+}
+
+@test "warn_uid_range_overlaps: systemd-nspawn on the host warns" {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/systemd-nspawn"
+  chmod +x "$TMP/bin/systemd-nspawn"
+  PATH="$TMP/bin:$PATH" run warn_uid_range_overlaps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"systemd-nspawn"*"524288-1878982655"* ]]
+}
+
+@test "real run: an overlapping subuid entry warns and the install still succeeds" {
+  setup_full_run systemd
+  mkdir -p "$TMP/etc"
+  printf 'bob:1048576:65536\n' > "$SUBUID_FILE"
+  install_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN"*"'bob' has ids 1048576-1114111"* ]]
+  [[ "$output" == *"cluster: created"* ]]
 }
