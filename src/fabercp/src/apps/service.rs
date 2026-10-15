@@ -255,9 +255,14 @@ impl FaberService {
         };
         // Reports are stamped with the lease clock, so staleness is judged on
         // it. Without a mesh nothing has reported.
+        let placement = self
+            .state()
+            .placement(project, environment)
+            .map_err(|e| ServiceError::Internal(format!("placement: {e}")))?;
+        let placed = placement.as_ref().map_or(&[][..], |p| p.replicas(workload));
         let replicas =
             self.status_view()?
-                .workload(project, environment, workload, stored.revision);
+                .workload(project, environment, workload, stored.revision, placed);
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),
@@ -968,6 +973,15 @@ mod tests {
     /// A workload of one container that runs `image`.
     fn spec(image: &str) -> WorkloadSpec {
         serde_json::from_value(json!({"containers": [{"name": "main", "image": image}]})).unwrap()
+    }
+
+    /// Two replicas of one container.
+    fn two_replicas(image: &str) -> WorkloadSpec {
+        serde_json::from_value(json!({
+            "scale": {"replicas": {"count": 2}},
+            "containers": [{"name": "main", "image": image}],
+        }))
+        .unwrap()
     }
 
     /// A workload the model validation refuses: it has no container.
@@ -1752,11 +1766,12 @@ mod tests {
         svc.deploy(
             "shop",
             "staging",
-            deploy_req(&[("web", spec("nginx"))], false),
+            deploy_req(&[("web", two_replicas("nginx"))], false),
         )
         .await
         .unwrap();
-        // Nothing reported: no replicas, and no mesh to read a clock from.
+        // Nothing placed or reported: no replicas, and no mesh to read a
+        // clock from.
         assert!(
             svc.workload("shop", "staging", "web", false)
                 .await
@@ -1770,6 +1785,42 @@ mod tests {
             .await
             .unwrap()
             .revision;
+        let capacity = Capacity {
+            cpu_millis: 4_000,
+            memory_bytes: 1 << 33,
+            disk_bytes: 0,
+        };
+        // A report of replicas that are not placed shows nothing yet.
+        let report_node = |replicas| {
+            Request::ReportNode(ReportNode {
+                node_id: 1,
+                instance_id: "ab".repeat(16),
+                capacity,
+                replicas,
+            })
+        };
+        svc.propose(report_node(Vec::new())).await.unwrap();
+        assert!(
+            svc.workload("shop", "staging", "web", false)
+                .await
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
+        // The leader places both replicas on the only node.
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        let shown = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(
+            shown
+                .replicas
+                .iter()
+                .map(|r| (r.node, r.replica_index, r.state))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1), 0, ReplicaState::Deploying),
+                (Some(1), 1, ReplicaState::Deploying)
+            ]
+        );
         let report = |index: u32, state, pod_ip: Option<&str>| ReplicaReport {
             project: "shop".into(),
             environment: "staging".into(),
@@ -1780,26 +1831,21 @@ mod tests {
             pod_ip: pod_ip.map(|ip| ip.parse().unwrap()),
             detail: None,
         };
-        svc.propose(Request::ReportNode(ReportNode {
-            node_id: 1,
-            instance_id: "ab".repeat(16),
-            capacity: Capacity::default(),
-            replicas: vec![
-                report(1, ReplicaState::Deploying, None),
-                // A replica of another revision is not shown.
-                ReplicaReport {
-                    revision: rev + 1,
-                    ..report(2, ReplicaState::Available, None)
-                },
-                report(0, ReplicaState::Available, Some("10.200.0.2")),
-            ],
-        }))
+        svc.propose(report_node(vec![
+            report(1, ReplicaState::Deploying, None),
+            // A replica that is not placed is not shown.
+            ReplicaReport {
+                revision: rev + 1,
+                ..report(2, ReplicaState::Available, None)
+            },
+            report(0, ReplicaState::Available, Some("10.200.0.2")),
+        ]))
         .await
         .unwrap();
         let want = |state| {
             vec![
                 ReplicaStatus {
-                    node: 1,
+                    node: Some(1),
                     replica_index: 0,
                     revision: rev,
                     state: if state {
@@ -1808,9 +1854,10 @@ mod tests {
                         ReplicaState::Unavailable
                     },
                     pod_ip: Some("10.200.0.2".parse().unwrap()),
+                    reason: None,
                 },
                 ReplicaStatus {
-                    node: 1,
+                    node: Some(1),
                     replica_index: 1,
                     revision: rev,
                     state: if state {
@@ -1819,6 +1866,7 @@ mod tests {
                         ReplicaState::Unavailable
                     },
                     pod_ip: None,
+                    reason: None,
                 },
             ]
         };
@@ -1847,6 +1895,150 @@ mod tests {
             .unwrap();
         let got = svc.workload("shop", "staging", "web", false).await.unwrap();
         assert_eq!(got.replicas, want(false));
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_leader_proposes_a_placement_only_when_it_changes() {
+        use crate::raft::store::status::{Capacity, ReportNode};
+
+        let node = shop().await;
+        let svc = &node.service;
+        let shown = |r: &WorkloadResponse| {
+            r.replicas
+                .iter()
+                .map(|r| (r.node, r.reason.clone()))
+                .collect::<Vec<_>>()
+        };
+        svc.deploy(
+            "shop",
+            "staging",
+            deploy_req(&[("web", two_replicas("nginx"))], false),
+        )
+        .await
+        .unwrap();
+        // No mesh, nothing to place on.
+        assert_eq!(svc.place_once().await.unwrap(), 0);
+
+        // No node has reported: both replicas are unplaced, and say so once.
+        seed_mesh(&node).await;
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert_eq!(svc.place_once().await.unwrap(), 0);
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
+        let why = Some("no_node_available".to_string());
+        assert_eq!(shown(&got), [(None, why.clone()), (None, why)]);
+
+        // The node reports its capacity: the replicas are placed.
+        svc.propose(Request::ReportNode(ReportNode {
+            node_id: 1,
+            instance_id: "ab".repeat(16),
+            capacity: Capacity {
+                cpu_millis: 4_000,
+                memory_bytes: 1 << 33,
+                disk_bytes: 0,
+            },
+            replicas: Vec::new(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert_eq!(svc.place_once().await.unwrap(), 0);
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(shown(&got), [(Some(1), None), (Some(1), None)]);
+        let uid_base = |name: &str| {
+            let record = svc.state().placement("shop", "staging").unwrap().unwrap();
+            record.workloads[name].uid_base
+        };
+        let web_uids = uid_base("web");
+
+        // A change of scale is placed once; the workload keeps its uids.
+        svc.deploy(
+            "shop",
+            "staging",
+            deploy_req(&[("web", spec("nginx"))], false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert_eq!(svc.place_once().await.unwrap(), 0);
+        let got = svc.workload("shop", "staging", "web", false).await.unwrap();
+        assert_eq!(shown(&got), [(Some(1), None)]);
+        assert_eq!(uid_base("web"), web_uids);
+
+        // A second workload gets the next range.
+        svc.deploy("shop", "staging", deploy_req(&[("db", spec("pg"))], false))
+            .await
+            .unwrap();
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert_eq!(uid_base("db"), web_uids + 65_536);
+
+        // Both removed: the record goes and the ranges are free.
+        svc.remove_workload("shop", "staging", "web").await.unwrap();
+        svc.remove_workload("shop", "staging", "db").await.unwrap();
+        assert_eq!(svc.place_once().await.unwrap(), 1);
+        assert!(svc.state().placement("shop", "staging").unwrap().is_none());
+        assert_eq!(svc.place_once().await.unwrap(), 0);
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_placement_task_places_on_a_change_of_state() {
+        use crate::raft::store::status::{Capacity, ReportNode};
+        use crate::reconcile::ReconcileTiming;
+        use std::time::Duration;
+
+        let node = shop().await;
+        let svc = &node.service;
+        seed_mesh(&node).await;
+        let timing = ReconcileTiming {
+            debounce_quiet: Duration::from_millis(10),
+            debounce_max: Duration::from_millis(50),
+            ..ReconcileTiming::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = crate::placement::spawn_placement_task(
+            svc.clone(),
+            timing,
+            Duration::from_secs(3600),
+            cancel.clone(),
+        );
+        svc.deploy(
+            "shop",
+            "staging",
+            deploy_req(&[("web", two_replicas("nginx"))], false),
+        )
+        .await
+        .unwrap();
+        svc.propose(Request::ReportNode(ReportNode {
+            node_id: 1,
+            instance_id: "ab".repeat(16),
+            capacity: Capacity {
+                cpu_millis: 4_000,
+                memory_bytes: 1 << 33,
+                disk_bytes: 0,
+            },
+            replicas: Vec::new(),
+        }))
+        .await
+        .unwrap();
+        let placed = async {
+            loop {
+                let nodes = svc
+                    .state()
+                    .placement("shop", "staging")
+                    .unwrap()
+                    .map(|r| r.replicas("web").iter().map(|r| r.node).collect::<Vec<_>>());
+                if nodes == Some(vec![Some(1), Some(1)]) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), placed)
+            .await
+            .expect("the task places the replicas");
+        cancel.cancel();
+        task.await.unwrap();
         node.shutdown().await;
     }
 

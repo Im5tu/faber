@@ -24,6 +24,7 @@ use faber_api_types::workload::{ReplicaState, ReplicaStatus};
 use tokio_util::sync::CancellationToken;
 
 use crate::mesh::MeshState;
+use crate::raft::store::place::ReplicaPlacement;
 use crate::raft::store::status::{
     Capacity, NodeStatus, ReplicaReport, ReportNode, STALE_AFTER_INTERVALS,
 };
@@ -327,39 +328,62 @@ impl StatusView {
         view
     }
 
-    /// The replicas of one workload at `revision`, by replica index and then
-    /// node. `revision` is the stored revision of a workload that exists, so
-    /// reports for a workload that is gone, or for another revision, are
-    /// never shown.
+    /// The replicas of one workload at `revision`, one per replica in
+    /// `placed` and in its order (by replica index).
     ///
-    /// Entries are what nodes claim. Placement will add a check that the
-    /// node is one the workload is placed on; this is where it goes.
+    /// A replica shows the report of the node it is placed on, and only that
+    /// one: what another node claims about a replica that is not placed on it
+    /// is ignored, as are reports of another revision and of a workload that
+    /// is gone. A replica that its node has not reported yet is `deploying`,
+    /// or `unavailable` when the node is stale. An unplaced replica is
+    /// `unavailable` with the reason it has no node. `revision` is the stored
+    /// revision of a workload that exists.
     pub fn workload(
         &self,
         project: &str,
         environment: &str,
         workload: &str,
         revision: u64,
+        placed: &[ReplicaPlacement],
     ) -> Vec<ReplicaStatus> {
-        let mut found: Vec<ReplicaStatus> = self
-            .replicas
+        placed
             .iter()
-            .filter(|(_, r)| {
-                r.project == project
-                    && r.environment == environment
-                    && r.workload == workload
-                    && r.revision == revision
+            .map(|p| {
+                let Some(node) = p.node else {
+                    return ReplicaStatus {
+                        node: None,
+                        replica_index: p.index,
+                        revision,
+                        state: ReplicaState::Unavailable,
+                        pod_ip: None,
+                        reason: p.reason.clone(),
+                    };
+                };
+                let report = self.replicas.iter().find(|(n, r)| {
+                    *n == node
+                        && r.project == project
+                        && r.environment == environment
+                        && r.workload == workload
+                        && r.revision == revision
+                        && r.replica_index == p.index
+                });
+                let (state, pod_ip) = match report {
+                    Some((_, r)) => (r.state, r.pod_ip),
+                    None if self.nodes.get(&node).is_some_and(|n| n.stale) => {
+                        (ReplicaState::Unavailable, None)
+                    }
+                    None => (ReplicaState::Deploying, None),
+                };
+                ReplicaStatus {
+                    node: Some(node),
+                    replica_index: p.index,
+                    revision,
+                    state,
+                    pod_ip,
+                    reason: None,
+                }
             })
-            .map(|(node, r)| ReplicaStatus {
-                node: *node,
-                replica_index: r.replica_index,
-                revision: r.revision,
-                state: r.state,
-                pod_ip: r.pod_ip,
-            })
-            .collect();
-        found.sort_by_key(|r| (r.replica_index, r.node));
-        found
+            .collect()
     }
 }
 
@@ -401,6 +425,14 @@ mod tests {
         }
     }
 
+    /// Replica `index` placed on `node`, for each pair.
+    fn placed(pairs: &[(u32, u64)]) -> Vec<ReplicaPlacement> {
+        pairs
+            .iter()
+            .map(|(index, node)| ReplicaPlacement::on(*index, *node))
+            .collect()
+    }
+
     fn record(reported_at: u64, replicas: Vec<ReplicaReport>) -> NodeStatus {
         NodeStatus {
             reported_at,
@@ -424,7 +456,7 @@ mod tests {
         // Interval 5: fresh up to and including 15 seconds of age.
         for (now, stale) in [(100, false), (115, false), (116, true), (10_000, true)] {
             let view = StatusView::new(statuses.clone(), 5, now, 0);
-            let got = view.workload("shop", "staging", "web", 2);
+            let got = view.workload("shop", "staging", "web", 2, &placed(&[(0, 1), (1, 2)]));
             assert_eq!(got.len(), 2);
             let want = if stale {
                 [ReplicaState::Unavailable, ReplicaState::Unavailable]
@@ -448,10 +480,19 @@ mod tests {
                 record(100, vec![replica("web", 1, ReplicaState::Available)]),
             ),
         ]);
-        let got = StatusView::new(mixed, 5, 100, 0).workload("shop", "staging", "web", 2);
+        let got = StatusView::new(mixed, 5, 100, 0).workload(
+            "shop",
+            "staging",
+            "web",
+            2,
+            &placed(&[(0, 1), (1, 2)]),
+        );
         assert_eq!(
             got.iter().map(|r| (r.node, r.state)).collect::<Vec<_>>(),
-            vec![(1, ReplicaState::Unavailable), (2, ReplicaState::Available)]
+            vec![
+                (Some(1), ReplicaState::Unavailable),
+                (Some(2), ReplicaState::Available)
+            ]
         );
     }
 
@@ -466,8 +507,14 @@ mod tests {
             )])
         };
         let state = |at, now| {
-            StatusView::new(reported(at), 5, now, tick).workload("shop", "staging", "web", 2)[0]
-                .state
+            StatusView::new(reported(at), 5, now, tick).workload(
+                "shop",
+                "staging",
+                "web",
+                2,
+                &placed(&[(0, 1)]),
+            )[0]
+            .state
         };
         // Reported just before the clock ticked, and not again yet: a whole
         // tick old on the clock.
@@ -499,15 +546,96 @@ mod tests {
             ),
         ]);
         let view = StatusView::new(statuses, 5, 0, 0);
-        let web = view.workload("shop", "staging", "web", 2);
+        let web = view.workload("shop", "staging", "web", 2, &placed(&[(0, 1), (2, 3)]));
         assert_eq!(
             web.iter()
                 .map(|r| (r.replica_index, r.node))
                 .collect::<Vec<_>>(),
-            vec![(0, 1), (2, 3)]
+            vec![(0, Some(1)), (2, Some(3))]
         );
-        assert!(view.workload("shop", "production", "web", 2).is_empty());
-        assert!(StatusView::default().workload("a", "b", "c", 2).is_empty());
+        assert!(
+            view.workload("shop", "production", "web", 2, &[])
+                .is_empty()
+        );
+        assert!(
+            StatusView::default()
+                .workload("a", "b", "c", 2, &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_the_report_of_the_node_a_replica_is_placed_on_is_shown() {
+        // Node 2 claims replica 0, which is placed on node 1, and replica 1
+        // twice over, which is placed on node 2 only.
+        let statuses = BTreeMap::from([
+            (
+                1,
+                record(0, vec![replica("web", 0, ReplicaState::Available)]),
+            ),
+            (
+                2,
+                record(
+                    0,
+                    vec![
+                        replica("web", 0, ReplicaState::Deploying),
+                        replica("web", 1, ReplicaState::Available),
+                    ],
+                ),
+            ),
+            (
+                3,
+                record(0, vec![replica("web", 1, ReplicaState::Deploying)]),
+            ),
+        ]);
+        let view = StatusView::new(statuses, 5, 0, 0);
+        let got = view.workload("shop", "staging", "web", 2, &placed(&[(0, 1), (1, 2)]));
+        assert_eq!(
+            got.iter()
+                .map(|r| (r.node, r.replica_index, r.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), 0, ReplicaState::Available),
+                (Some(2), 1, ReplicaState::Available)
+            ]
+        );
+        // Nothing is placed: nothing is shown, whatever the nodes claim.
+        assert!(view.workload("shop", "staging", "web", 2, &[]).is_empty());
+        // A node that is not the one it is placed on has no say.
+        let got = view.workload("shop", "staging", "web", 2, &placed(&[(0, 3)]));
+        assert_eq!(got[0].state, ReplicaState::Deploying);
+        assert_eq!(got[0].pod_ip, None);
+    }
+
+    #[test]
+    fn a_placed_replica_nobody_reported_is_deploying_and_an_unplaced_one_says_why() {
+        let statuses = BTreeMap::from([(
+            1,
+            record(0, vec![replica("web", 0, ReplicaState::Available)]),
+        )]);
+        let mut unplaced = placed(&[(0, 1), (1, 1)]);
+        unplaced.push(ReplicaPlacement::unplaced(2, "insufficient_capacity"));
+        let fresh = StatusView::new(statuses.clone(), 5, 0, 0);
+        let got = fresh.workload("shop", "staging", "web", 2, &unplaced);
+        assert_eq!(
+            got.iter().map(|r| r.state).collect::<Vec<_>>(),
+            [
+                ReplicaState::Available,
+                ReplicaState::Deploying,
+                ReplicaState::Unavailable
+            ]
+        );
+        assert_eq!((got[2].node, got[2].revision), (None, 2));
+        assert_eq!(got[2].reason.as_deref(), Some("insufficient_capacity"));
+        assert_eq!(got[1].reason, None);
+        // The node went quiet: what it never reported is unavailable too.
+        let stale = StatusView::new(statuses, 5, 1000, 0);
+        let got = stale.workload("shop", "staging", "web", 2, &unplaced);
+        assert!(got.iter().all(|r| r.state == ReplicaState::Unavailable));
+        // A report of another revision does not count.
+        let got = fresh.workload("shop", "staging", "web", 3, &placed(&[(0, 1)]));
+        assert_eq!(got[0].state, ReplicaState::Deploying);
+        assert_eq!(got[0].revision, 3);
     }
 
     #[test]
