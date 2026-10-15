@@ -37,6 +37,11 @@ pub enum Outcome {
 /// `ips`; every other name is [`Outcome::Forward`].
 pub fn answer(packet: &[u8], ips: &dyn ServiceIps) -> Outcome {
     let Ok(request) = Message::from_vec(packet) else {
+        // Never answer a response, however broken: two servers could
+        // otherwise trade error replies forever.
+        if is_response(packet) {
+            return Outcome::Drop;
+        }
         return error_reply(packet, ResponseCode::FormErr).map_or(Outcome::Drop, Outcome::Reply);
     };
     if request.metadata.message_type == MessageType::Response {
@@ -81,6 +86,37 @@ pub fn error_reply(packet: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
         ),
     };
     message.to_vec().ok()
+}
+
+/// Whether the header of `packet` has the QR bit set.
+fn is_response(packet: &[u8]) -> bool {
+    packet.get(2).is_some_and(|flags| flags & 0x80 != 0)
+}
+
+/// Size of a UDP reply when the client sent no EDNS.
+const PLAIN_UDP_SIZE: usize = 512;
+
+/// `response` as it may go to the sender of `query` over UDP: unchanged when
+/// it fits the size the client accepts (its EDNS payload size, or 512 bytes
+/// without EDNS), else cut to the question with the TC bit set so the client
+/// retries over TCP.
+pub fn fit_udp(query: &[u8], response: Vec<u8>) -> Vec<u8> {
+    let limit = Message::from_vec(query).map_or(PLAIN_UDP_SIZE, |q| usize::from(q.max_payload()));
+    if response.len() <= limit {
+        return response;
+    }
+    if let Ok(message) = Message::from_vec(&response)
+        && let Ok(cut) = message.truncate().to_vec()
+        && cut.len() <= limit
+    {
+        return cut;
+    }
+    // Not parseable, or the question alone does not fit: a bare header.
+    let mut header = response;
+    header.truncate(HEADER_LEN);
+    header[2] |= 0x02;
+    header[4..HEADER_LEN].fill(0);
+    header
 }
 
 fn in_zone(labels: &[&[u8]]) -> bool {
@@ -232,5 +268,48 @@ mod tests {
         assert_eq!(m.metadata.id, 9);
         assert_eq!(m.metadata.response_code, ResponseCode::FormErr);
         assert_eq!(answer(&[1, 2, 3], &ips()), Outcome::Drop);
+    }
+
+    #[test]
+    fn dns_unparseable_response_is_dropped() {
+        let broken = [0, 9, 0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xff];
+        assert_eq!(answer(&broken, &ips()), Outcome::Drop);
+    }
+
+    fn big_response(query: &[u8]) -> Vec<u8> {
+        let request = Message::from_vec(query).unwrap();
+        let mut m = Message::response(request.metadata.id, OpCode::Query);
+        m.queries.clone_from(&request.queries);
+        for i in 0..60u8 {
+            m.add_answer(Record::from_rdata(
+                request.queries[0].name().clone(),
+                60,
+                RData::A(A(Ipv4Addr::new(1, 1, 1, i))),
+            ));
+        }
+        m.to_vec().unwrap()
+    }
+
+    #[test]
+    fn dns_udp_reply_over_the_clients_size_is_truncated() {
+        let plain = query_packet("example.com.", RecordType::A);
+        let big = big_response(&plain);
+        assert!(big.len() > 512);
+        // No EDNS: cut to 512.
+        let cut = Message::from_vec(&fit_udp(&plain, big.clone())).unwrap();
+        assert!(cut.metadata.truncation);
+        assert!(cut.answers.is_empty());
+        assert_eq!(cut.queries.len(), 1);
+        assert_eq!(cut.metadata.id, 7);
+        // EDNS 4096: fits as is.
+        let mut edns = Message::from_vec(&plain).unwrap();
+        let mut e = Edns::new();
+        e.set_max_payload(4096);
+        edns.set_edns(e);
+        assert_eq!(fit_udp(&edns.to_vec().unwrap(), big.clone()), big);
+        // Garbage that is too big still goes out cut.
+        let cut = fit_udp(&plain, vec![0xaa; 600]);
+        assert_eq!(cut.len(), 12);
+        assert_eq!(cut[2] & 0x02, 0x02);
     }
 }
