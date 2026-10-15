@@ -306,7 +306,8 @@ teardown() {
   PATH="$TMP/bin:$PATH" run install_cni v1.9.1 amd64
   [ "$status" -eq 0 ]
   [[ "$output" == *"+ curl -fsSL --retry 3"*"cni-plugins-linux-amd64-v1.9.1.tgz"* ]]
-  [[ "$output" == *"+ tar -C $CNI_BIN_DIR -xzf"*" --no-same-owner"* ]]
+  [[ "$output" == *"+ tar -C $CNI_BIN_DIR -xzf"*" --no-same-owner --no-same-permissions"* ]]
+  [[ "$output" == *"+ chmod -R u-s\,g-ws\,o-w $CNI_BIN_DIR"* ]]
   [ ! -e "$TMP/curl-called" ]
   [ ! -e "$CNI_BIN_DIR" ]
 }
@@ -1629,29 +1630,6 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   ! ls "$TMP/etc/containerd" | grep -q faber-bak
   configure_containerd_root
   [ "$ROOT_CONFIG_CHANGED" = 0 ]
-}
-
-@test "configure_containerd_root: an upgrade hands the faber-owned conf dir and faber.toml to root" {
-  need_root_faber_account
-  mkdir -p "$CONTAINERD_CONF_DIR"
-  printf 'x\n' > "$CONTAINERD_CONF_DIR/faber.toml"
-  chown faber:faber "$CONTAINERD_CONF_DIR" "$CONTAINERD_CONF_DIR/faber.toml"
-  chmod 0664 "$CONTAINERD_CONF_DIR/faber.toml"
-  configure_containerd_root
-  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "root:root 755" ]
-  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR/faber.toml")" = "root:root 644" ]
-  [ "$(cat "$CONTAINERD_CONF_DIR/faber.toml")" = x ]
-}
-
-@test "configure_cni_conf_dir: an upgrade hands the faber-owned dir and conflist to root" {
-  need_root_faber_account
-  mkdir -p "$CNI_CONF_DIR"
-  printf 'x\n' > "$CNI_CONF_DIR/$CNI_CONFLIST"
-  chown faber:faber "$CNI_CONF_DIR" "$CNI_CONF_DIR/$CNI_CONFLIST"
-  chmod 0664 "$CNI_CONF_DIR/$CNI_CONFLIST"
-  configure_cni_conf_dir
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
-  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR/$CNI_CONFLIST")" = "root:root 644" ]
 }
 
 @test "configure_cni_conf_dir: fresh dir is root:root 0755 and stays empty" {
@@ -4720,6 +4698,119 @@ removed_node() {
   chmod 0666 "$CNI_BIN_DIR/.version"
   run check_cfg_paths
   [ "$status" -eq 1 ]
+}
+
+@test "check_cfg_paths: every entry of the bin dir must be root's and not group/world-writable, directories too" {
+  need_root_faber_account
+  mkdir -p "$CNI_BIN_DIR/sub"
+  chmod 0755 "$CNI_BIN_DIR/sub"
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
+  chmod 0775 "$CNI_BIN_DIR/sub"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CNI_BIN_DIR/sub must be owned by root and not group/world-writable"* ]]
+  chmod 0755 "$CNI_BIN_DIR/sub"
+  chown faber "$CNI_BIN_DIR/sub"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CNI_BIN_DIR/sub must be owned by root"* ]]
+}
+
+@test "check_cfg_paths: a file in the containerd conf dir that root does not own is refused by name" {
+  need_root_faber_account
+  mkdir -p "$CONTAINERD_CONF_DIR"
+  chown faber:faber "$CONTAINERD_CONF_DIR"
+  touch "$CONTAINERD_CONF_DIR/faber.toml" "$CONTAINERD_CONF_DIR/ok.toml" "$CONTAINERD_CONF_DIR/planted.toml" \
+    "$CONTAINERD_CONF_DIR/.hidden" "$CONTAINERD_CONF_DIR/link"
+  chown faber:faber "$CONTAINERD_CONF_DIR/faber.toml" "$CONTAINERD_CONF_DIR/planted.toml" "$CONTAINERD_CONF_DIR/.hidden"
+  chown -h faber:faber "$CONTAINERD_CONF_DIR/link"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$CONTAINERD_CONF_DIR"* ]]
+  [[ "$output" == *"planted.toml"* ]]
+  [[ "$output" == *".hidden"* ]]
+  [[ "$output" == *"link"* ]]
+  [[ "$output" != *"ok.toml"* ]]
+  [[ "$output" != *"faber.toml"* ]]
+  [[ "$output" == *"remove"* ]]
+  rm "$CONTAINERD_CONF_DIR/planted.toml" "$CONTAINERD_CONF_DIR/.hidden" "$CONTAINERD_CONF_DIR/link"
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
+}
+
+@test "check_cfg_paths: a CNI config that root does not own is refused by name, other files are not" {
+  need_root_faber_account
+  mkdir -p "$CNI_CONF_DIR"
+  touch "$CNI_CONF_DIR/10-faber.conflist" "$CNI_CONF_DIR/README" "$CNI_CONF_DIR/05-other.conf" \
+    "$CNI_CONF_DIR/.hid.json" "$CNI_CONF_DIR/90-x.conflist"
+  chown faber:faber "$CNI_CONF_DIR/10-faber.conflist" "$CNI_CONF_DIR/README" "$CNI_CONF_DIR/90-x.conflist"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"90-x.conflist"* ]]
+  [[ "$output" != *"README"* ]]
+  [[ "$output" != *"05-other.conf"* ]]
+  [[ "$output" == *"remove"* ]]
+  rm "$CNI_CONF_DIR/90-x.conflist"
+  chown faber:faber "$CNI_CONF_DIR/.hid.json"
+  run check_cfg_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *".hid.json"* ]]
+  rm "$CNI_CONF_DIR/.hid.json"
+  run check_cfg_paths
+  [ "$status" -eq 0 ]
+}
+
+@test "take_over_fabercp_files: stops fabercp, then replaces the faber-owned files with nothing" {
+  need_root_faber_account
+  make_stub_path
+  mkdir -p "$SYSTEMD_RUN_DIR" "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR"
+  printf 'x\n' > "$CONTAINERD_CONF_DIR/faber.toml"
+  printf 'x\n' > "$CNI_CONF_DIR/$CNI_CONFLIST"
+  chown faber:faber "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR" "$CONTAINERD_CONF_DIR/faber.toml" "$CNI_CONF_DIR/$CNI_CONFLIST"
+  PATH="$TMP/bin:$PATH" run take_over_fabercp_files
+  [ "$status" -eq 0 ]
+  [ "$(count_calls 'systemctl stop fabercp')" = 1 ]
+  [ ! -e "$CONTAINERD_CONF_DIR/faber.toml" ]
+  [ ! -e "$CNI_CONF_DIR/$CNI_CONFLIST" ]
+  [ "$(stat -c '%U:%G %a' "$CONTAINERD_CONF_DIR")" = "root:root 755" ]
+  [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
+}
+
+@test "take_over_fabercp_files: a file planted after preflight is refused, nothing is removed" {
+  need_root_faber_account
+  make_stub_path
+  mkdir -p "$SYSTEMD_RUN_DIR" "$CONTAINERD_CONF_DIR"
+  printf 'x\n' > "$CONTAINERD_CONF_DIR/faber.toml"
+  printf 'x\n' > "$CONTAINERD_CONF_DIR/evil.toml"
+  chown faber:faber "$CONTAINERD_CONF_DIR" "$CONTAINERD_CONF_DIR/faber.toml" "$CONTAINERD_CONF_DIR/evil.toml"
+  PATH="$TMP/bin:$PATH" run take_over_fabercp_files
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"evil.toml"* ]]
+  [ -e "$CONTAINERD_CONF_DIR/faber.toml" ]
+}
+
+@test "take_over_fabercp_files: root-owned files and missing directories change nothing" {
+  need_root_faber_account
+  make_stub_path
+  mkdir -p "$SYSTEMD_RUN_DIR" "$CONTAINERD_CONF_DIR"
+  printf 'x\n' > "$CONTAINERD_CONF_DIR/faber.toml"
+  PATH="$TMP/bin:$PATH" run take_over_fabercp_files
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/executed" ]
+  [ -e "$CONTAINERD_CONF_DIR/faber.toml" ]
+}
+
+@test "take_over_fabercp_files: dry-run plans the stop and the removals" {
+  need_root_faber_account
+  mkdir -p "$SYSTEMD_RUN_DIR" "$CNI_CONF_DIR"
+  printf 'x\n' > "$CNI_CONF_DIR/$CNI_CONFLIST"
+  chown faber:faber "$CNI_CONF_DIR/$CNI_CONFLIST"
+  DRY_RUN=1 run take_over_fabercp_files
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"+ systemctl stop fabercp"* ]]
+  [[ "$output" == *"+ rm -f -- $CNI_CONF_DIR/$CNI_CONFLIST"* ]]
+  [ -e "$CNI_CONF_DIR/$CNI_CONFLIST" ]
 }
 
 @test "check_cfg_paths: missing directories pass" {

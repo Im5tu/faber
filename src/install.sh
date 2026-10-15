@@ -975,7 +975,9 @@ install_cni() {
     verify_sha256 "$dir/$tgz" "$dir/$tgz.sha256" || die "checksum verification failed for $tgz"
   fi
   run_cmd install -d -m 0755 "$CNI_BIN_DIR"
-  run_cmd tar -C "$CNI_BIN_DIR" -xzf "$dir/$tgz" --no-same-owner
+  run_cmd tar -C "$CNI_BIN_DIR" -xzf "$dir/$tgz" --no-same-owner --no-same-permissions
+  # nothing extracted may be setuid, setgid or writable by group or others
+  run_cmd chmod -R u-s,g-ws,o-w "$CNI_BIN_DIR"
   if [[ "$DRY_RUN" == 1 ]]; then
     printf '+ echo %s > %s\n' "$ver" "$CNI_BIN_DIR/.version"
   else
@@ -1763,14 +1765,77 @@ is_managed_file() {
   [[ -f "$1" && ! -L "$1" ]] && grep -Fxq -- "$MANAGED_MARKER" "$1" 2>/dev/null
 }
 
-# hand_to_root FILE: an older install let the faber user own the files
-# faber-node now writes; make a regular FILE root:root 0644. A missing file is
-# left alone (faber-node creates it) and so is a symlink (faber-node replaces
-# it).
-hand_to_root() {
-  [[ -f "$1" && ! -L "$1" ]] || return 0
-  run_cmd chown root:root "$1"
-  run_cmd chmod 0644 "$1"
+# unowned_entries DIR [GLOB...]: names, one per line, of the entries of DIR
+# (dot files, symlinks and directories included) that root does not own and
+# that match one of the GLOBs (any name when none is given). A symlink counts
+# by its own owner.
+unowned_entries() {
+  local d="$1" f name g match
+  shift
+  [[ -d "$d" && ! -L "$d" ]] || return 0
+  for f in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    name="${f##*/}"
+    if (($# > 0)); then
+      match=0
+      for g in "$@"; do
+        # shellcheck disable=SC2254 # the glob is meant to be a pattern
+        case "$name" in $g) match=1 ;; esac
+      done
+      ((match == 1)) || continue
+    fi
+    [[ "$(stat -c '%u' "$f")" == 0 ]] || printf '%s\n' "$name"
+  done | LC_ALL=C sort
+}
+
+# check_leftover_config: an older install let the faber user write into the
+# containerd drop-in and CNI config directories. Whatever it left that root
+# does not own, other than the two files fabercp wrote ($CONTAINERD_DROPIN and
+# $CNI_CONFLIST, which take_over_fabercp_files removes), could be planted
+# config that faber-node would then trust, so the operator removes it. Only
+# checked as root.
+check_leftover_config() {
+  local left
+  [[ "$EUID" == 0 ]] || return 0
+  left="$(unowned_entries "$CONTAINERD_CONF_DIR" | grep -vxF "$CONTAINERD_DROPIN" || true)"
+  if [[ -n "$left" ]]; then
+    die "$CONTAINERD_CONF_DIR holds files that root does not own: $(quote_names <<<"$left"); check them, remove them and re-run (faber-node would load them as root)"
+  fi
+  left="$(unowned_entries "$CNI_CONF_DIR" '*.conf' '*.conflist' '*.json' | grep -vxF "$CNI_CONFLIST" || true)"
+  if [[ -n "$left" ]]; then
+    die "$CNI_CONF_DIR holds CNI configs that root does not own: $(quote_names <<<"$left"); check them, remove them and re-run (containerd would load them as root)"
+  fi
+}
+
+# take_over_fabercp_files: an older install ran fabercp as owner of the two
+# config directories and of $CONTAINERD_DROPIN and $CNI_CONFLIST. When any of
+# them is not root's, stop fabercp so nothing is written meanwhile, make the
+# directories root's, check for leftovers again (fabercp could have written
+# one since preflight), and remove the two files: faber-node writes fresh
+# root-owned copies. Nothing is chowned in place.
+take_over_fabercp_files() {
+  local f d need=0
+  local -a files=()
+  for d in "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR"; do
+    [[ -d "$d" && ! -L "$d" && "$(stat -c '%u' "$d")" != 0 ]] && need=1
+  done
+  for f in "$CONTAINERD_CONF_DIR/$CONTAINERD_DROPIN" "$CNI_CONF_DIR/$CNI_CONFLIST"; do
+    if [[ -f "$f" && ! -L "$f" && "$(stat -c '%u' "$f")" != 0 ]]; then
+      files+=("$f")
+      need=1
+    fi
+  done
+  ((need == 1)) || return 0
+  if systemd_present; then
+    run_cmd systemctl stop fabercp || die "could not stop fabercp; stop it and re-run"
+  else
+    warn "systemd not detected; stop fabercp yourself, it still owns files in $CONTAINERD_CONF_DIR and $CNI_CONF_DIR"
+  fi
+  for d in "$CONTAINERD_CONF_DIR" "$CNI_CONF_DIR"; do
+    [[ -d "$d" && ! -L "$d" ]] && run_cmd install -d -o root -g root -m 0755 "$d"
+  done
+  check_leftover_config
+  ((${#files[@]} == 0)) || run_cmd rm -f -- "${files[@]}"
 }
 
 # configure_containerd_root: containerd's root config only imports the
@@ -1781,7 +1846,6 @@ configure_containerd_root() {
   dir="$(dirname "$conf")"
   [[ -d "$dir" ]] || run_cmd install -d -m 0755 "$dir"
   run_cmd install -d -o root -g root -m 0755 "$CONTAINERD_CONF_DIR"
-  hand_to_root "$CONTAINERD_CONF_DIR/$CONTAINERD_DROPIN"
   if [[ -e "$conf" || -L "$conf" ]] && ! is_managed_file "$conf"; then
     bak="$conf.faber-bak.$(date +%s)"
     while [[ -e "$bak" || -L "$bak" ]]; do
@@ -1823,8 +1887,8 @@ quote_names() {
 
 # configure_cni_conf_dir: $CNI_CONF_DIR belongs to root, because faber-node
 # writes $CNI_CONFLIST there (preflight has already refused a symlink or
-# non-directory). Only $CNI_CONFLIST is touched, to hand an older install's
-# copy to root. containerd loads the lexically
+# non-directory; take_over_fabercp_files and preflight have dealt with files
+# root does not own). Nothing in it is touched. containerd loads the lexically
 # first config in the directory, so a config from someone else can win over
 # faber's: warn and name it.
 configure_cni_conf_dir() {
@@ -1832,7 +1896,6 @@ configure_cni_conf_dir() {
   parent="$(dirname "$CNI_CONF_DIR")"
   [[ -d "$parent" ]] || run_cmd install -d -m 0755 "$parent"
   run_cmd install -d -o root -g root -m 0755 "$CNI_CONF_DIR"
-  hand_to_root "$CNI_CONF_DIR/$CNI_CONFLIST"
   foreign="$(foreign_cni_configs)"
   if [[ -n "$foreign" ]]; then
     warn "$CNI_CONF_DIR holds CNI configs that faber did not write: $(quote_names <<<"$foreign")"
@@ -2285,18 +2348,23 @@ check_node_paths() {
 # refuses to start unless each of them and every directory above is root's
 # and not group/world-writable. The two config directories themselves are
 # made root's by configure_*, so an older install's faber-owned copy passes
-# here; only their parents are checked. A plugin file in the bin dir must pass
-# the same test (symlinks are followed, as faber-node does).
+# here; only their parents are checked. Files in them that root does not own
+# are refused (check_leftover_config), and every entry of the bin dir must
+# pass the same test as the directory (symlinks are followed, as faber-node
+# does).
 check_cfg_paths() {
   local f uid mode
   local why="faber-node refuses to start otherwise"
   check_root_only_path "$(dirname "$CONTAINERD_CONF_DIR")" CONTAINERD_CONF_DIR "$why"
   check_root_only_path "$(dirname "$CNI_CONF_DIR")" CNI_CONF_DIR "$why"
   check_root_only_path "$CNI_BIN_DIR" CNI_BIN_DIR "$why"
-  [[ "$EUID" == 0 && -d "$CNI_BIN_DIR" ]] || return 0
-  for f in "$CNI_BIN_DIR"/* "$CNI_BIN_DIR"/.[!.]*; do
-    [[ -f "$f" ]] || continue
-    read -r uid mode < <(stat -L -c '%u %a' "$f")
+  [[ "$EUID" == 0 ]] || return 0
+  check_leftover_config
+  [[ -d "$CNI_BIN_DIR" ]] || return 0
+  for f in "$CNI_BIN_DIR"/* "$CNI_BIN_DIR"/.[!.]* "$CNI_BIN_DIR"/..?*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    read -r uid mode < <(stat -L -c '%u %a' "$f") ||
+      die "CNI_BIN_DIR: cannot read $f (${why})"
     if [[ "$uid" != 0 ]] || (((8#$mode & 8#022) != 0)); then
       die "CNI_BIN_DIR: $f must be owned by root and not group/world-writable (${why})"
     fi
@@ -2715,6 +2783,7 @@ main() {
   done
 
   configure_faber_etc
+  take_over_fabercp_files
   configure_containerd_root
   configure_cni_conf_dir
   install_units
