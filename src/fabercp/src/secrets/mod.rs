@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use faber_api_types::workload::WorkloadSpec;
 use faber_crypto::{ClusterKey, CryptoError, DataKey, env_digest, open, seal};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::apps::{SealedEnv, StoredWorkload, WorkloadRecord};
 use crate::mesh::files::write_atomic;
@@ -239,6 +239,43 @@ pub fn seal_workload(
     Ok(StoredWorkload { spec: cleared, env })
 }
 
+/// Opens a sealed value as text. The decrypted bytes are wiped if they are
+/// not text; as text they are the caller's to wipe.
+fn open_text(
+    key: &DataKey,
+    sealed: &faber_crypto::Sealed,
+    aad: &[&str],
+) -> Result<String, CryptoError> {
+    let clear = open(key, sealed, aad)?;
+    String::from_utf8(clear).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        CryptoError::Malformed
+    })
+}
+
+/// The env of one container of `record`, opened. The values are plaintext:
+/// the caller wipes them (`faber_node_protocol::SecretEnv` does when it is
+/// dropped).
+pub fn reveal_env(
+    key: &DataKey,
+    project: &str,
+    environment: &str,
+    workload: &str,
+    record: &WorkloadRecord,
+    container: &str,
+) -> Result<BTreeMap<String, String>, CryptoError> {
+    let mut env = BTreeMap::new();
+    let Some(sealed) = record.env.get(container) else {
+        return Ok(env);
+    };
+    for (var, value) in &sealed.values {
+        let aad = [project, environment, workload, container, var];
+        env.insert(var.clone(), open_text(key, value, &aad)?);
+    }
+    Ok(env)
+}
+
 /// The spec of `record` with every env value opened.
 pub fn reveal_workload(
     key: &DataKey,
@@ -254,9 +291,9 @@ pub fn reveal_workload(
         };
         for (var, value) in &sealed.values {
             let aad = [project, environment, name, &container.name, var];
-            let clear = open(key, value, &aad)?;
-            let clear = String::from_utf8(clear).map_err(|_| CryptoError::Malformed)?;
-            container.env.insert(var.clone(), clear);
+            container
+                .env
+                .insert(var.clone(), open_text(key, value, &aad)?);
         }
     }
     Ok(spec)
