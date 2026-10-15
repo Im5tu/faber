@@ -10,6 +10,7 @@
 //! the loop backs off.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ReconcileTiming, next_invite_expiry, run_loop};
 use crate::mesh::state::MeshState;
+use crate::raft::store::keys::DataKeyRecord;
 use crate::raft::store::{PlacementView, ReadError, StateReader};
 
 /// The future of [`ReconcileStep::apply`].
@@ -41,6 +43,9 @@ pub struct ReplicatedStateView {
     /// Seconds between two status reports, as the staleness of a report is
     /// judged ([`crate::raft::store::status::IntervalSetting::effective`]).
     pub status_interval_secs: u64,
+    /// The data key of every environment that has a plan, by scope
+    /// (`<project>/<environment>`).
+    pub data_keys: BTreeMap<String, DataKeyRecord>,
     /// Unix seconds when the view was read.
     pub now: u64,
 }
@@ -50,11 +55,19 @@ impl ReplicatedStateView {
     pub fn read(reader: &StateReader, now: u64) -> Result<Self, ReadError> {
         let placement = reader.placement_view()?;
         let clock = placement.mesh.as_ref().map_or(0, |m| m.clock);
+        let mut data_keys = BTreeMap::new();
+        for (project, environment) in placement.records.keys() {
+            let scope = crate::secrets::env_scope(project, environment);
+            if let Some(key) = reader.data_key(&scope)? {
+                data_keys.insert(scope, key);
+            }
+        }
         Ok(Self {
             mesh: reader.mesh()?,
             containerd: reader.containerd()?,
             status_interval_secs: reader.status_setting()?.effective(clock),
             placement: Some(placement),
+            data_keys,
             now,
         })
     }
@@ -80,6 +93,13 @@ pub trait ReconcileStep: Send + Sync + 'static {
 
     /// Used in logs.
     fn name(&self) -> &'static str;
+
+    /// Whether startup stops when this step fails. A step that waits on
+    /// something that may come up later (a helper process) says `false`: the
+    /// reconcile loop applies it again on its first pass.
+    fn required_at_startup(&self) -> bool {
+        true
+    }
 
     /// The desired value for `view`. Pure: nothing is applied.
     fn plan(&self, view: &ReplicatedStateView) -> Planned<Self::Desired>;
@@ -150,6 +170,7 @@ impl Debug for StepValue {
 /// [`ReconcileStep`] with the desired type erased.
 trait ErasedStep: Send + Sync {
     fn name(&self) -> &'static str;
+    fn required_at_startup(&self) -> bool;
     fn plan(&self, view: &ReplicatedStateView) -> (StepValue, Vec<String>);
     fn apply<'a>(&'a self, desired: &'a StepValue) -> StepFuture<'a>;
 }
@@ -159,6 +180,10 @@ struct Typed<S>(S);
 impl<S: ReconcileStep> ErasedStep for Typed<S> {
     fn name(&self) -> &'static str {
         self.0.name()
+    }
+
+    fn required_at_startup(&self) -> bool {
+        self.0.required_at_startup()
     }
 
     fn plan(&self, view: &ReplicatedStateView) -> (StepValue, Vec<String>) {
@@ -265,14 +290,25 @@ impl StepRunner {
     /// Applies `desired` in step order and stops at the first failure. For
     /// startup, where nothing works without the earlier steps. Steps that
     /// succeeded are remembered as applied.
-    pub async fn bring_up(&self, desired: &[StepValue]) -> anyhow::Result<()> {
+    ///
+    /// A step that is not [`ReconcileStep::required_at_startup`] is left
+    /// alone: it may wait on something that comes up later, or take minutes.
+    /// The steps after it still run. The result is the indices of the steps
+    /// left alone; the loop must not take their values as applied, so that
+    /// its first pass applies them.
+    pub async fn bring_up(&self, desired: &[StepValue]) -> anyhow::Result<Vec<usize>> {
         debug_assert_eq!(desired.len(), self.steps.0.len());
+        let mut left = Vec::new();
         for (index, (step, value)) in self.steps.0.iter().zip(desired).enumerate() {
+            if !step.required_at_startup() {
+                left.push(index);
+                continue;
+            }
             self.begin(index, value, true);
             step.apply(value).await?;
             self.succeeded(index, value);
         }
-        Ok(())
+        Ok(left)
     }
 
     /// Applies `desired` in step order. A step runs when its value differs
@@ -464,6 +500,7 @@ mod tests {
             status_interval_secs: 5,
             mesh: None,
             containerd: None,
+            data_keys: BTreeMap::new(),
             now: 0,
         }
     }
@@ -546,6 +583,49 @@ mod tests {
         rig.take_log();
         rig.runner.apply(&desired, false).await.unwrap();
         assert!(rig.take_log().is_empty());
+    }
+
+    /// A step that startup leaves to the loop.
+    struct Late(Arc<AtomicU32>);
+
+    impl ReconcileStep for Late {
+        type Desired = u32;
+
+        fn name(&self) -> &'static str {
+            "late"
+        }
+
+        fn required_at_startup(&self) -> bool {
+            false
+        }
+
+        fn plan(&self, _view: &ReplicatedStateView) -> Planned<u32> {
+            Planned {
+                desired: 1,
+                warnings: vec![],
+            }
+        }
+
+        fn apply<'a>(&'a self, _desired: &'a u32) -> StepFuture<'a> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn bring_up_leaves_a_late_step_to_the_loop() {
+        let applies = Arc::new(AtomicU32::new(0));
+        let runner = StepRunner::new(StepList::default().with(Late(applies.clone())));
+        let desired = runner.plan(&view()).desired;
+        assert_eq!(runner.bring_up(&desired).await.unwrap(), [0]);
+        assert_eq!(
+            applies.load(Ordering::SeqCst),
+            0,
+            "startup did not apply it"
+        );
+        // The loop's first pass does, without being forced.
+        runner.apply(&desired, false).await.unwrap();
+        assert_eq!(applies.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

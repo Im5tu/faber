@@ -639,6 +639,7 @@ mod tests {
                     .view,
             ),
             status_interval_secs: INTERVAL,
+            data_keys: Default::default(),
             now: 0,
         };
         let planned = step.plan(&view);

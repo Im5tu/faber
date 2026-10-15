@@ -458,6 +458,8 @@ pub struct HostReconciler {
     /// though the node is on time ([`LeaseTiming::tick_clock_secs`]).
     pub lease_timing: LeaseTiming,
     pub reader: StateReader,
+    /// What the containers step and the supervisor share.
+    pub containers: containers::ContainersWiring,
 }
 
 impl HostReconciler {
@@ -1170,6 +1172,7 @@ mod tests {
             cni_conf_dir: PathBuf::from("/etc/cni/net.d"),
             lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
+            containers: wiring(),
         };
         let keys = |host: &HostReconciler| -> Vec<String> {
             let plan = plan_of(host);
@@ -1858,6 +1861,7 @@ mod tests {
             cni_conf_dir: PathBuf::from(cni_conf_dir),
             lease_timing: LeaseTiming::default(),
             reader: storage.reader.clone(),
+            containers: wiring(),
         };
         let (replicated, elsewhere) = (host("/etc/cni/net.d"), host("/var/tmp/cni"));
 
@@ -2279,6 +2283,15 @@ mod tests {
     }
 
     /// The fake network runner with containerd's drop-in written to `dir`.
+    fn wiring() -> containers::ContainersWiring {
+        containers::ContainersWiring {
+            socket: PathBuf::from("/nonexistent/node.sock"),
+            state: Arc::default(),
+            cluster_key: Arc::new(crate::secrets::NoClusterKey),
+            env: crate::runner::env::StaticEnv::secret(),
+        }
+    }
+
     fn backends(runner: &Arc<RecordingRunner>, dir: &std::path::Path) -> HostBackends {
         HostBackends {
             network: NetworkManager::new(runner.clone()),

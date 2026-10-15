@@ -18,6 +18,7 @@ use crate::raft::types::NodeId;
 pub use crate::mesh::state::{
     DEFAULT_CONTAINER_CIDR, DEFAULT_MESH_CIDR, DEFAULT_SERVICE_CIDR, DEFAULT_WG_PORT,
 };
+pub use crate::runner::DEFAULT_NODE_SOCKET;
 pub use faber_api_types::DEFAULT_PEER_PORT;
 
 /// Hosts the MCP endpoint always accepts in the `Host` header. Guards against
@@ -198,6 +199,10 @@ pub struct Config {
     #[arg(long, env = "FABER_CNI_CONF_DIR", default_value = DEFAULT_CNI_CONF_DIR)]
     pub cni_conf_dir: PathBuf,
 
+    /// Unix socket of faber-node, the root helper that runs the containers.
+    #[arg(long, env = "FABER_NODE_SOCKET", default_value = DEFAULT_NODE_SOCKET)]
+    pub node_socket: PathBuf,
+
     /// Seconds between full host re-applies (WireGuard, nftables,
     /// containerd), on top of the applies triggered by state changes. At
     /// least 1.
@@ -244,6 +249,7 @@ impl Config {
             manage_host: false,
             containerd_conf_dir: PathBuf::from(DEFAULT_CONTAINERD_CONF_DIR),
             cni_conf_dir: PathBuf::from(DEFAULT_CNI_CONF_DIR),
+            node_socket: PathBuf::from(DEFAULT_NODE_SOCKET),
             reconcile_interval_secs: DEFAULT_RECONCILE_INTERVAL_SECS,
             lease_timing: LeaseTiming::default(),
         }

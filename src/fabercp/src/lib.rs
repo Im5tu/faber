@@ -72,6 +72,7 @@ use crate::raft::rpc::{RaftGate, SourceCheck};
 use crate::raft::store::StateReader;
 use crate::raft::types::{Node, NodeId, Raft};
 use crate::raft::{rpc, store};
+use crate::reconcile::containers::ContainersStep;
 use crate::reconcile::services::ServicesStep;
 use crate::reconcile::step::{StepList, StepRunner, StepValue};
 use crate::reconcile::{HostReconciler, NetworkStep, ReconcileTiming, RuntimeStep};
@@ -415,6 +416,8 @@ pub async fn start_with(
     // when this node sees itself as a voter.
     let joining = identity.as_ref().is_some_and(|i| i.pending_join.is_some());
     let join_pending = JoinPending::new(joining);
+    let cluster_key: Arc<dyn secrets::ClusterKeyProvider> =
+        Arc::new(secrets::FileClusterKey::new(config.cluster_key_path()));
     let host = backends
         .zip(identity.clone())
         .map(|(backends, identity)| HostReconciler {
@@ -426,6 +429,15 @@ pub async fn start_with(
             cni_conf_dir: config.cni_conf_dir.clone(),
             lease_timing: config.lease_timing,
             reader: reader.clone(),
+            containers: reconcile::containers::ContainersWiring {
+                socket: config.node_socket.clone(),
+                state: Arc::default(),
+                cluster_key: cluster_key.clone(),
+                env: Arc::new(runner::StateEnvSource::new(
+                    reader.clone(),
+                    cluster_key.clone(),
+                )),
+            },
         });
     let started = match &host {
         Some(host) => Some(bring_up_host(host).await?),
@@ -539,10 +551,29 @@ pub async fn start_with(
     ];
 
     let mut tasks = Vec::new();
+    // What the status reporter reports: the replicas the runner runs, or none
+    // on a node that does not manage its host.
+    let replicas: Arc<dyn status::ReplicaSource> = match &host {
+        Some(host) => host.containers.state.clone(),
+        None => Arc::new(status::NoReplicas),
+    };
+    let prober = runner::NetProber::new().context("building the probe client")?;
     // The host loop has a stop of its own: a rejected invite ends it while
-    // the rest of the node stays up. `host` implies `identity`.
+    // the rest of the node stays up. `host` implies `identity`. The
+    // supervisor stops with it.
     let host = host.zip(started).map(|(host, (runner, applied))| {
         let stop = cancel.child_token();
+        tasks.push(
+            runner::Supervisor::new(
+                runner::SocketNodeClient::new(host.containers.socket.clone()),
+                runner::MonotonicClock::new(),
+                prober,
+                host.containers.env.clone(),
+                host.containers.state.clone(),
+                runner::SupervisorConfig::default(),
+            )
+            .spawn(stop.clone()),
+        );
         HostControl {
             network: host.backends.network.clone(),
             runtime: host.backends.runtime.clone(),
@@ -587,6 +618,7 @@ pub async fn start_with(
                 data_dir: config.data_dir.clone(),
                 wg_endpoint,
                 reader: reader.clone(),
+                replicas,
                 gate: raft_gate,
                 lease_second: config.lease_timing.second,
                 left_mesh: left_mesh.clone(),
@@ -829,7 +861,7 @@ async fn stored_member(data_dir: &Path, node_id: u64) -> anyhow::Result<bool> {
 }
 
 /// The host reconcile steps, in the order they run: network, runtime
-/// configuration, then services. Later steps are added here.
+/// configuration, services, then containers. Later steps are added here.
 pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
     StepRunner::new(
         StepList::default()
@@ -848,6 +880,13 @@ pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
             .with(ServicesStep::new(
                 host.backends.network.clone(),
                 host.lease_timing,
+            ))
+            .with(ContainersStep::new(
+                runner::SocketNodeClient::new(host.containers.socket.clone()),
+                host.containers.state.clone(),
+                host.identity.node_id,
+                host.containers.cluster_key.clone(),
+                host.containers.env.clone(),
             )),
     )
 }
@@ -864,8 +903,15 @@ async fn bring_up_host(host: &HostReconciler) -> anyhow::Result<(StepRunner, Vec
     for w in &plan.warnings {
         tracing::warn!("{w}");
     }
-    runner.bring_up(&plan.desired).await?;
-    Ok((runner, plan.desired))
+    // A step that startup may leave undone (the containers step, while
+    // faber-node is not up yet) is seeded with a value that differs from its
+    // plan, so that the loop's first pass applies it and only it.
+    let failed = runner.bring_up(&plan.desired).await?;
+    let mut seed = plan.desired;
+    for index in failed {
+        seed[index] = StepValue::new(());
+    }
+    Ok((runner, seed))
 }
 
 /// Creates `--state-dir` if it is missing (mode 0700 on unix). Under systemd
@@ -943,6 +989,8 @@ struct MeshMembership {
     data_dir: PathBuf,
     wg_endpoint: Option<SocketAddr>,
     reader: StateReader,
+    /// What this node's runner runs, for the status reports.
+    replicas: Arc<dyn status::ReplicaSource>,
     /// Opened once the mesh has accepted this node's registration, closed
     /// again when the invite is rejected or the mesh removes the node.
     gate: RaftGate,
@@ -1099,14 +1147,13 @@ async fn mesh_membership(ctx: MeshMembership, mut identity: Identity, host: Opti
             end
         };
         // Reports this node's status every interval, which an admin sets for
-        // the cluster, in lease seconds. It has no runner to ask yet, so it
-        // reports no replicas.
+        // the cluster, in lease seconds.
         let status = async {
             let service = ctx.service.clone();
             let reporter = status::Reporter::new(
                 move || service.report_identity(),
                 ctx.service.clone(),
-                Arc::new(status::NoReplicas),
+                ctx.replicas.clone(),
                 status::system_probe(ctx.data_dir.clone()),
             );
             let interval = || {
