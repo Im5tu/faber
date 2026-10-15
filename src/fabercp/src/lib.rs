@@ -75,6 +75,7 @@ use crate::raft::{rpc, store};
 use crate::reconcile::step::{StepList, StepRunner, StepValue};
 use crate::reconcile::{HostReconciler, NetworkStep, ReconcileTiming, RuntimeStep};
 use crate::secrets::KeyDeliveryError;
+use crate::secrets::delivery::{KeyStep, key_step};
 use crate::service::{MeshLocal, now_secs};
 
 /// How long shutdown waits for in-flight HTTP requests and for storage to close.
@@ -166,6 +167,7 @@ impl NodeHandle {
     /// What made this node take itself out of the mesh, once it has; `None`
     /// while it is a member or still joining. One of:
     /// - `invite_rejected`: the mesh refused the invite during the join;
+    /// - `key_unavailable`: the cluster never sent its cluster key;
     /// - `key_mismatch`: the cluster key the cluster sent is not the one
     ///   raft records;
     /// - `join_refused`: the mesh had removed the node before it finished
@@ -356,12 +358,14 @@ pub async fn start_with(
         if let Some(reason) = left_for_good(&config)? {
             // What is left of the old identity goes, as at any other start.
             identity::discard_failed_join(&config.state_dir, &config.data_dir)?;
+            secrets::remove_cluster_key_file(&config.cluster_key_path());
             return Err(anyhow::Error::new(LeftMesh { reason }));
         }
         if let Some(backends) = &backends {
             claim_interface(&backends.network, &config.state_dir, config.wg_iface()).await?;
         }
         if identity::discard_failed_join(&config.state_dir, &config.data_dir)? {
+            secrets::remove_cluster_key_file(&config.cluster_key_path());
             tracing::warn!(
                 "removed the identity and raft data of an earlier join whose invite was rejected"
             );
@@ -565,6 +569,7 @@ pub async fn start_with(
             MeshMembership {
                 service: service.clone(),
                 state_dir: config.state_dir.clone(),
+                cluster_key_file: config.cluster_key_path(),
                 data_dir: config.data_dir.clone(),
                 wg_endpoint,
                 reader: reader.clone(),
@@ -765,6 +770,7 @@ async fn replace_superseded_join(config: &Config) -> anyhow::Result<Superseded> 
     }
     identity::mark_join_failed(&config.state_dir)?;
     identity::discard_failed_join(&config.state_dir, &config.data_dir)?;
+    secrets::remove_cluster_key_file(&config.cluster_key_path());
     tracing::warn!(
         node_id = existing.node_id,
         "the join token is for another invite than the pending join, which never completed: \
@@ -912,6 +918,8 @@ async fn claim_interface(
 struct MeshMembership {
     service: FaberService,
     state_dir: PathBuf,
+    /// The cluster key file, removed with the identity.
+    cluster_key_file: PathBuf,
     /// Where the raft data is: the file system whose free space this node
     /// reports as its disk capacity.
     data_dir: PathBuf,
@@ -1050,6 +1058,7 @@ async fn mesh_membership(ctx: MeshMembership, mut identity: Identity, host: Opti
                 let because = match reason {
                     BootstrapError::NodeRemoved => "join_refused",
                     BootstrapError::KeyMismatch => "key_mismatch",
+                    BootstrapError::KeyUnavailable => "key_unavailable",
                     _ => "invite_rejected",
                 };
                 leave_mesh(ctx, host, reason, because).await;
@@ -1129,7 +1138,7 @@ async fn leave_mesh(
     if let Some(host) = host {
         host.teardown(&ctx.state_dir).await;
     }
-    discard_identity(ctx.state_dir, reason).await;
+    discard_identity(ctx.state_dir, ctx.cluster_key_file, reason).await;
 }
 
 /// Why [`hold_lease`] stopped renewing.
@@ -1519,6 +1528,7 @@ async fn finish_join(ctx: &MeshMembership, identity: &mut Identity) -> JoinOutco
     let (service, cancel) = (&ctx.service, &ctx.cancel);
     let instance_id = identity.instance_id.clone().unwrap_or_default();
     let mut registered = pending.registered;
+    let mut keyless = 0u32;
     // A node that is already in the membership has raft state worth keeping,
     // so its join is not given up on for an `invite_*` answer. When the
     // mesh has removed the node, whatever membership its own log still
@@ -1572,6 +1582,30 @@ async fn finish_join(ctx: &MeshMembership, identity: &mut Identity) -> JoinOutco
                 };
                 match attempt {
                     Ok(delivered) => {
+                        // A cluster that checks sources must send the key. A
+                        // registration without one is not recorded: it is
+                        // repeated, and given up on after a few tries.
+                        match key_step(service.checks_peer_source(), &delivered, &mut keyless) {
+                            KeyStep::Proceed => {}
+                            KeyStep::Retry => {
+                                tracing::warn!(
+                                    via = %addr,
+                                    "the cluster sent no cluster key; registering again"
+                                );
+                                continue;
+                            }
+                            KeyStep::GiveUp => {
+                                tracing::error!(
+                                    via = %addr,
+                                    "the cluster never sent its cluster key, so this node will \
+                                     not join. Its identity is being discarded and its WireGuard \
+                                     interface removed. Put the cluster key file on a mesh node, \
+                                     create a new invite (`faber mesh invite`) and run \
+                                     `install.sh --join <token>` here."
+                                );
+                                return JoinOutcome::Rejected(BootstrapError::KeyUnavailable);
+                            }
+                        }
                         // The key is on disk before this node can become a
                         // voter, and before the registration is recorded.
                         match service.accept_cluster_key(&delivered).await {
@@ -1658,12 +1692,16 @@ async fn finish_join(ctx: &MeshMembership, identity: &mut Identity) -> JoinOutco
 /// reason is on disk before the identity goes, so whoever sees a node without
 /// an identity can read why. The raft data directory is cleared at the next
 /// start ([`identity::discard_failed_join`]), because the database is open
-/// until this process stops.
-async fn discard_identity(state_dir: PathBuf, reason: BootstrapError) {
+/// until this process stops. The cluster key file is removed too.
+async fn discard_identity(state_dir: PathBuf, key_file: PathBuf, reason: BootstrapError) {
     let file = identity::path(&state_dir);
     let result = tokio::task::spawn_blocking(move || {
         note_bootstrap_error(&state_dir, reason);
-        identity::mark_join_failed(&state_dir)
+        let discarded = identity::mark_join_failed(&state_dir);
+        // The cluster key goes with the identity, so it does not linger on a
+        // node that is no longer in the cluster.
+        secrets::remove_cluster_key_file(&key_file);
+        discarded
     })
     .await;
     match result {
@@ -2696,6 +2734,30 @@ mod tests {
                 .is_some_and(|e| e.contains("not bootstrapped")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn discarding_the_identity_removes_the_cluster_key() {
+        use crate::secrets::ClusterKeyProvider as _;
+
+        for reason in [
+            BootstrapError::NodeRemoved,
+            BootstrapError::InviteRejected,
+            BootstrapError::KeyMismatch,
+            BootstrapError::KeyUnavailable,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path().to_path_buf();
+            let key_file = state_dir.join("cluster.key");
+            secrets::FileClusterKey::new(&key_file)
+                .create_if_missing()
+                .unwrap();
+            assert!(key_file.exists());
+
+            discard_identity(state_dir.clone(), key_file.clone(), reason).await;
+            assert!(!key_file.exists(), "{reason:?}");
+            assert_eq!(mesh::bootstrap::read(&state_dir).unwrap(), Some(reason));
+        }
     }
 
     /// What `leave_mesh` leaves behind: no identity, the `join-failed`

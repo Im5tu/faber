@@ -21,6 +21,10 @@ pub const TOKEN_VERSION: u32 = 1;
 pub const MAX_TOKEN_LEN: usize = 64 * 1024;
 
 /// Everything a new node needs to bring up faber0 and join.
+///
+/// A bearer secret: it holds the node's WireGuard private key, and whoever
+/// holds it can register the invite, join, and receive the cluster key. It
+/// works once and only until it expires. Treat it like a password.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteToken {
     /// Format version, [`TOKEN_VERSION`].

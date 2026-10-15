@@ -2603,6 +2603,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_leader_retries_the_key_id_when_the_key_file_appears_later() {
+        // Raft is initialised with no id recorded and no key file to take
+        // one from. The timer picks the file up once it is there.
+        let node = TestNode::start().await;
+        std::fs::remove_file(node.dir().join("cluster.key")).unwrap();
+        let members = BTreeMap::from([(1, Node::new(node.peer_addr.to_string()))]);
+        node.service.raft().initialize(members).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(node.state().cluster_key_id().unwrap(), None);
+
+        use crate::secrets::ClusterKeyProvider as _;
+        crate::secrets::FileClusterKey::new(node.dir().join("cluster.key"))
+            .store(&crate::testing::test_cluster_key())
+            .unwrap();
+        let want = faber_crypto::key_id(&crate::testing::test_cluster_key());
+        let mut recorded = None;
+        for _ in 0..300 {
+            recorded = node.state().cluster_key_id().unwrap();
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(recorded.map(|r| r.key_id), Some(want));
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_answer_has_no_key_until_the_leader_has_its_file() {
+        use crate::secrets::ClusterKeyProvider as _;
+
+        let node = TestNode::start_initialized().await;
+        let invite_id = invited(&node).await;
+        let invitee = node.service.read_mesh().unwrap().unwrap().invites[&invite_id].mesh_ip;
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::secrets::FileClusterKey::new(dir.path().join("cluster.key"));
+        let leader = strict_mesh_service_at(&node, "10.99.0.1", &[], &JoinPending::new(false))
+            .with_cluster_keys(Arc::new(file.clone()));
+        let register = || {
+            leader.peer_register_for(
+                register_req(&invite_id, MACHINE),
+                false,
+                source(&invitee.to_string()),
+            )
+        };
+
+        // No key file: the answer is empty, and a joiner that needs the key
+        // registers again.
+        for _ in 0..2 {
+            assert_eq!(register().await.unwrap(), PeerRegisterResponse::default());
+        }
+        file.store(&crate::testing::test_cluster_key()).unwrap();
+        let got = register().await.unwrap();
+        assert!(got.cluster_key.is_some());
+        node.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_join_token_never_holds_the_cluster_key() {
         let node = TestNode::start_initialized().await;
         seed_mesh(&node).await;

@@ -22,6 +22,37 @@ use crate::service::{FaberService, ServiceError, ServiceResult};
 /// own copy of the mesh.
 const REGISTRATION_WAIT: Duration = Duration::from_secs(5);
 const REGISTRATION_POLL: Duration = Duration::from_millis(50);
+/// How often a leader without a recorded key id tries again.
+const KEY_ID_RETRY: Duration = Duration::from_secs(5);
+
+/// What a joiner does with the answer to its registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStep {
+    /// Store the key if there is one and record the registration.
+    Proceed,
+    /// The cluster sent no key although this node needs one: register again.
+    Retry,
+    /// Too many answers without a key.
+    GiveUp,
+}
+
+/// Registrations a joiner repeats while the answer has no key.
+pub const KEYLESS_ATTEMPTS: u32 = 10;
+
+/// Decides what to do with a registration answer. `required` is whether
+/// this node's cluster checks sources, so that the answer should carry the
+/// key; `keyless` counts the answers without one so far.
+pub fn key_step(required: bool, answer: &PeerRegisterResponse, keyless: &mut u32) -> KeyStep {
+    if !required || answer.cluster_key.is_some() {
+        return KeyStep::Proceed;
+    }
+    *keyless += 1;
+    if *keyless >= KEYLESS_ATTEMPTS {
+        KeyStep::GiveUp
+    } else {
+        KeyStep::Retry
+    }
+}
 
 /// Why a delivered cluster key was not stored.
 #[derive(Debug, thiserror::Error)]
@@ -213,25 +244,26 @@ impl FaberService {
     }
 
     /// Records the id of this node's cluster key in raft when raft has none.
-    /// Nothing happens when raft has an id, or this node has no usable key
-    /// file. For the leader only.
-    pub(crate) async fn record_missing_key_id(&self) -> ServiceResult<()> {
+    /// `Ok(true)` when raft has an id afterwards, `Ok(false)` when it has
+    /// none and this node has no usable key file to take one from. For the
+    /// leader only.
+    pub(crate) async fn record_missing_key_id(&self) -> ServiceResult<bool> {
         if self.recorded_key_id()?.is_some() {
-            return Ok(());
+            return Ok(true);
         }
         let provider = self.cluster_keys().clone();
         let read = tokio::task::spawn_blocking(move || provider.cluster_key())
             .await
             .map_err(|e| ServiceError::Internal(format!("reading the cluster key: {e}")))?;
         let Ok(key) = read else {
-            return Ok(());
+            return Ok(false);
         };
         let record = SetClusterKeyId {
             key_id: key_id(&key),
         };
         self.propose(Request::SetClusterKeyId(record))
             .await
-            .map(drop)
+            .map(|_| true)
     }
 
     /// Starts a task that, while this node leads an initialised cluster
@@ -256,18 +288,66 @@ impl FaberService {
                     done = false;
                 } else if !done {
                     match svc.record_missing_key_id().await {
-                        Ok(()) => done = true,
+                        Ok(recorded) => done = recorded,
                         Err(e) => tracing::warn!(
                             error = %e,
                             "could not record the cluster key id; will retry"
                         ),
                     }
                 }
+                // Until the id is recorded a timer retries, so a key file
+                // that appears later or a failed proposal needs no further
+                // change of the raft metrics.
+                let retrying = leads && !done;
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     changed = metrics.changed() => if changed.is_err() { return },
+                    _ = tokio::time::sleep(KEY_ID_RETRY), if retrying => {}
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_key() -> PeerRegisterResponse {
+        PeerRegisterResponse {
+            cluster_key: Some(WireKey::new(
+                faber_crypto::ClusterKey::from_bytes([3; faber_crypto::KEY_LEN]).to_base64(),
+            )),
+            key_id: None,
+        }
+    }
+
+    #[test]
+    fn a_keyless_answer_is_retried_a_bounded_number_of_times() {
+        let none = PeerRegisterResponse::default();
+        let mut keyless = 0;
+        for _ in 1..KEYLESS_ATTEMPTS {
+            assert_eq!(key_step(true, &none, &mut keyless), KeyStep::Retry);
+        }
+        assert_eq!(key_step(true, &none, &mut keyless), KeyStep::GiveUp);
+    }
+
+    #[test]
+    fn the_registration_is_recorded_only_once_a_key_came() {
+        let none = PeerRegisterResponse::default();
+        let mut keyless = 0;
+        assert_eq!(key_step(true, &none, &mut keyless), KeyStep::Retry);
+        assert_eq!(key_step(true, &none, &mut keyless), KeyStep::Retry);
+        assert_eq!(key_step(true, &with_key(), &mut keyless), KeyStep::Proceed);
+    }
+
+    #[test]
+    fn a_node_that_cannot_be_told_apart_needs_no_key() {
+        let mut keyless = 0;
+        assert_eq!(
+            key_step(false, &PeerRegisterResponse::default(), &mut keyless),
+            KeyStep::Proceed
+        );
+        assert_eq!(keyless, 0);
     }
 }

@@ -153,6 +153,25 @@ impl ClusterKeyProvider for FileClusterKey {
     }
 }
 
+/// Removes the cluster key file of a node that no longer belongs to the
+/// cluster, so that the key does not linger. A missing file is fine; a
+/// failure is logged and not returned, because the caller is already giving
+/// up the node's identity.
+pub fn remove_cluster_key_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::info!(
+            key_file = %path.display(),
+            "removed the cluster key of a node that left the cluster"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::error!(
+            key_file = %path.display(),
+            error = %e,
+            "could not remove the cluster key file; remove it by hand"
+        ),
+    }
+}
+
 /// A key held in memory, for tests.
 #[derive(Debug, Clone)]
 pub struct StaticClusterKey(pub ClusterKey);
@@ -382,6 +401,16 @@ mod tests {
         }
         #[cfg(not(unix))]
         let _ = path;
+    }
+
+    #[test]
+    fn a_key_file_can_be_removed_and_a_missing_one_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        FileClusterKey::new(&path).create_if_missing().unwrap();
+        remove_cluster_key_file(&path);
+        assert!(!path.exists());
+        remove_cluster_key_file(&path);
     }
 
     #[test]

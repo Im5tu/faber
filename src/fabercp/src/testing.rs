@@ -68,6 +68,11 @@ impl TestNode {
         node
     }
 
+    /// The directory that holds the node's data and its `cluster.key`.
+    pub fn dir(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+
     /// A reader over the node's replicated state.
     pub fn state(&self) -> StateReader {
         self.handle.state().clone()
