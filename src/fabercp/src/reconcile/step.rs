@@ -377,10 +377,23 @@ mod tests {
                 .unwrap()
                 .push(format!("{}={desired}", self.name));
             self.stamps.lock().unwrap().push(Instant::now());
-            let failing = self
-                .fail
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
+            // Decrement if above zero. A compare_exchange loop, because
+            // `fetch_update` is deprecated on newer toolchains and its
+            // replacement `try_update` is missing on older ones.
+            let mut failing = false;
+            let mut seen = self.fail.load(Ordering::SeqCst);
+            while seen > 0 {
+                match self
+                    .fail
+                    .compare_exchange(seen, seen - 1, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => {
+                        failing = true;
+                        break;
+                    }
+                    Err(now) => seen = now,
+                }
+            }
             Box::pin(async move {
                 if failing {
                     anyhow::bail!("{} failed", self.name);
