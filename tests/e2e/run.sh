@@ -23,8 +23,9 @@
 #      bridge takes nothing from the Docker network, a forged source address
 #      or IPv6 (the test gives the nodes IPv6 addresses for that check)
 #   J  projects through the CLI on A and B, deploys to unknown projects
-#      and environments, and the records after a restart of fabercp. No
-#      workload is deployed here
+#      and environments, spec deploys of workloads with zero replicas (so
+#      the phase checks records and nothing runs), refused removals while a
+#      workload is left, and the records after a restart of fabercp
 #   C  install.sh re-run changes nothing
 #   D  restart and stop of fabercp
 #   E  hardening of the service and the files
@@ -1043,7 +1044,7 @@ j_gen() { dx "$1" "faber project show shop | awk -v e=$2 '\$1 == e { print \$3 }
 
 phase_j() {
   local out rc gen n before
-  section "J: projects, deploys to unknown targets and the records after a restart"
+  section "J: projects, records of deploys and removal, and the records after a restart"
 
   # Projects.
   out="$(dx "$NODE_A" 'faber project create shop')"
@@ -1064,9 +1065,11 @@ phase_j() {
   assert_eq "J both nodes have the same generation of staging" "$(j_gen "$NODE_B" staging)" "$(j_gen "$NODE_A" staging)"
   gen="$(j_gen "$NODE_B" staging)"
 
-  # Unknown targets. The spec is never deployed: the target is refused first.
+  # Unknown targets. The spec has no replicas, so nothing ever runs: a
+  # deploy of it only stores records.
   j_put "$NODE_B" spec.json <<'EOF'
-{"web":{"containers":[{"name":"web","image":"nginx:1.27"}]}}
+{"web":{"scale":{"replicas":{"count":0}},"containers":[{"name":"web","image":"nginx:1.27"}]},
+ "api":{"scale":{"replicas":{"count":0}},"containers":[{"name":"api","image":"nginx:1.27"}]}}
 EOF
   out="$(dx "$NODE_B" "faber deploy spec $J_DIR/spec.json --project nope --env staging")"
   rc=$?
@@ -1082,6 +1085,23 @@ EOF
   assert_hasnt "J neither failed deploy made a project" "$out" '^nope '
   assert_eq "J the failed deploys keep the generation" "$(j_gen "$NODE_A" staging)" "$gen"
 
+  # Workloads with zero replicas, deployed on the follower and the leader.
+  out="$(dx "$NODE_B" "faber deploy spec $J_DIR/spec.json --project shop --env staging")"
+  rc=$?
+  evidence "$out"
+  assert_ok "J $NODE_B: faber deploy spec to staging (forwarded) exits 0" "$rc" "$out"
+  assert_has "J the deploy created api and web" "$out" '^created: +api, web$'
+  out="$(dx "$NODE_A" "faber deploy spec $J_DIR/spec.json --project shop --env production")"
+  assert_has "J $NODE_A: the same spec in production creates api and web" "$out" '^created: +api, web$'
+  assert_ne "J the deploy moved the generation of staging (was $gen)" "$(j_gen "$NODE_B" staging)" "$gen"
+  gen="$(j_gen "$NODE_B" staging)"
+  assert_eq "J both nodes have the same generation of staging after the deploys" "$(j_gen "$NODE_A" staging)" "$gen"
+  out="$(dx "$NODE_B" 'faber app ls')"
+  evidence "$out"
+  assert_eq "J $NODE_B lists 4 workloads" "$(awk 'NR > 1' <<<"$out" | wc -l | tr -d ' ')" "4"
+  out="$(dx "$NODE_B" 'faber app ls --project shop --env production')"
+  assert_hasnt "J the environment filter leaves staging out" "$out" 'staging'
+
   # The records survive a restart. Only B is restarted, as in phase D, so
   # that A stays the leader for the phases that follow.
   n="$NODE_B"
@@ -1094,10 +1114,41 @@ EOF
   assert_ne "J $n: fabercp has a new MainPID after systemctl restart (was $before)" "$(main_pid "$n" fabercp)" "$before"
   out="$(dx "$n" 'faber project ls')"
   evidence "$out"
-  assert_has "J $n still has project shop after the restart" "$out" '^shop +production, staging +0 '
+  assert_has "J $n still has project shop after the restart, with 2 workloads in each environment" "$out" '^shop +production, staging +4 '
+  assert_eq "J $n lists the same 4 workloads after the restart" "$(dx "$n" 'faber app ls' | awk 'NR > 1' | wc -l | tr -d ' ')" "4"
   assert_eq "J $n has the same generation of staging after the restart" "$(j_gen "$n" staging)" "$gen"
 
-  # Removal.
+  # Removal. Nothing is removed while a workload is left.
+  out="$(dx "$NODE_B" 'faber project rm shop')"
+  rc=$?
+  evidence "$out"
+  assert_eq "J faber project rm of a project with workloads exits 1" "$rc" "1"
+  assert_has "J faber project rm of a project with workloads answers not_empty" "$out" '^error: not_empty'
+  out="$(dx "$NODE_B" 'faber project env rm shop staging')"
+  rc=$?
+  assert_eq "J faber project env rm of an environment with workloads exits 1" "$rc" "1"
+  assert_has "J faber project env rm of an environment with workloads answers not_empty" "$out" '^error: not_empty'
+  out="$(dx "$NODE_B" 'faber app rm web api --project shop --env staging')"
+  rc=$?
+  evidence "$out"
+  assert_ok "J $NODE_B: faber app rm web api exits 0" "$rc" "$out"
+  assert_has "J app rm prints removed web.staging.shop" "$out" '^removed web\.staging\.shop\.faber\.(internal|local)$'
+  assert_has "J app rm prints removed api.staging.shop" "$out" '^removed api\.staging\.shop\.faber\.(internal|local)$'
+  out="$(dx "$NODE_B" 'faber app rm web --project shop --env staging')"
+  rc=$?
+  assert_eq "J faber app rm of a removed workload exits 1" "$rc" "1"
+  assert_has "J faber app rm of a removed workload answers not_found" "$out" '^error: not_found'
+  out="$(dx "$NODE_A" 'faber project rm shop')"
+  rc=$?
+  assert_eq "J faber project rm still fails while production has workloads" "$rc" "1"
+  assert_has "J that failure is not_empty too" "$out" '^error: not_empty'
+  out="$(dx "$NODE_A" 'faber project env rm shop staging')"
+  rc=$?
+  evidence "$out"
+  assert_ok "J faber project env rm of the now empty staging exits 0" "$rc" "$out"
+  assert_has "J env rm prints removed environment staging from shop" "$out" '^removed environment staging from shop$'
+  out="$(dx "$NODE_A" 'faber app rm web api --project shop --env production')"
+  assert_has "J app rm prints removed web.production.shop" "$out" '^removed web\.production\.shop\.faber\.(internal|local)$'
   out="$(dx "$NODE_A" 'faber project rm shop')"
   rc=$?
   evidence "$out"
