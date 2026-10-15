@@ -71,6 +71,7 @@ fn name_of(response: &Response) -> &'static str {
         Response::Changed { .. } => "changed",
         Response::Replicas { .. } => "replicas",
         Response::Volumes { .. } => "volumes",
+        Response::VolumeSpace { .. } => "volume_space",
         Response::Error { .. } => "error",
     }
 }
@@ -487,6 +488,7 @@ pub mod fake {
                 ),
                 Request::ListReplicas => ("list_replicas".into(), "list_replicas"),
                 Request::ListVolumes => ("list_volumes".into(), "list_volumes"),
+                Request::VolumeSpace => ("volume_space".into(), "volume_space"),
                 Request::ConfigureRuntime { pod_network } => (
                     format!(
                         "configure_runtime network={}",
@@ -653,6 +655,9 @@ pub mod fake {
                     });
                     Ok(Response::Volumes { volumes })
                 }
+                Request::VolumeSpace => Ok(Response::VolumeSpace {
+                    free_bytes: 1 << 40,
+                }),
                 Request::ConfigureRuntime { pod_network } => {
                     let files = RuntimeFiles { pod_network };
                     let changed = inner.runtime.as_ref() != Some(&files);

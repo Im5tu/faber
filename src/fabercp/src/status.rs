@@ -16,11 +16,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faber_api_types::workload::{ReplicaState, ReplicaStatus};
+use faber_node_protocol::{Request, Response};
 use tokio_util::sync::CancellationToken;
 
 use crate::mesh::MeshState;
@@ -29,6 +31,7 @@ use crate::raft::store::status::{
     Capacity, NodeStatus, ReplicaReport, ReportNode, STALE_AFTER_INTERVALS,
 };
 use crate::raft::store::{ReadError, StateReader};
+use crate::runner::NodeClient;
 use crate::service::{FaberService, ServiceError, ServiceResult};
 
 /// Longest wait for one report to be accepted. A slower one is dropped; the
@@ -57,11 +60,71 @@ impl ReplicaSource for NoReplicas {
     }
 }
 
-/// Measures what this node can offer. May block briefly (it reads `/proc`
-/// and asks the file system), so the reporter calls it off the async
-/// threads.
+/// Measures what this node can offer. May block briefly (it reads `/proc`),
+/// so the reporter calls it off the async threads. Its `disk_bytes` is
+/// replaced by the [`DiskProbe`] of the reporter, when there is one.
 pub trait CapacityProbe: Send + Sync {
     fn capacity(&self) -> Capacity;
+}
+
+/// Measures the free disk space that block volumes can use. Those live under
+/// the volume root of faber-node, which fabercp does not know and may not
+/// read, so only faber-node can say.
+pub trait DiskProbe: Send + Sync {
+    /// The free bytes, or `None` when they cannot be measured.
+    fn free_bytes(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>>;
+}
+
+/// How long the reporter waits for a [`DiskProbe`]. A report that waited
+/// longer would be dropped as a whole ([`REPORT_TIMEOUT`]) and the node
+/// would go quiet.
+const DISK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The [`DiskProbe`] that asks faber-node ([`Request::VolumeSpace`]).
+pub struct NodeDisk<C> {
+    client: C,
+    /// Whether the last measurement failed, so that a faber-node that is
+    /// down is logged once and not at every report.
+    failing: AtomicBool,
+}
+
+impl<C> NodeDisk<C> {
+    pub fn new(client: C) -> Self {
+        Self {
+            client,
+            failing: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<C: NodeClient> DiskProbe for NodeDisk<C> {
+    fn free_bytes(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let answer = match self.client.call(Request::VolumeSpace).await {
+                Ok(Response::VolumeSpace { free_bytes }) => Ok(free_bytes),
+                Ok(_) => Err("it answered with a response that is not for this request".into()),
+                Err(e) => Err(e.to_string()),
+            };
+            match answer {
+                Ok(free_bytes) => {
+                    if self.failing.swap(false, Ordering::Relaxed) {
+                        tracing::info!("faber-node reports the free disk space again");
+                    }
+                    Some(free_bytes)
+                }
+                Err(why) => {
+                    if !self.failing.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            error = %why,
+                            "cannot get the free disk space from faber-node; this node reports \
+                             no disk, so no replica with a block volume is placed on it"
+                        );
+                    }
+                    None
+                }
+            }
+        })
+    }
 }
 
 /// A probe that answers a fixed figure: for tests, and for hosts that have
@@ -92,16 +155,15 @@ pub fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
     }
 }
 
-/// The probe for this host: on Linux the CPUs, `MemTotal` and the free space
-/// of the file system under `data_dir`; elsewhere only the CPUs.
-pub fn system_probe(data_dir: PathBuf) -> Arc<dyn CapacityProbe> {
+/// The probe for this host: on Linux the CPUs and `MemTotal`; elsewhere only
+/// the CPUs. The disk is not measured here ([`DiskProbe`]).
+pub fn system_probe() -> Arc<dyn CapacityProbe> {
     #[cfg(target_os = "linux")]
     {
-        Arc::new(linux::ProcProbe { data_dir })
+        Arc::new(linux::ProcProbe)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = data_dir;
         Arc::new(FixedCapacity(Capacity {
             cpu_millis: cpu_millis(),
             ..Capacity::default()
@@ -111,13 +173,9 @@ pub fn system_probe(data_dir: PathBuf) -> Arc<dyn CapacityProbe> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::path::PathBuf;
-
     use super::{Capacity, CapacityProbe, cpu_millis, parse_meminfo_total};
 
-    pub struct ProcProbe {
-        pub data_dir: PathBuf,
-    }
+    pub struct ProcProbe;
 
     impl CapacityProbe for ProcProbe {
         fn capacity(&self) -> Capacity {
@@ -125,15 +183,10 @@ mod linux {
                 .ok()
                 .and_then(|text| parse_meminfo_total(&text))
                 .unwrap_or(0);
-            // Free space for unprivileged use: fragment size times free blocks.
-            let disk_bytes = nix::sys::statvfs::statvfs(&self.data_dir).map_or(0, |s| {
-                let bytes = s.fragment_size() as u128 * s.blocks_available() as u128;
-                u64::try_from(bytes).unwrap_or(u64::MAX)
-            });
             Capacity {
                 cpu_millis: cpu_millis(),
                 memory_bytes,
-                disk_bytes,
+                disk_bytes: 0,
             }
         }
     }
@@ -167,6 +220,8 @@ pub struct Reporter<S> {
     sink: S,
     replicas: Arc<dyn ReplicaSource>,
     capacity: Arc<dyn CapacityProbe>,
+    /// Where the disk figure comes from. Without one, the probe's own.
+    disk: Option<Arc<dyn DiskProbe>>,
     /// The last measurement and when it was made.
     measured: Mutex<Option<(tokio::time::Instant, Capacity)>>,
 }
@@ -183,8 +238,19 @@ impl<S: ReportSink> Reporter<S> {
             sink,
             replicas,
             capacity,
+            disk: None,
             measured: Mutex::new(None),
         }
+    }
+
+    /// Takes the disk capacity from `disk`. When it cannot say, the node
+    /// reports no disk at all, which keeps every replica with a block volume
+    /// off it, rather than the free space of some other file system. That
+    /// measurement is not kept, so the next report asks again.
+    #[must_use]
+    pub fn with_disk(mut self, disk: Arc<dyn DiskProbe>) -> Self {
+        self.disk = Some(disk);
+        self
     }
 
     /// The capacity, measured at most once per [`CAPACITY_REFRESH`].
@@ -198,9 +264,20 @@ impl<S: ReportSink> Reporter<S> {
             return Ok(c);
         }
         let probe = self.capacity.clone();
-        let c = tokio::task::spawn_blocking(move || probe.capacity())
+        let mut c = tokio::task::spawn_blocking(move || probe.capacity())
             .await
             .map_err(|e| ServiceError::Internal(format!("the capacity probe failed: {e}")))?;
+        if let Some(disk) = &self.disk {
+            let free = tokio::time::timeout(DISK_PROBE_TIMEOUT, disk.free_bytes())
+                .await
+                .ok()
+                .flatten();
+            let Some(free) = free else {
+                c.disk_bytes = 0;
+                return Ok(c);
+            };
+            c.disk_bytes = free;
+        }
         *self.measured.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, c));
         Ok(c)
     }
@@ -863,5 +940,119 @@ mod tests {
         assert!(recorder.sent.lock().unwrap().len() >= 15);
         cancel.cancel();
         task.await.unwrap();
+    }
+
+    /// A disk probe with a script of answers, where `None` is a measurement
+    /// that failed. With `hang` it never answers.
+    struct ScriptedDisk {
+        answers: Mutex<std::collections::VecDeque<Option<u64>>>,
+        asked: AtomicU64,
+        hang: bool,
+    }
+
+    impl ScriptedDisk {
+        fn new(answers: &[Option<u64>]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(answers.iter().copied().collect()),
+                asked: AtomicU64::new(0),
+                hang: false,
+            })
+        }
+    }
+
+    impl DiskProbe for ScriptedDisk {
+        fn free_bytes(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+            Box::pin(async move {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                if self.hang {
+                    std::future::pending::<()>().await;
+                }
+                self.answers.lock().unwrap().pop_front().flatten()
+            })
+        }
+    }
+
+    fn reporter_with(disk: Arc<dyn DiskProbe>) -> Reporter<Recorder> {
+        Reporter::new(
+            || Some((1, String::new())),
+            Recorder::default(),
+            Arc::new(NoReplicas),
+            Arc::new(FixedCapacity(fake_capacity())),
+        )
+        .with_disk(disk)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_disk_comes_from_the_disk_probe_not_the_capacity_probe() {
+        let reporter = reporter_with(ScriptedDisk::new(&[Some(777)]));
+        let c = reporter.capacity().await.unwrap();
+        assert_eq!(c.disk_bytes, 777);
+        // The rest is the capacity probe's.
+        assert_eq!(c.memory_bytes, fake_capacity().memory_bytes);
+        assert_eq!(c.cpu_millis, fake_capacity().cpu_millis);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_disk_is_reported_as_zero_and_asked_again() {
+        let disk = ScriptedDisk::new(&[None, Some(500)]);
+        let reporter = reporter_with(disk.clone());
+        assert_eq!(reporter.capacity().await.unwrap().disk_bytes, 0);
+        // The failure was not kept for a minute.
+        assert_eq!(reporter.capacity().await.unwrap().disk_bytes, 500);
+        assert_eq!(disk.asked.load(Ordering::Relaxed), 2);
+        // The success is.
+        assert_eq!(reporter.capacity().await.unwrap().disk_bytes, 500);
+        assert_eq!(disk.asked.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disk_probe_that_hangs_does_not_hold_up_the_report() {
+        let disk = Arc::new(ScriptedDisk {
+            answers: Mutex::default(),
+            asked: AtomicU64::new(0),
+            hang: true,
+        });
+        let reporter = reporter_with(disk);
+        let started = tokio::time::Instant::now();
+        assert_eq!(reporter.capacity().await.unwrap().disk_bytes, 0);
+        assert!(started.elapsed() < REPORT_TIMEOUT);
+    }
+
+    /// Answers every request with the next of a list.
+    struct Scripted(Mutex<Vec<Result<Response, crate::runner::NodeCallError>>>);
+
+    impl NodeClient for Scripted {
+        async fn call(&self, request: Request) -> Result<Response, crate::runner::NodeCallError> {
+            assert_eq!(request, Request::VolumeSpace);
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn faber_node_is_asked_for_the_space_and_anything_else_is_unknown() {
+        use crate::runner::NodeCallError;
+        use faber_node_protocol::ErrorCode;
+
+        let disk = NodeDisk::new(Scripted(Mutex::new(vec![
+            Ok(Response::VolumeSpace { free_bytes: 42 }),
+            Err(NodeCallError::Node {
+                code: ErrorCode::Runtime,
+                message: "no".into(),
+            }),
+            Err(NodeCallError::Transport("down".into())),
+            Ok(Response::Done),
+            Ok(Response::VolumeSpace { free_bytes: 7 }),
+        ])));
+        assert_eq!(disk.free_bytes().await, Some(42));
+        assert_eq!(disk.free_bytes().await, None);
+        assert_eq!(disk.free_bytes().await, None);
+        assert_eq!(disk.free_bytes().await, None);
+        assert_eq!(disk.free_bytes().await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_fake_node_answers_the_space_request() {
+        let disk = NodeDisk::new(crate::runner::node::fake::FakeNode::default());
+        assert!(disk.free_bytes().await.is_some());
     }
 }

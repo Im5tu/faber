@@ -614,7 +614,7 @@ pub async fn start_with(
                 service: service.clone(),
                 state_dir: config.state_dir.clone(),
                 cluster_key_file: config.cluster_key_path(),
-                data_dir: config.data_dir.clone(),
+                node_socket: host.is_some().then(|| config.node_socket.clone()),
                 wg_endpoint,
                 reader: reader.clone(),
                 replicas,
@@ -986,9 +986,10 @@ struct MeshMembership {
     state_dir: PathBuf,
     /// The cluster key file, removed with the identity.
     cluster_key_file: PathBuf,
-    /// Where the raft data is: the file system whose free space this node
-    /// reports as its disk capacity.
-    data_dir: PathBuf,
+    /// Where faber-node listens, which is asked for the free space of the
+    /// volume root that this node reports as its disk capacity. `None` when
+    /// this node runs no containers: it then reports no disk.
+    node_socket: Option<PathBuf>,
     wg_endpoint: Option<SocketAddr>,
     reader: StateReader,
     /// What this node's runner runs, for the status reports.
@@ -1152,12 +1153,17 @@ async fn mesh_membership(ctx: MeshMembership, mut identity: Identity, host: Opti
         // the cluster, in lease seconds.
         let status = async {
             let service = ctx.service.clone();
-            let reporter = status::Reporter::new(
+            let mut reporter = status::Reporter::new(
                 move || service.report_identity(),
                 ctx.service.clone(),
                 ctx.replicas.clone(),
-                status::system_probe(ctx.data_dir.clone()),
+                status::system_probe(),
             );
+            if let Some(socket) = &ctx.node_socket {
+                reporter = reporter.with_disk(Arc::new(status::NodeDisk::new(
+                    runner::SocketNodeClient::new(socket.clone()),
+                )));
+            }
             let interval = || {
                 ctx.reader
                     .status_interval()
