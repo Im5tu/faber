@@ -218,7 +218,6 @@ mod tests {
             volume: "data".into(),
             path: "/proc/x".into(),
             read_only: false,
-            sub_path: None,
         }];
         assert!(check_container(&c, &SecretEnv::default()).is_err());
         c.mounts[0].path = "/data".into();

@@ -74,12 +74,11 @@ fn container_request(sandbox_id: &str, container: ContainerSpec, uid_base: u32) 
     }
 }
 
-fn data_mount(sub_path: Option<&str>) -> MountSpec {
+fn data_mount() -> MountSpec {
     MountSpec {
         volume: "data".into(),
         path: "/data".into(),
         read_only: false,
-        sub_path: sub_path.map(str::to_owned),
     }
 }
 
@@ -257,7 +256,7 @@ async fn the_container_lifecycle_with_a_volume() {
     assert_eq!(reply, Response::Done);
     let sandbox_id = sandbox(&rig).await;
     let mut spec = ContainerSpec::new("redis", "redis:7");
-    spec.mounts = vec![data_mount(None)];
+    spec.mounts = vec![data_mount()];
     let Response::Container { container_id } = rig
         .node
         .handle(container_request(&sandbox_id, spec, BASE))
@@ -450,24 +449,11 @@ async fn removals_of_missing_objects_succeed_and_a_long_grace_is_refused() {
 }
 
 #[tokio::test]
-async fn sub_path_mounts_are_refused() {
-    let rig = rig();
-    let sandbox_id = sandbox(&rig).await;
-    let mut spec = ContainerSpec::new("redis", "redis:7");
-    spec.mounts = vec![data_mount(Some("sub"))];
-    let reply = rig
-        .node
-        .handle(container_request(&sandbox_id, spec, BASE))
-        .await;
-    assert_eq!(error_code(&reply), Some(ErrorCode::Forbidden));
-}
-
-#[tokio::test]
 async fn a_mount_needs_an_ensured_volume() {
     let rig = rig();
     let sandbox_id = sandbox(&rig).await;
     let mut spec = ContainerSpec::new("redis", "redis:7");
-    spec.mounts = vec![data_mount(None)];
+    spec.mounts = vec![data_mount()];
     let reply = rig
         .node
         .handle(container_request(&sandbox_id, spec, BASE))
@@ -490,7 +476,12 @@ async fn the_attempt_counter_follows_the_containers_in_the_sandbox() {
                 BASE,
             ))
             .await;
-        assert!(matches!(reply, Response::Container { .. }), "{reply:?}");
+        let Response::Container { container_id } = reply else {
+            panic!("{reply:?}")
+        };
+        // The container ran and exited, so the next one is a new attempt.
+        rig.cri.start_container(&container_id).await.unwrap();
+        rig.cri.exit_container(&container_id, 1);
         let Response::Replicas { replicas } = rig.node.handle(Request::ListReplicas).await else {
             panic!()
         };
@@ -504,6 +495,83 @@ async fn the_attempt_counter_follows_the_containers_in_the_sandbox() {
         );
     }
     assert_eq!(attempts, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn a_retried_create_returns_the_container_already_made() {
+    let rig = rig();
+    ready_image(&rig).await;
+    let sandbox_id = sandbox(&rig).await;
+    let spec = || ContainerSpec::new("redis", "redis:7");
+    let first = rig
+        .node
+        .handle(container_request(&sandbox_id, spec(), BASE))
+        .await;
+    let second = rig
+        .node
+        .handle(container_request(&sandbox_id, spec(), BASE))
+        .await;
+    assert!(matches!(first, Response::Container { .. }), "{first:?}");
+    assert_eq!(first, second);
+    let creates = rig
+        .cri
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, Call::CreateContainer { .. }))
+        .count();
+    assert_eq!(creates, 1);
+}
+
+#[tokio::test]
+async fn concurrent_sandbox_requests_make_one_sandbox() {
+    let rig = rig();
+    let (a, b, c) = tokio::join!(
+        rig.node.handle(sandbox_request(BASE)),
+        rig.node.handle(sandbox_request(BASE)),
+        rig.node.handle(sandbox_request(BASE)),
+    );
+    assert_eq!(a, b);
+    assert_eq!(b, c);
+    let runs = rig
+        .cri
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, Call::RunPodSandbox { .. }))
+        .count();
+    assert_eq!(runs, 1);
+}
+
+#[tokio::test]
+async fn a_failed_handshake_closes_the_connection() {
+    use crate::connection::{Limits, Outcome, serve_connection};
+    use crate::peer::fake::FakeStream;
+    use crate::peer::{Authorizer, Peer};
+    use faber_node_protocol::{MAX_FRAME_BYTES, read_frame, write_frame};
+
+    let rig = rig();
+    let (server, mut client) = FakeStream::pair(Peer {
+        uid: 0,
+        gid: 0,
+        pid: None,
+    });
+    let task = tokio::spawn(async move {
+        serve_connection(server, &rig.node, &Authorizer::new(990), Limits::default()).await
+    });
+    write_frame(&mut client, &Request::Version { client_version: 99 })
+        .await
+        .unwrap();
+    let reply: Response = read_frame(&mut client, MAX_FRAME_BYTES)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(error_code(&reply), Some(ErrorCode::VersionMismatch));
+    // The server hung up: a following request gets no answer.
+    let _ = write_frame(&mut client, &Request::ListReplicas).await;
+    let next: Option<Response> = read_frame(&mut client, MAX_FRAME_BYTES)
+        .await
+        .unwrap_or(None);
+    assert_eq!(next, None);
+    assert_eq!(task.await.unwrap(), Outcome::Finished);
 }
 
 #[tokio::test]

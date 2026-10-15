@@ -65,7 +65,29 @@ fn is_managed(labels: &HashMap<String, String>) -> bool {
     labels.get(LABEL_MANAGED).map(String::as_str) == Some("true")
 }
 
+/// One lock per replica, so concurrent requests for a replica's sandbox and
+/// containers run one after the other and find each other's work.
+#[derive(Default)]
+struct ReplicaLocks(std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl ReplicaLocks {
+    async fn lock(&self, replica: &ReplicaRef) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = format!(
+            "{}/{}/{}/{}/{}",
+            replica.project, replica.env, replica.workload, replica.revision, replica.replica_index
+        );
+        let lock = {
+            let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            // A lock that only the map holds is idle: forget it.
+            map.retain(|_, l| Arc::strong_count(l) > 1);
+            Arc::clone(map.entry(key).or_default())
+        };
+        lock.lock_owned().await
+    }
+}
+
 pub struct Node<C> {
+    sandbox_locks: ReplicaLocks,
     uid_range: UidRange,
     runtime_handler: String,
     cri: C,
@@ -81,6 +103,7 @@ impl<C: CriClient + Clone> Node<C> {
         volumes: Arc<dyn VolumeManager>,
     ) -> Self {
         Self {
+            sandbox_locks: ReplicaLocks::default(),
             uid_range,
             runtime_handler,
             images: ImagePuller::new(cri.clone()),
@@ -131,6 +154,7 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_dns(&dns)?;
                 trust::check_ports(&ports)?;
+                let _guard = self.sandbox_locks.lock(&replica).await;
                 self.ensure_sandbox(&replica, uid_base, &dns, &ports).await
             }
             Request::CreateContainer {
@@ -144,14 +168,7 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_runtime_id("sandbox_id", &sandbox_id)?;
                 trust::check_container(&container, &env)?;
-                if container.mounts.iter().any(|m| m.sub_path.is_some()) {
-                    // A container can plant a symlink in its volume, and the
-                    // runtime would follow it as root on the host.
-                    return Err(Fail::new(
-                        ErrorCode::Forbidden,
-                        "mount sub_path is not supported by faber-node",
-                    ));
-                }
+                let _guard = self.sandbox_locks.lock(&replica).await;
                 let sandbox = self.cri.pod_sandbox_status(&sandbox_id).await?;
                 let want = replica.labels();
                 let have: BTreeMap<_, _> = sandbox.labels.clone().into_iter().collect();
@@ -183,16 +200,29 @@ impl<C: CriClient + Clone> Node<C> {
                         ..Default::default()
                     }))
                     .await?;
+                // A retried request finds the container it already made.
+                let same_name =
+                    |c: &&faber_cri::Container| c.metadata.as_ref().is_some_and(|m| m.name == name);
+                if let Some(made) = existing
+                    .iter()
+                    .filter(same_name)
+                    .find(|c| c.state == CriContainerState::ContainerCreated as i32)
+                {
+                    return Ok(Response::Container {
+                        container_id: made.id.clone(),
+                    });
+                }
                 let attempt = existing
                     .iter()
+                    .filter(same_name)
                     .filter_map(|c| c.metadata.as_ref())
-                    .filter(|m| m.name == name)
                     .map(|m| m.attempt + 1)
                     .max()
                     .unwrap_or(0);
                 let config = cri_config::container_config(
                     &replica, &container, &env, uid_base, attempt, &mounts,
-                );
+                )
+                .map_err(|e| Fail::new(ErrorCode::InvalidRequest, e))?;
                 let sandbox_config =
                     cri_config::container_sandbox_config(&replica, uid_base, sandbox.metadata);
                 let container_id = self

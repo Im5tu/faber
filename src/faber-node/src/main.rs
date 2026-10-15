@@ -48,7 +48,7 @@ mod linux {
     use faber_node::listener;
     use faber_node::node::Node;
     use faber_node::peer::Authorizer;
-    use faber_node::volume::{CommandMounter, HostVolumes};
+    use faber_node::volume::{CommandMounter, HostVolumes, ToolPaths};
 
     /// The env file decides what pods may map, so it must be root's alone.
     fn read_config(path: &Path) -> anyhow::Result<NodeConfig> {
@@ -71,13 +71,28 @@ mod linux {
             .await
             .context("connecting to containerd")?;
         let runner = Arc::new(SystemRunner);
+        let tools = ToolPaths {
+            bin_dir: config.bin_dir.clone(),
+            sbin_dir: config.sbin_dir.clone(),
+        };
+        std::fs::create_dir_all(&config.volume_root).context("creating the volume root")?;
+        // Volumes are made and removed by path under here; anyone who could
+        // write the root could redirect root's file operations.
+        let meta =
+            std::fs::symlink_metadata(&config.volume_root).context("checking the volume root")?;
+        if !meta.is_dir() || !root_only_writable(meta.uid(), meta.mode()) {
+            anyhow::bail!(
+                "{} must be a directory owned by root and not writable by group or others",
+                config.volume_root.display()
+            );
+        }
         let volumes = HostVolumes::new(
             config.volume_root.clone(),
             config.faber_gid,
+            tools.clone(),
             runner.clone(),
-            Arc::new(CommandMounter::new(runner)),
+            Arc::new(CommandMounter::new(tools, runner)),
         );
-        std::fs::create_dir_all(&config.volume_root).context("creating the volume root")?;
         let node = Arc::new(Node::new(
             config.uid_range,
             config.runtime_handler.clone(),

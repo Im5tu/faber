@@ -93,10 +93,16 @@ where
             .await;
             return Outcome::Finished;
         }
-        first = false;
         let response = node.handle(request).await;
         if write_frame(&mut stream, &response).await.is_err() {
             return Outcome::Finished;
+        }
+        // The handshake is done only by a version that was accepted.
+        if first {
+            if !matches!(response, Response::Version { .. }) {
+                return Outcome::Finished;
+            }
+            first = false;
         }
     }
 }

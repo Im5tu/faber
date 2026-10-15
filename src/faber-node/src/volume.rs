@@ -7,6 +7,7 @@
 //! <root>/<project>/<env>/<workload>/<replica_index>/<volume>/
 //!     disk.img        block only: the sparse ext4 image
 //!     disk.img.new    block only: while it is being formatted
+//!     volume          marker: the kind and uid_base it was created with
 //!     mnt/            the mount point handed to containers
 //! ```
 //!
@@ -22,6 +23,7 @@
 //! `nosuid,nodev` is set on the host mount, which a bind keeps and a user
 //! namespace cannot clear.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,6 +102,7 @@ impl VolumeRef {
             image: dir.join("disk.img"),
             staging: dir.join("disk.img.new"),
             mount: dir.join("mnt"),
+            marker: dir.join("volume"),
             dir,
         }
     }
@@ -111,6 +114,8 @@ pub struct VolumePaths {
     pub image: PathBuf,
     pub staging: PathBuf,
     pub mount: PathBuf,
+    /// Beside the volume, not inside it: records its kind and owner.
+    pub marker: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -198,14 +203,50 @@ fn path_str(path: &Path) -> Result<&str, VolumeError> {
         .ok_or_else(|| VolumeError::Invalid("path is not valid UTF-8".to_owned()))
 }
 
+/// Where the host tools live. Programs are always run by absolute path, so
+/// nothing in root's `PATH` can stand in for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPaths {
+    /// `mount`, `umount`, `mountpoint`, `chmod`.
+    pub bin_dir: PathBuf,
+    /// `mkfs.ext4`.
+    pub sbin_dir: PathBuf,
+}
+
+impl Default for ToolPaths {
+    fn default() -> Self {
+        Self {
+            bin_dir: PathBuf::from("/usr/bin"),
+            sbin_dir: PathBuf::from("/usr/sbin"),
+        }
+    }
+}
+
+impl ToolPaths {
+    pub fn bin(&self, name: &str) -> String {
+        format!(
+            "{}/{name}",
+            self.bin_dir.to_string_lossy().trim_end_matches('/')
+        )
+    }
+
+    pub fn sbin(&self, name: &str) -> String {
+        format!(
+            "{}/{name}",
+            self.sbin_dir.to_string_lossy().trim_end_matches('/')
+        )
+    }
+}
+
 /// [`Mounter`] over `mount`, `umount` and `mountpoint`.
 pub struct CommandMounter {
+    tools: ToolPaths,
     runner: Arc<dyn CommandRunner>,
 }
 
 impl CommandMounter {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+    pub fn new(tools: ToolPaths, runner: Arc<dyn CommandRunner>) -> Self {
+        Self { tools, runner }
     }
 }
 
@@ -216,7 +257,7 @@ impl Mounter for CommandMounter {
             let args = ["-q", target];
             let out = self
                 .runner
-                .run("mountpoint", &args, None)
+                .run(&self.tools.bin("mountpoint"), &args, None)
                 .await
                 .map_err(|source| VolumeError::Spawn {
                     cmd: format!("mountpoint -q {target}"),
@@ -249,7 +290,9 @@ impl Mounter for CommandMounter {
                 path_str(image)?,
                 path_str(target)?,
             ];
-            run(&*self.runner, "mount", &args).await.map(drop)
+            run(&*self.runner, &self.tools.bin("mount"), &args)
+                .await
+                .map(drop)
         })
     }
 
@@ -263,7 +306,9 @@ impl Mounter for CommandMounter {
         Box::pin(async move {
             let options = format!("size={size_bytes},mode=0770,uid={uid},gid={gid},nosuid,nodev");
             let args = ["-t", "tmpfs", "-o", &options, "tmpfs", path_str(target)?];
-            run(&*self.runner, "mount", &args).await.map(drop)
+            run(&*self.runner, &self.tools.bin("mount"), &args)
+                .await
+                .map(drop)
         })
     }
 
@@ -275,16 +320,106 @@ impl Mounter for CommandMounter {
         Box::pin(async move {
             let options = format!("remount,size={size_bytes},nosuid,nodev");
             let args = ["-o", &options, path_str(target)?];
-            run(&*self.runner, "mount", &args).await.map(drop)
+            run(&*self.runner, &self.tools.bin("mount"), &args)
+                .await
+                .map(drop)
         })
     }
 
     fn unmount<'a>(&'a self, target: &'a Path) -> BoxFuture<'a, Result<(), VolumeError>> {
         Box::pin(async move {
-            run(&*self.runner, "umount", &[path_str(target)?])
-                .await
-                .map(drop)
+            run(
+                &*self.runner,
+                &self.tools.bin("umount"),
+                &[path_str(target)?],
+            )
+            .await
+            .map(drop)
         })
+    }
+}
+
+/// Runs blocking filesystem work off the async threads.
+async fn blocking<T, F>(what: &'static str, f: F) -> Result<T, VolumeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(io_err(what)),
+        Err(join) => Err(VolumeError::Io {
+            what: what.to_owned(),
+            source: io::Error::other(join),
+        }),
+    }
+}
+
+fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// What a volume was first created as. Kept beside the volume, outside the
+/// directory containers can reach, so a later request cannot change a
+/// volume's kind or owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Marker {
+    kind: VolumeKind,
+    uid_base: u32,
+}
+
+impl Marker {
+    fn render(self) -> String {
+        let kind = match self.kind {
+            VolumeKind::Block => "block",
+            VolumeKind::Ramdisk => "ramdisk",
+        };
+        format!("kind={kind}\nuid_base={}\n", self.uid_base)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        let kind = match lines.next()?.strip_prefix("kind=")? {
+            "block" => VolumeKind::Block,
+            "ramdisk" => VolumeKind::Ramdisk,
+            _ => return None,
+        };
+        let uid_base = lines.next()?.strip_prefix("uid_base=")?.parse().ok()?;
+        Some(Self { kind, uid_base })
+    }
+}
+
+fn read_marker(path: &Path) -> io::Result<Option<Marker>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Marker::parse(&text).map(Some).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "the volume marker is damaged")
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes any half-made image, then creates a sparse root-only file.
+fn create_image(staging: &Path, size_bytes: u64) -> io::Result<()> {
+    ignore_missing(std::fs::remove_file(staging))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // The raw image holds the service's data, so only root may read it,
+    // whatever the mode of the directories above.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(staging)?;
+    // Sparse: no blocks are allocated until the filesystem writes them.
+    file.set_len(size_bytes)
+}
+
+fn image_len(image: &Path) -> io::Result<Option<u64>> {
+    match std::fs::metadata(image) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -292,23 +427,38 @@ impl Mounter for CommandMounter {
 pub struct HostVolumes {
     root: PathBuf,
     faber_gid: u32,
+    tools: ToolPaths,
     runner: Arc<dyn CommandRunner>,
     mounter: Arc<dyn Mounter>,
+    /// One lock per volume, so two requests for one volume never race on its
+    /// image or its mount.
+    locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl HostVolumes {
     pub fn new(
         root: PathBuf,
         faber_gid: u32,
+        tools: ToolPaths,
         runner: Arc<dyn CommandRunner>,
         mounter: Arc<dyn Mounter>,
     ) -> Self {
         Self {
             root,
             faber_gid,
+            tools,
             runner,
             mounter,
+            locks: std::sync::Mutex::default(),
         }
+    }
+
+    async fn lock(&self, dir: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(map.entry(dir.to_path_buf()).or_default())
+        };
+        lock.lock_owned().await
     }
 
     async fn ensure_block(
@@ -316,59 +466,55 @@ impl HostVolumes {
         req: &EnsureVolume,
         paths: &VolumePaths,
     ) -> Result<(), VolumeError> {
-        if paths.image.exists() {
-            let have = std::fs::metadata(&paths.image)
-                .map_err(io_err("reading the volume image"))?
-                .len();
-            if have != req.size_bytes {
+        let image = paths.image.clone();
+        match blocking("reading the volume image", move || image_len(&image)).await? {
+            Some(have) if have != req.size_bytes => {
                 return Err(VolumeError::Invalid(format!(
                     "the volume exists with size {have}; resizing is not supported"
                 )));
             }
-        } else {
-            self.format(req, paths).await?;
+            Some(_) => {}
+            None => self.format(req, paths).await?,
         }
         if !self.mounter.is_mounted(&paths.mount).await? {
             self.mounter.mount_block(&paths.image, &paths.mount).await?;
         }
-        run(&*self.runner, "chmod", &["0770", path_str(&paths.mount)?]).await?;
+        run(
+            &*self.runner,
+            &self.tools.bin("chmod"),
+            &["0770", path_str(&paths.mount)?],
+        )
+        .await?;
         Ok(())
     }
 
     /// Builds the image beside its final name and renames it into place, so
     /// an image that exists is always a formatted one.
     async fn format(&self, req: &EnsureVolume, paths: &VolumePaths) -> Result<(), VolumeError> {
-        match std::fs::remove_file(&paths.staging) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err("removing a stale volume image")(e)),
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        // The raw image holds the service's data, so only root may read it,
-        // whatever the mode of the directories above.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options
-            .open(&paths.staging)
-            .map_err(io_err("creating the volume image"))?;
-        // Sparse: no blocks are allocated until the filesystem writes them.
-        file.set_len(req.size_bytes)
-            .map_err(io_err("sizing the volume image"))?;
-        drop(file);
+        let (staging, size) = (paths.staging.clone(), req.size_bytes);
+        blocking("creating the volume image", move || {
+            create_image(&staging, size)
+        })
+        .await?;
         let owner = format!("root_owner={}:{}", req.uid_base, self.faber_gid);
         let formatted = run(
             &*self.runner,
-            "mkfs.ext4",
+            &self.tools.sbin("mkfs.ext4"),
             &["-F", "-q", "-E", &owner, path_str(&paths.staging)?],
         )
         .await;
+        let (staging, image) = (paths.staging.clone(), paths.image.clone());
         if let Err(e) = formatted {
-            let _ = std::fs::remove_file(&paths.staging);
+            let _ = blocking("removing the volume image", move || {
+                std::fs::remove_file(&staging)
+            })
+            .await;
             return Err(e);
         }
-        std::fs::rename(&paths.staging, &paths.image)
-            .map_err(io_err("moving the volume image into place"))
+        blocking("moving the volume image into place", move || {
+            std::fs::rename(&staging, &image)
+        })
+        .await
     }
 
     async fn ensure_ramdisk(
@@ -392,19 +538,50 @@ impl VolumeManager for HostVolumes {
     fn ensure<'a>(&'a self, req: &'a EnsureVolume) -> BoxFuture<'a, Result<(), VolumeError>> {
         Box::pin(async move {
             let paths = req.volume.paths(&self.root);
-            std::fs::create_dir_all(&paths.mount)
-                .map_err(io_err("creating the volume directory"))?;
-            match req.kind {
-                VolumeKind::Block => self.ensure_block(req, &paths).await,
-                VolumeKind::Ramdisk => self.ensure_ramdisk(req, &paths).await,
+            let _guard = self.lock(&paths.dir).await;
+            let (mount, marker_path) = (paths.mount.clone(), paths.marker.clone());
+            let existing = blocking("creating the volume directory", move || {
+                std::fs::create_dir_all(&mount)?;
+                read_marker(&marker_path)
+            })
+            .await?;
+            let wanted = Marker {
+                kind: req.kind,
+                uid_base: req.uid_base,
+            };
+            if let Some(have) = existing {
+                if have.kind != wanted.kind {
+                    return Err(VolumeError::Invalid(
+                        "the volume exists with a different kind".to_owned(),
+                    ));
+                }
+                if have.uid_base != wanted.uid_base {
+                    return Err(VolumeError::Invalid(
+                        "the volume exists with a different uid_base".to_owned(),
+                    ));
+                }
             }
+            match req.kind {
+                VolumeKind::Block => self.ensure_block(req, &paths).await?,
+                VolumeKind::Ramdisk => self.ensure_ramdisk(req, &paths).await?,
+            }
+            if existing.is_none() {
+                let marker_path = paths.marker.clone();
+                blocking("recording the volume", move || {
+                    std::fs::write(marker_path, wanted.render())
+                })
+                .await?;
+            }
+            Ok(())
         })
     }
 
     fn remove<'a>(&'a self, volume: &'a VolumeRef) -> BoxFuture<'a, Result<(), VolumeError>> {
         Box::pin(async move {
             let paths = volume.paths(&self.root);
-            if !paths.dir.exists() {
+            let _guard = self.lock(&paths.dir).await;
+            let dir = paths.dir.clone();
+            if !blocking("checking the volume", move || Ok(dir.exists())).await? {
                 return Ok(());
             }
             if self.mounter.is_mounted(&paths.mount).await? {
@@ -418,21 +595,16 @@ impl VolumeManager for HostVolumes {
             // Single files and empty directories only: anything under an
             // unexpectedly unmounted `mnt` makes `remove_dir` fail instead of
             // being deleted.
-            for file in [&paths.image, &paths.staging] {
-                match std::fs::remove_file(file) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_err("removing the volume image")(e)),
+            blocking("removing the volume", move || {
+                for file in [&paths.image, &paths.staging, &paths.marker] {
+                    ignore_missing(std::fs::remove_file(file))?;
                 }
-            }
-            for dir in [&paths.mount, &paths.dir] {
-                match std::fs::remove_dir(dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_err("removing the volume directory")(e)),
+                for dir in [&paths.mount, &paths.dir] {
+                    ignore_missing(std::fs::remove_dir(dir))?;
                 }
-            }
-            Ok(())
+                Ok(())
+            })
+            .await
         })
     }
 
@@ -558,11 +730,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(RecordingRunner::new());
         // Nothing is mounted until the test says so.
-        runner.script("mountpoint", None, CommandOutput::failure(32, ""));
-        let mounter = Arc::new(CommandMounter::new(runner.clone()));
+        runner.script("/usr/bin/mountpoint", None, CommandOutput::failure(32, ""));
+        let mounter = Arc::new(CommandMounter::new(ToolPaths::default(), runner.clone()));
         let root = tmp.path().to_path_buf();
         Harness {
-            volumes: HostVolumes::new(root.clone(), 989, runner.clone(), mounter),
+            volumes: HostVolumes::new(
+                root.clone(),
+                989,
+                ToolPaths::default(),
+                runner.clone(),
+                mounter,
+            ),
             runner,
             root,
             _tmp: tmp,
@@ -631,10 +809,10 @@ mod tests {
         assert_eq!(
             lines(&h),
             vec![
-                format!("mkfs.ext4 -F -q -E root_owner=131072:989 {base}/disk.img.new"),
-                format!("mountpoint -q {base}/mnt"),
-                format!("mount -t ext4 -o loop,nosuid,nodev {base}/disk.img {base}/mnt"),
-                format!("chmod 0770 {base}/mnt"),
+                format!("/usr/sbin/mkfs.ext4 -F -q -E root_owner=131072:989 {base}/disk.img.new"),
+                format!("/usr/bin/mountpoint -q {base}/mnt"),
+                format!("/usr/bin/mount -t ext4 -o loop,nosuid,nodev {base}/disk.img {base}/mnt"),
+                format!("/usr/bin/chmod 0770 {base}/mnt"),
             ]
         );
         // Sparse image of the requested size, in its final place.
@@ -661,6 +839,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_ensures_of_one_new_volume_format_it_once() {
+        let h = harness();
+        let r = req(VolumeKind::Block, 8 << 20);
+        let (a, b, c) = tokio::join!(
+            h.volumes.ensure(&r),
+            h.volumes.ensure(&r),
+            h.volumes.ensure(&r)
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        let mkfs = lines(&h)
+            .iter()
+            .filter(|l| l.starts_with("/usr/sbin/mkfs"))
+            .count();
+        assert_eq!(mkfs, 1);
+    }
+
+    #[tokio::test]
+    async fn a_volume_keeps_its_kind_and_owner() {
+        let h = harness();
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap();
+        let err = h
+            .volumes
+            .ensure(&req(VolumeKind::Ramdisk, 8 << 20))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::Invalid(m) if m.contains("kind")));
+        let mut other_owner = req(VolumeKind::Block, 8 << 20);
+        other_owner.uid_base = 196608;
+        let err = h.volumes.ensure(&other_owner).await.unwrap_err();
+        assert!(matches!(err, VolumeError::Invalid(m) if m.contains("uid_base")));
+        // The same request is still fine.
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_volume_forgets_its_kind_and_owner() {
+        let h = harness();
+        let r = req(VolumeKind::Block, 8 << 20);
+        h.volumes.ensure(&r).await.unwrap();
+        h.volumes.remove(&r.volume).await.unwrap();
+        h.volumes
+            .ensure(&req(VolumeKind::Ramdisk, 8 << 20))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tools_run_by_absolute_path() {
+        let h = harness();
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap();
+        for call in h.runner.calls() {
+            assert!(call.prog.starts_with("/usr/"), "{}", call.prog);
+        }
+    }
+
+    #[tokio::test]
     async fn an_existing_image_is_never_formatted_again() {
         let h = harness();
         let r = req(VolumeKind::Block, 8 << 20);
@@ -668,7 +913,7 @@ mod tests {
         h.runner.clear();
         h.volumes.ensure(&r).await.unwrap();
         assert!(
-            lines(&h).iter().all(|l| !l.starts_with("mkfs")),
+            lines(&h).iter().all(|l| !l.starts_with("/usr/sbin/mkfs")),
             "{:?}",
             lines(&h)
         );
@@ -680,10 +925,10 @@ mod tests {
         let r = req(VolumeKind::Block, 8 << 20);
         h.volumes.ensure(&r).await.unwrap();
         h.runner
-            .script("mountpoint", None, CommandOutput::success());
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
         h.runner.clear();
         h.volumes.ensure(&r).await.unwrap();
-        assert!(lines(&h).iter().all(|l| !l.starts_with("mount ")));
+        assert!(lines(&h).iter().all(|l| !l.starts_with("/usr/bin/mount ")));
     }
 
     #[tokio::test]
@@ -706,8 +951,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_mkfs_leaves_no_image_so_the_next_try_formats_again() {
         let h = harness();
-        h.runner
-            .script("mkfs.ext4", None, CommandOutput::failure(1, "boom"));
+        h.runner.script(
+            "/usr/sbin/mkfs.ext4",
+            None,
+            CommandOutput::failure(1, "boom"),
+        );
         let err = h
             .volumes
             .ensure(&req(VolumeKind::Block, 8 << 20))
@@ -729,9 +977,9 @@ mod tests {
         assert_eq!(
             lines(&h),
             vec![
-                format!("mountpoint -q {base}/mnt"),
+                format!("/usr/bin/mountpoint -q {base}/mnt"),
                 format!(
-                    "mount -t tmpfs -o size=67108864,mode=0770,uid=131072,gid=989,nosuid,nodev tmpfs {base}/mnt"
+                    "/usr/bin/mount -t tmpfs -o size=67108864,mode=0770,uid=131072,gid=989,nosuid,nodev tmpfs {base}/mnt"
                 ),
             ]
         );
@@ -745,20 +993,26 @@ mod tests {
             .await
             .unwrap();
         h.volumes
-            .ensure(&req(VolumeKind::Ramdisk, 8 << 20))
+            .ensure(&EnsureVolume {
+                volume: VolumeRef::new(&replica(), "cache").unwrap(),
+                ..req(VolumeKind::Ramdisk, 8 << 20)
+            })
             .await
             .unwrap();
         h.runner
-            .script("mountpoint", None, CommandOutput::success());
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
         h.volumes
-            .ensure(&req(VolumeKind::Ramdisk, 16 << 20))
+            .ensure(&EnsureVolume {
+                volume: VolumeRef::new(&replica(), "cache").unwrap(),
+                ..req(VolumeKind::Ramdisk, 16 << 20)
+            })
             .await
             .unwrap();
         let mounts: Vec<_> = h
             .runner
             .calls()
             .into_iter()
-            .filter(|c| c.prog == "mount")
+            .filter(|c| c.prog == "/usr/bin/mount")
             .collect();
         assert_eq!(mounts.len(), 3);
         for call in mounts {
@@ -777,7 +1031,7 @@ mod tests {
         h.volumes.ensure(&r).await.unwrap();
         // Mounted before the unmount, gone after it.
         h.runner
-            .script("mountpoint", None, CommandOutput::success());
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
         h.runner.clear();
         // The `mountpoint` after `umount` must report unmounted: a wrapper
         // swaps the script when `umount` runs.
@@ -789,9 +1043,9 @@ mod tests {
                 args: &'a [&'a str],
                 stdin: Option<Vec<u8>>,
             ) -> BoxFuture<'a, io::Result<CommandOutput>> {
-                if prog == "umount" {
+                if prog == "/usr/bin/umount" {
                     self.0
-                        .script("mountpoint", None, CommandOutput::failure(32, ""));
+                        .script("/usr/bin/mountpoint", None, CommandOutput::failure(32, ""));
                 }
                 self.0.run(prog, args, stdin)
             }
@@ -800,12 +1054,13 @@ mod tests {
         let volumes = HostVolumes::new(
             h.root.clone(),
             989,
+            ToolPaths::default(),
             flip.clone(),
-            Arc::new(CommandMounter::new(flip)),
+            Arc::new(CommandMounter::new(ToolPaths::default(), flip)),
         );
         volumes.remove(&r.volume).await.unwrap();
         let l = lines(&h);
-        assert!(l.iter().any(|c| c.starts_with("umount ")), "{l:?}");
+        assert!(l.iter().any(|c| c.starts_with("/usr/bin/umount ")), "{l:?}");
         assert!(!h.root.join("shop/prod/redis/1/data").exists());
         volumes.remove(&r.volume).await.unwrap();
     }
@@ -816,7 +1071,7 @@ mod tests {
         let r = req(VolumeKind::Block, 8 << 20);
         h.volumes.ensure(&r).await.unwrap();
         h.runner
-            .script("mountpoint", None, CommandOutput::success());
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
         let err = h.volumes.remove(&r.volume).await.unwrap_err();
         assert!(matches!(err, VolumeError::Invalid(_)));
         assert!(h.root.join("shop/prod/redis/1/data/disk.img").exists());
@@ -831,7 +1086,7 @@ mod tests {
             Err(VolumeError::NotMounted(_))
         ));
         h.runner
-            .script("mountpoint", None, CommandOutput::success());
+            .script("/usr/bin/mountpoint", None, CommandOutput::success());
         assert_eq!(
             h.volumes.mount_path(&r.volume).await.unwrap(),
             h.root.join("shop/prod/redis/1/data/mnt")

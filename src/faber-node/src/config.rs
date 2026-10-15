@@ -93,6 +93,9 @@ pub struct NodeConfig {
     pub socket: PathBuf,
     pub volume_root: PathBuf,
     pub containerd_socket: PathBuf,
+    /// Directories of the host tools, run by absolute path.
+    pub bin_dir: PathBuf,
+    pub sbin_dir: PathBuf,
     /// CRI runtime handler; empty for the runtime's default.
     pub runtime_handler: String,
     pub uid_range: UidRange,
@@ -173,6 +176,8 @@ impl NodeConfig {
             socket: path("FABER_NODE_SOCKET", DEFAULT_SOCKET)?,
             volume_root: path("FABER_NODE_VOLUME_ROOT", DEFAULT_VOLUME_ROOT)?,
             containerd_socket: path("FABER_NODE_CONTAINERD_SOCKET", faber_cri::DEFAULT_SOCKET)?,
+            bin_dir: path("FABER_NODE_BIN_DIR", "/usr/bin")?,
+            sbin_dir: path("FABER_NODE_SBIN_DIR", "/usr/sbin")?,
             runtime_handler: map
                 .get("FABER_NODE_RUNTIME_HANDLER")
                 .cloned()
@@ -207,6 +212,8 @@ FABER_NODE_FABER_GID=989
             PathBuf::from("/var/lib/faber-node/volumes")
         );
         assert_eq!((cfg.faber_uid, cfg.faber_gid), (990, 989));
+        assert_eq!(cfg.bin_dir, PathBuf::from("/usr/bin"));
+        assert_eq!(cfg.sbin_dir, PathBuf::from("/usr/sbin"));
     }
 
     #[test]

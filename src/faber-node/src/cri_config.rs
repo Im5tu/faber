@@ -143,18 +143,24 @@ pub struct ResolvedMount {
     pub host_path: PathBuf,
     pub read_only: bool,
 }
-
-/// `(user, group)` of `uid`, `uid:gid` or a user name.
-fn run_as(user: Option<&str>) -> (Option<i64>, Option<i64>, String) {
+/// `(uid, gid, user name)` of `uid`, `uid:gid` or a user name. Anything
+/// else is an error: a user that cannot be read must not become root.
+fn run_as(user: Option<&str>) -> Result<(Option<i64>, Option<i64>, String), String> {
     let Some(user) = user else {
-        return (None, None, String::new());
+        return Ok((None, None, String::new()));
     };
+    let bad = || format!("user {user:?} is not a uid, uid:gid or a user name");
     match user.split_once(':') {
-        Some((uid, gid)) => (uid.parse().ok(), gid.parse().ok(), String::new()),
-        None => match user.parse() {
-            Ok(uid) => (Some(uid), None, String::new()),
-            Err(_) => (None, None, user.to_owned()),
-        },
+        Some((uid, gid)) => Ok((
+            Some(uid.parse().map_err(|_| bad())?),
+            Some(gid.parse().map_err(|_| bad())?),
+            String::new(),
+        )),
+        None if user.bytes().all(|b| b.is_ascii_digit()) && !user.is_empty() => {
+            Ok((Some(user.parse().map_err(|_| bad())?), None, String::new()))
+        }
+        None if user.is_empty() => Err(bad()),
+        None => Ok((None, None, user.to_owned())),
     }
 }
 
@@ -169,13 +175,13 @@ pub fn container_config(
     uid_base: u32,
     attempt: u32,
     mounts: &[ResolvedMount],
-) -> ContainerConfig {
-    let (uid, gid, username) = run_as(container.user.as_deref());
+) -> Result<ContainerConfig, String> {
+    let (uid, gid, username) = run_as(container.user.as_deref())?;
     let mut labels = labels(replica);
     labels.insert(LABEL_CONTAINER.to_owned(), container.name.clone());
     let cpu_millis = limit(container.resources.cpu_millis);
     let memory = limit(container.resources.memory_bytes);
-    ContainerConfig {
+    Ok(ContainerConfig {
         metadata: Some(ContainerMetadata {
             name: container_name(replica, &container.name),
             attempt,
@@ -241,7 +247,7 @@ pub fn container_config(
             }),
         }),
         ..Default::default()
-    }
+    })
 }
 
 /// `<workload>-<revision>-<container>`: unique within the pod.
@@ -256,6 +262,37 @@ mod tests {
     use faber_api_types::workload::Resources;
 
     use super::*;
+
+    /// The tests use valid users except where they say otherwise.
+    fn container_config(
+        replica: &ReplicaRef,
+        container: &ContainerSpec,
+        env: &SecretEnv,
+        uid_base: u32,
+        attempt: u32,
+        mounts: &[ResolvedMount],
+    ) -> ContainerConfig {
+        super::container_config(replica, container, env, uid_base, attempt, mounts).unwrap()
+    }
+
+    #[test]
+    fn an_unreadable_user_is_an_error_not_root() {
+        for bad in [
+            "1000:",
+            ":1000",
+            "a:b",
+            "1000:x",
+            "",
+            "99999999999999999999",
+            ":",
+        ] {
+            let mut spec = ContainerSpec::new("c", "i");
+            spec.user = Some(bad.into());
+            let r =
+                super::container_config(&replica(), &spec, &SecretEnv::default(), 65536, 0, &[]);
+            assert!(r.is_err(), "{bad:?}");
+        }
+    }
 
     fn replica() -> ReplicaRef {
         ReplicaRef {
