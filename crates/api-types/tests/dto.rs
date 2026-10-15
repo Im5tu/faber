@@ -873,18 +873,28 @@ fn workload_route_shapes() {
             spec: minimal_spec(),
             replicas: vec![
                 ReplicaStatus {
-                    node: 2,
+                    node: Some(2),
                     replica_index: 0,
                     revision: 7,
                     state: ReplicaState::Available,
                     pod_ip: Some("10.200.2.5".parse().unwrap()),
+                    reason: None,
                 },
                 ReplicaStatus {
-                    node: 3,
+                    node: Some(3),
                     replica_index: 1,
                     revision: 7,
                     state: ReplicaState::Unavailable,
                     pod_ip: None,
+                    reason: None,
+                },
+                ReplicaStatus {
+                    node: None,
+                    replica_index: 2,
+                    revision: 7,
+                    state: ReplicaState::Unavailable,
+                    pod_ip: None,
+                    reason: Some("insufficient_capacity".into()),
                 },
             ],
         },
@@ -895,7 +905,9 @@ fn workload_route_shapes() {
             "replicas": [
                 {"node": 2, "replica_index": 0, "revision": 7, "state": "available",
                  "pod_ip": "10.200.2.5"},
-                {"node": 3, "replica_index": 1, "revision": 7, "state": "unavailable"}
+                {"node": 3, "replica_index": 1, "revision": 7, "state": "unavailable"},
+                {"node": null, "replica_index": 2, "revision": 7, "state": "unavailable",
+                 "reason": "insufficient_capacity"}
             ]
         }),
     );

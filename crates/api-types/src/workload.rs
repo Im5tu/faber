@@ -1403,9 +1403,10 @@ pub struct WorkloadResponse {
     /// The generation of the environment the workload was read from.
     pub generation: u64,
     pub spec: WorkloadSpec,
-    /// What the nodes last reported for each replica, sorted by replica
-    /// index. Empty until a node reports one. A replica whose node has not
-    /// reported for three report intervals reads `unavailable`.
+    /// Each replica the leader has placed, sorted by replica index, with what
+    /// its node last reported. Empty until the leader has placed the workload.
+    /// A replica whose node has not reported for three report intervals reads
+    /// `unavailable`.
     #[serde(default)]
     pub replicas: Vec<ReplicaStatus>,
 }
@@ -1419,18 +1420,25 @@ pub enum ReplicaState {
     Unavailable,
 }
 
-/// One replica in [`WorkloadResponse::replicas`].
+/// One replica in [`WorkloadResponse::replicas`]: where the leader placed it
+/// and what that node reported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaStatus {
-    /// The node that runs the replica.
-    pub node: u64,
+    /// The node the replica is placed on. `null` while it is unplaced; then
+    /// `reason` says why and `state` is `unavailable`.
+    pub node: Option<u64>,
     pub replica_index: u32,
     /// The revision the replica runs.
     pub revision: u64,
+    /// `deploying` until the node reports the replica.
     pub state: ReplicaState,
     /// The replica's pod address, once it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_ip: Option<Ipv4Addr>,
+    /// Why the replica is unplaced: `insufficient_capacity`, `volume_lost`,
+    /// `pinned_node_unknown` or `no_node_available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]
