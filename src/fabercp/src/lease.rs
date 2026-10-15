@@ -489,7 +489,6 @@ mod tests {
     }
 
     use faber_api_types::{CreateInviteRequest, error_code};
-    use faber_container_runtime::ContainerRuntimeSpec;
     use openraft::ChangeMembers;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -710,7 +709,6 @@ mod tests {
                     name: "node-1".into(),
                     lease_renewed_at: 0,
                 },
-                containerd: ContainerRuntimeSpec::default(),
             })
             .await
             .unwrap();

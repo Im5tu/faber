@@ -1,7 +1,56 @@
 //! Atomic writes and removals for the config files this crate owns.
+//!
+//! The files are loaded by root, so nothing here follows a symlink: the
+//! target is read with `O_NOFOLLOW` (a symlink there is replaced, never read
+//! through or written through), and the temp file has a random name and is
+//! created with `O_EXCL | O_NOFOLLOW`.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::io;
 use std::path::Path;
+
+/// `O_NOFOLLOW`, or nothing where the flag is not known.
+#[cfg(target_os = "linux")]
+fn no_follow() -> i32 {
+    nix::fcntl::OFlag::O_NOFOLLOW.bits()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_follow() -> i32 {
+    0
+}
+
+/// 128 random bits as hex, from the keys the standard library seeds from the
+/// operating system.
+fn random_suffix() -> String {
+    let word = || RandomState::new().build_hasher().finish();
+    format!("{:016x}{:016x}", word(), word())
+}
+
+/// The content of `path`, or `None` when there is no regular file to compare
+/// with: it is missing, or it is a symlink (which is not read through).
+fn read_existing(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(no_follow());
+    }
+    let mut file = match opts.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(target_os = "linux")]
+        Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    Ok(Some(content))
+}
 
 /// Writes `content` to `<dir>/<file_name>` unless the file already holds
 /// exactly that. Returns whether it wrote.
@@ -12,13 +61,10 @@ use std::path::Path;
 /// containerd's `*.toml` import nor libcni's config loader picks up.
 pub(crate) fn write_if_changed(dir: &Path, file_name: &str, content: &[u8]) -> io::Result<bool> {
     let target = dir.join(file_name);
-    match std::fs::read(&target) {
-        Ok(existing) if existing == content => return Ok(false),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if read_existing(&target)?.is_some_and(|existing| existing == content) {
+        return Ok(false);
     }
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", random_suffix()));
     let result = write_and_rename(&tmp, &target, content);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -43,19 +89,14 @@ pub(crate) fn remove_if_exists(dir: &Path, file_name: &str) -> io::Result<bool> 
 fn write_and_rename(tmp: &Path, target: &Path, content: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
-    // A temp file left by a crashed run with the same pid must not wedge
-    // later writes; removing it first and then using `create_new` also means
-    // we never write through a symlink planted at the temp path.
-    match std::fs::remove_file(tmp) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
+    // `create_new` fails on anything already at the path, a symlink
+    // included, and the random name cannot be guessed to plant one.
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o644);
+        opts.mode(0o644).custom_flags(no_follow());
     }
     let mut file = opts.open(tmp)?;
     #[cfg(unix)]
@@ -117,5 +158,58 @@ mod tests {
     fn remove_if_exists_missing_dir_is_no_change() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!remove_if_exists(&dir.path().join("nope"), "a.conf").unwrap());
+    }
+
+    #[test]
+    fn temp_names_are_random_and_long() {
+        let (a, b) = (random_suffix(), random_suffix());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_at_the_target_is_replaced_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The link points at a file that already holds the new content, so
+        // reading through it would report "unchanged" and write nothing.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "new").unwrap();
+        let target = dir.path().join("a.conf");
+        symlink(&victim, &target).unwrap();
+
+        assert!(write_if_changed(dir.path(), "a.conf", b"new").unwrap());
+        assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"new");
+
+        // A link to a file with other content: the file is left alone.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&victim, "precious").unwrap();
+        symlink(&victim, &target).unwrap();
+        assert!(write_if_changed(dir.path(), "a.conf", b"new").unwrap());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_name_is_never_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        // The name the old scheme used: pid, no randomness.
+        let old = dir
+            .path()
+            .join(format!(".a.conf.{}.tmp", std::process::id()));
+        symlink(&victim, &old).unwrap();
+
+        assert!(write_if_changed(dir.path(), "a.conf", b"new").unwrap());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
     }
 }

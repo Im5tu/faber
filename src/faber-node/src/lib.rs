@@ -13,6 +13,8 @@
 pub mod config;
 pub mod connection;
 pub mod cri_config;
+pub mod dirs;
+pub mod host_net;
 #[cfg(target_os = "linux")]
 pub mod listener;
 pub mod node;

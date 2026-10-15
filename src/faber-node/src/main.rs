@@ -45,6 +45,8 @@ mod linux {
     use faber_cri::GrpcCri;
     use faber_network_management::SystemRunner;
     use faber_node::config::{NodeConfig, root_only_writable};
+    use faber_node::dirs::DirPolicy;
+    use faber_node::host_net::IpHostNetworks;
     use faber_node::listener;
     use faber_node::node::Node;
     use faber_node::peer::Authorizer;
@@ -86,18 +88,26 @@ mod linux {
                 config.volume_root.display()
             );
         }
-        // Root loads what is written here (containerd config, CNI config),
-        // so nobody else may be able to replace it.
-        for dir in [&config.containerd_conf_dir, &config.cni_conf_dir] {
-            let meta = std::fs::symlink_metadata(dir)
-                .with_context(|| format!("checking {}", dir.display()))?;
-            if !meta.is_dir() || !root_only_writable(meta.uid(), meta.mode()) {
-                anyhow::bail!(
-                    "{} must be a directory owned by root and not writable by group or others",
-                    dir.display()
-                );
-            }
+        // Root loads what is written here (containerd config, CNI config) and
+        // runs the CNI plugins, so nobody else may be able to replace any of
+        // it, or any directory above it. The config directories are made if
+        // they are missing; the plugin directory is the installer's.
+        let policy = DirPolicy::root();
+        let containerd = config.containerd();
+        for dir in [&containerd.conf_dir, &containerd.cni_conf_dir] {
+            policy
+                .create_if_missing(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
         }
+        policy.check_runtime_dirs(&containerd).map_err(|e| {
+            anyhow::anyhow!(
+                "the {} cannot be trusted: {} (every directory of the path must be owned by \
+                 root and not writable by group or others)",
+                e.role,
+                e.detail
+            )
+        })?;
+        let networks = IpHostNetworks::new(runner.clone(), &tools);
         let volumes = HostVolumes::new(
             config.volume_root.clone(),
             config.faber_gid,
@@ -110,7 +120,9 @@ mod linux {
             config.runtime_handler.clone(),
             cri,
             Arc::new(volumes),
-            config.containerd(),
+            containerd,
+            policy,
+            Arc::new(networks),
         ));
         let listener = listener::bind(&config)?;
         tracing::info!(socket = %config.socket.display(), "faber-node listening");

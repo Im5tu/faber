@@ -104,7 +104,6 @@ impl Cluster {
         )]);
         ReplicatedStateView {
             mesh: None,
-            containerd: None,
             placement: Some(PlacementView {
                 applied: 0,
                 mesh: None,

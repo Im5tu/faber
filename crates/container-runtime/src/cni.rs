@@ -66,13 +66,13 @@ struct Range {
 
 /// The conflist for `network`: pretty-printed JSON with a trailing newline.
 /// Deterministic for equal input.
-pub(crate) fn render(network: &PodNetworkSpec) -> String {
+pub(crate) fn render(network: &PodNetworkSpec, bridge: &str) -> String {
     let conf = ConfList {
         cni_version: CNI_VERSION,
         name: NETWORK_NAME,
         plugins: [Bridge {
             kind: "bridge",
-            bridge: &network.bridge,
+            bridge,
             is_gateway: true,
             is_default_gateway: true,
             force_address: true,
@@ -100,7 +100,6 @@ mod tests {
 
     fn network() -> PodNetworkSpec {
         PodNetworkSpec {
-            bridge: "faberbr0".into(),
             subnet: "10.200.3.0/24".parse().unwrap(),
             mtu: 1420,
         }
@@ -136,16 +135,18 @@ mod tests {
   ]
 }
 "#;
-        assert_eq!(render(&network()), expected);
+        assert_eq!(render(&network(), "faberbr0"), expected);
     }
 
     #[test]
     fn render_follows_the_spec() {
-        let out = render(&PodNetworkSpec {
-            bridge: "br\"x".into(),
-            subnet: "10.200.7.0/24".parse().unwrap(),
-            mtu: 1380,
-        });
+        let out = render(
+            &PodNetworkSpec {
+                subnet: "10.200.7.0/24".parse().unwrap(),
+                mtu: 1380,
+            },
+            "br\"x",
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let plugin = &v["plugins"][0];
         assert_eq!(v["plugins"].as_array().unwrap().len(), 1);

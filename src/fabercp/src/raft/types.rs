@@ -6,7 +6,6 @@ use std::fmt;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
 
-use faber_container_runtime::ContainerRuntimeSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,7 +54,7 @@ pub enum Request {
     /// through `Raft::client_write`. Rejected for `mesh::state::RESERVED_KEYS`
     /// and for the keys of `apps::state::is_reserved_key`.
     Set { key: String, value: Value },
-    /// Seeds `mesh` and `config/containerd`. Rejected with
+    /// Seeds `mesh`. Rejected with
     /// `already_initialized` once `mesh` exists, and with `bad_request` for
     /// a bad founder, founder name or container range. `apply` allocates
     /// the founder's container subnet and ignores `founder.container_subnet`
@@ -64,7 +63,6 @@ pub enum Request {
     InitCluster {
         mesh: MeshConfig,
         founder: NodeRecord,
-        containerd: ContainerRuntimeSpec,
     },
     /// Reserves a node ID, mesh IP and name for a new node, and drops an
     /// older live invite for the same name. Answers [`Response::Invited`],
@@ -320,7 +318,6 @@ mod tests {
             Request::InitCluster {
                 mesh: MeshConfig::default(),
                 founder,
-                containerd: ContainerRuntimeSpec::default(),
             },
             Request::CreateInvite {
                 invite_id: "ab".repeat(16),
@@ -515,7 +512,6 @@ mod tests {
                 "node_id": 1, "public_key": "pk1", "mesh_ip": "10.99.0.1",
                 "endpoint": "203.0.113.1:51820", "invite_id": null
             },
-            "containerd": ContainerRuntimeSpec::default(),
         }});
         let Request::InitCluster { mesh, founder, .. } =
             serde_json::from_value::<Request>(old).unwrap()
@@ -546,7 +542,6 @@ mod tests {
                 name: String::new(),
                 lease_renewed_at: 0,
             },
-            containerd: ContainerRuntimeSpec::default(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["InitCluster"]["mesh"]["container_cidr"], "10.200.0.0/16");

@@ -14,10 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::cni::{self, CONFLIST_FILE};
-use crate::{
-    BoxFuture, ContainerRuntime, ContainerRuntimeSpec, NodeRuntimeSpec, PodNetworkSpec,
-    RuntimeError, file,
-};
+use crate::{BoxFuture, ContainerRuntime, NodeRuntimeSpec, PodNetworkSpec, RuntimeError, file};
 
 /// File name of the drop-in inside the conf dir.
 pub const DROP_IN_FILE: &str = "faber.toml";
@@ -32,7 +29,8 @@ const RECONCILE: &str = "configuring containerd";
 /// containerd, configured through the drop-in `<conf_dir>/faber.toml` and the
 /// CNI network config `<cni_conf_dir>/10-faber.conflist`. The drop-in tells
 /// containerd to read CNI configs from `cni_conf_dir` and to run CNI plugins
-/// from `cni_bin_dir`.
+/// from `cni_bin_dir`, to use the systemd cgroup driver, and which pause image
+/// to use. The CNI config names `bridge`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Containerd {
     /// Directory the drop-in is written to.
@@ -42,11 +40,14 @@ pub struct Containerd {
     pub cni_conf_dir: PathBuf,
     /// Directory containerd is told to run CNI plugins from.
     pub cni_bin_dir: PathBuf,
+    /// The pause image of every pod sandbox.
+    pub sandbox_image: String,
+    /// Name of the bridge containers attach to.
+    pub bridge: String,
 }
 
 impl ContainerRuntime for Containerd {
-    /// On a blocking thread: writes the drop-in from `spec.settings` if it
-    /// changed, then writes the conflist from `spec.pod_network` if it
+    /// On a blocking thread: writes the drop-in if it changed, then writes the conflist from `spec.pod_network` if it
     /// changed, or removes it when there is no network. Returns whether
     /// either file changed.
     ///
@@ -62,12 +63,13 @@ impl ContainerRuntime for Containerd {
             tokio::task::spawn_blocking(move || {
                 let drop_in = write_if_changed(
                     &this.conf_dir,
-                    &spec.settings,
+                    &this.sandbox_image,
                     &this.cni_bin_dir,
                     &this.cni_conf_dir,
                 )
                 .map_err(|e| (WRITE_DROP_IN, e))?;
-                let conflist = apply_pod_network(&this.cni_conf_dir, spec.pod_network.as_ref())?;
+                let conflist =
+                    apply_pod_network(&this.cni_conf_dir, &this.bridge, spec.pod_network.as_ref())?;
                 Ok(drop_in || conflist)
             })
             .await
@@ -105,12 +107,13 @@ impl ContainerRuntime for Containerd {
 /// - `[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]`
 ///   `runtime_type = "io.containerd.runc.v2"`
 /// - `[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]`
-///   `SystemdCgroup`
+///   `SystemdCgroup = true`, which the pod cgroup parent (a systemd slice)
+///   needs
 /// - `[plugins."io.containerd.grpc.v1.cri".cni] bin_dir` and `conf_dir`
 ///
 /// Starts with [`MANAGED_MARKER`] and `version = 2`. Strings are TOML-escaped.
 /// Deterministic for equal input.
-fn render(settings: &ContainerRuntimeSpec, cni_bin_dir: &Path, cni_conf_dir: &Path) -> String {
+fn render(sandbox_image: &str, cni_bin_dir: &Path, cni_conf_dir: &Path) -> String {
     const CRI: &str = r#"plugins."io.containerd.grpc.v1.cri""#;
     format!(
         "{MANAGED_MARKER}\n\
@@ -120,11 +123,10 @@ fn render(settings: &ContainerRuntimeSpec, cni_bin_dir: &Path, cni_conf_dir: &Pa
          \n\
          [{CRI}.containerd.runtimes.runc]\n  runtime_type = \"io.containerd.runc.v2\"\n\
          \n\
-         [{CRI}.containerd.runtimes.runc.options]\n  SystemdCgroup = {cgroup}\n\
+         [{CRI}.containerd.runtimes.runc.options]\n  SystemdCgroup = true\n\
          \n\
          [{CRI}.cni]\n  bin_dir = {bin}\n  conf_dir = {conf}\n",
-        sandbox = toml_string(&settings.sandbox_image),
-        cgroup = settings.systemd_cgroup,
+        sandbox = toml_string(sandbox_image),
         bin = toml_string(&cni_bin_dir.to_string_lossy()),
         conf = toml_string(&cni_conf_dir.to_string_lossy()),
     )
@@ -158,14 +160,14 @@ fn toml_string(value: &str) -> String {
 /// exactly that (`file::write_if_changed`). Returns whether it wrote.
 fn write_if_changed(
     dir: &Path,
-    settings: &ContainerRuntimeSpec,
+    sandbox_image: &str,
     cni_bin_dir: &Path,
     cni_conf_dir: &Path,
 ) -> io::Result<bool> {
     file::write_if_changed(
         dir,
         DROP_IN_FILE,
-        render(settings, cni_bin_dir, cni_conf_dir).as_bytes(),
+        render(sandbox_image, cni_bin_dir, cni_conf_dir).as_bytes(),
     )
 }
 
@@ -177,11 +179,12 @@ fn write_if_changed(
 /// write.
 fn apply_pod_network(
     dir: &Path,
+    bridge: &str,
     network: Option<&PodNetworkSpec>,
 ) -> Result<bool, (&'static str, io::Error)> {
     match network {
         Some(network) => {
-            file::write_if_changed(dir, CONFLIST_FILE, cni::render(network).as_bytes())
+            file::write_if_changed(dir, CONFLIST_FILE, cni::render(network, bridge).as_bytes())
                 .map_err(|e| (WRITE_CONFLIST, e))
         }
         None => file::remove_if_exists(dir, CONFLIST_FILE).map_err(|e| (REMOVE_CONFLIST, e)),
@@ -195,20 +198,30 @@ mod tests {
     const BIN: &str = "/opt/cni/bin";
     const CONF: &str = "/etc/cni/net.d";
 
-    fn render_with(settings: &ContainerRuntimeSpec) -> String {
-        render(settings, Path::new(BIN), Path::new(CONF))
+    const IMAGE: &str = "registry.k8s.io/pause:3.10";
+
+    fn render_with(sandbox_image: &str) -> String {
+        render(sandbox_image, Path::new(BIN), Path::new(CONF))
     }
 
-    fn write_with(dir: &Path, settings: &ContainerRuntimeSpec) -> io::Result<bool> {
-        write_if_changed(dir, settings, Path::new(BIN), Path::new(CONF))
+    fn write_with(dir: &Path, sandbox_image: &str) -> io::Result<bool> {
+        write_if_changed(dir, sandbox_image, Path::new(BIN), Path::new(CONF))
     }
 
-    /// The default settings with no container network.
-    fn node_spec() -> NodeRuntimeSpec {
-        NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
-            pod_network: None,
+    /// containerd with these directories and the default image and bridge.
+    fn containerd(conf_dir: impl Into<PathBuf>, cni_conf_dir: impl Into<PathBuf>) -> Containerd {
+        Containerd {
+            conf_dir: conf_dir.into(),
+            cni_conf_dir: cni_conf_dir.into(),
+            cni_bin_dir: BIN.into(),
+            sandbox_image: IMAGE.into(),
+            bridge: "faberbr0".into(),
         }
+    }
+
+    /// No container network.
+    fn node_spec() -> NodeRuntimeSpec {
+        NodeRuntimeSpec { pod_network: None }
     }
 
     #[test]
@@ -229,21 +242,23 @@ version = 2
   bin_dir = "/opt/cni/bin"
   conf_dir = "/etc/cni/net.d"
 "#;
-        assert_eq!(render_with(&ContainerRuntimeSpec::default()), expected);
+        assert_eq!(render_with(IMAGE), expected);
     }
 
     #[test]
     fn render_custom_values_escaped() {
-        let s = ContainerRuntimeSpec {
-            systemd_cgroup: false,
-            sandbox_image: "reg.example/pause:\"x\"".into(),
-        };
-        let out = render(&s, Path::new("C:\\cni\\bin"), Path::new("/etc/cni\n[evil]"));
+        let out = render(
+            "reg.example/pause:\"x\"",
+            Path::new("C:\\cni\\bin"),
+            Path::new("/etc/cni\n[evil]"),
+        );
         assert!(
             out.starts_with("# managed by faber\nversion = 2\n"),
             "{out}"
         );
-        assert!(out.contains("  SystemdCgroup = false\n"), "{out}");
+        // The cgroup driver is not a setting: the pod cgroup parent is a
+        // systemd slice.
+        assert!(out.contains("  SystemdCgroup = true\n"), "{out}");
         assert!(
             out.contains(r#"  sandbox_image = "reg.example/pause:\"x\"""#),
             "{out}"
@@ -270,24 +285,19 @@ version = 2
     #[test]
     fn write_if_changed_writes_then_skips() {
         let dir = tempfile::tempdir().unwrap();
-        let s = ContainerRuntimeSpec::default();
         let path = dir.path().join(DROP_IN_FILE);
 
-        assert!(write_with(dir.path(), &s).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(&s));
+        assert!(write_with(dir.path(), IMAGE).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(IMAGE));
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        assert!(!write_with(dir.path(), &s).unwrap());
+        assert!(!write_with(dir.path(), IMAGE).unwrap());
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
 
-        let changed = ContainerRuntimeSpec {
-            systemd_cgroup: false,
-            ..s
-        };
-        assert!(write_with(dir.path(), &changed).unwrap());
+        assert!(write_with(dir.path(), "other/pause:1").unwrap());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            render_with(&changed)
+            render_with("other/pause:1")
         );
 
         // Only the drop-in is left; no temp files.
@@ -303,33 +313,27 @@ version = 2
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DROP_IN_FILE);
         std::fs::write(&path, "junk").unwrap();
-        assert!(write_with(dir.path(), &ContainerRuntimeSpec::default()).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            render_with(&ContainerRuntimeSpec::default())
-        );
+        assert!(write_with(dir.path(), IMAGE).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(IMAGE));
     }
 
     #[test]
     fn write_if_changed_missing_dir_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert!(write_with(&missing, &ContainerRuntimeSpec::default()).is_err());
+        assert!(write_with(&missing, IMAGE).is_err());
     }
 
     #[tokio::test]
     async fn reconcile_writes_once_then_reports_no_change() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime: std::sync::Arc<dyn ContainerRuntime> = std::sync::Arc::new(Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().to_path_buf(),
-            cni_conf_dir: dir.path().join("cni"),
-        });
+        let runtime: std::sync::Arc<dyn ContainerRuntime> =
+            std::sync::Arc::new(containerd(dir.path().to_path_buf(), dir.path().join("cni")));
         let spec = node_spec();
         assert!(runtime.reconcile(&spec).await.unwrap());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings, Path::new(BIN), &dir.path().join("cni"))
+            render(IMAGE, Path::new(BIN), &dir.path().join("cni"))
         );
         assert!(!runtime.reconcile(&spec).await.unwrap());
     }
@@ -338,11 +342,7 @@ version = 2
     async fn reconcile_reports_what_failed_and_why() {
         use std::error::Error as _;
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().join("nope"),
-            cni_conf_dir: dir.path().join("cni"),
-        };
+        let runtime = containerd(dir.path().join("nope"), dir.path().join("cni"));
         let err = runtime.reconcile(&node_spec()).await.unwrap_err();
         assert_eq!(err.to_string(), "writing the containerd drop-in");
         assert!(err.source().is_some());
@@ -353,19 +353,13 @@ version = 2
         let cni_conf_dir = dir.join("cni");
         std::fs::create_dir(&cni_conf_dir).unwrap();
         let conflist = cni_conf_dir.join(CONFLIST_FILE);
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.to_path_buf(),
-            cni_conf_dir,
-        };
+        let runtime = containerd(dir.to_path_buf(), cni_conf_dir);
         (runtime, conflist)
     }
 
     fn node_spec_with_subnet(subnet: &str) -> NodeRuntimeSpec {
         NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
             pod_network: Some(PodNetworkSpec {
-                bridge: "faberbr0".into(),
                 subnet: subnet.parse().unwrap(),
                 mtu: 1420,
             }),
@@ -381,11 +375,11 @@ version = 2
         assert!(runtime.reconcile(&spec).await.unwrap());
         assert_eq!(
             std::fs::read_to_string(&conflist).unwrap(),
-            cni::render(spec.pod_network.as_ref().unwrap())
+            cni::render(spec.pod_network.as_ref().unwrap(), "faberbr0")
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings, Path::new(BIN), &dir.path().join("cni"))
+            render(IMAGE, Path::new(BIN), &dir.path().join("cni"))
         );
         assert!(!runtime.reconcile(&spec).await.unwrap());
 
@@ -425,7 +419,7 @@ version = 2
         assert!(runtime.reconcile(&moved).await.unwrap());
         assert_eq!(
             std::fs::read_to_string(&conflist).unwrap(),
-            cni::render(moved.pod_network.as_ref().unwrap())
+            cni::render(moved.pod_network.as_ref().unwrap(), "faberbr0")
         );
         assert!(!runtime.reconcile(&moved).await.unwrap());
     }
@@ -474,29 +468,21 @@ version = 2
     async fn reconcile_missing_cni_dir_errors_after_writing_the_drop_in() {
         use std::error::Error as _;
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().to_path_buf(),
-            cni_conf_dir: dir.path().join("nope"),
-        };
+        let runtime = containerd(dir.path().to_path_buf(), dir.path().join("nope"));
         let spec = node_spec_with_subnet("10.200.3.0/24");
         let err = runtime.reconcile(&spec).await.unwrap_err();
         assert_eq!(err.to_string(), "writing the CNI network config");
         assert!(err.source().is_some());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings, Path::new(BIN), &dir.path().join("nope"))
+            render(IMAGE, Path::new(BIN), &dir.path().join("nope"))
         );
     }
 
     #[tokio::test]
     async fn reconcile_missing_cni_dir_is_fine_without_a_pod_network() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().to_path_buf(),
-            cni_conf_dir: dir.path().join("nope"),
-        };
+        let runtime = containerd(dir.path().to_path_buf(), dir.path().join("nope"));
         assert!(runtime.reconcile(&node_spec()).await.unwrap());
         assert!(!runtime.reconcile(&node_spec()).await.unwrap());
     }
@@ -528,18 +514,14 @@ version = 2
 
         assert!(!runtime.remove_pod_network().await.unwrap());
         assert!(other.exists());
-        // No settings were given, so there is no drop-in to write.
+        // Nothing was configured, so there is no drop-in to write.
         assert!(!dir.path().join(DROP_IN_FILE).exists());
     }
 
     #[tokio::test]
     async fn remove_pod_network_needs_neither_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().join("nope"),
-            cni_conf_dir: dir.path().join("nor-this"),
-        };
+        let runtime = containerd(dir.path().join("nope"), dir.path().join("nor-this"));
         assert!(!runtime.remove_pod_network().await.unwrap());
     }
 
@@ -550,11 +532,7 @@ version = 2
         std::fs::create_dir(&cni_conf_dir).unwrap();
         let conflist = cni_conf_dir.join(CONFLIST_FILE);
         std::fs::write(&conflist, "{}").unwrap();
-        let runtime = Containerd {
-            cni_bin_dir: "/opt/cni/bin".into(),
-            conf_dir: dir.path().join("nope"),
-            cni_conf_dir,
-        };
+        let runtime = containerd(dir.path().join("nope"), cni_conf_dir);
         assert!(runtime.remove_pod_network().await.unwrap());
         assert!(!conflist.exists());
     }
@@ -578,7 +556,7 @@ version = 2
     fn write_if_changed_sets_mode_0644() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        write_with(dir.path(), &ContainerRuntimeSpec::default()).unwrap();
+        write_with(dir.path(), IMAGE).unwrap();
         let mode = std::fs::metadata(dir.path().join(DROP_IN_FILE))
             .unwrap()
             .permissions()

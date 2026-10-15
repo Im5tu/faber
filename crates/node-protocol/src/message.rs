@@ -38,13 +38,12 @@ pub struct DnsConfig {
     pub searches: Vec<String>,
 }
 
-/// The container network of this node: the fields of the CNI config.
+/// The container network of this node: the fields of the CNI config that
+/// are not faber-node's own to decide (it names the bridge itself).
 /// faber-node checks every one before it writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PodNetwork {
-    /// Name of the bridge containers attach to.
-    pub bridge: String,
     /// This node's container subnet.
     pub subnet: Ipv4Net,
     pub mtu: u16,
@@ -118,12 +117,11 @@ pub enum Request {
     /// argument: no path is ever sent.
     ListVolumes,
     /// Brings the containerd drop-in and the CNI network config to this
-    /// state, in files and directories that faber-node alone names. No path
-    /// is ever sent. Answered with [`Response::Changed`].
+    /// state, in files and directories that faber-node alone names, with
+    /// settings (cgroup driver, pause image, bridge, plugin directory) that
+    /// faber-node alone chooses. No path is ever sent. Answered with
+    /// [`Response::Changed`].
     ConfigureRuntime {
-        /// Use the systemd cgroup driver.
-        systemd_cgroup: bool,
-        sandbox_image: String,
         /// `None` removes the CNI network config: this node has no subnet.
         pod_network: Option<PodNetwork>,
     },
@@ -327,19 +325,12 @@ mod tests {
             Request::ListReplicas,
             Request::ListVolumes,
             Request::ConfigureRuntime {
-                systemd_cgroup: true,
-                sandbox_image: "registry.k8s.io/pause:3.10".into(),
                 pod_network: Some(PodNetwork {
-                    bridge: "faberbr0".into(),
                     subnet: "10.200.3.0/24".parse().unwrap(),
                     mtu: 1420,
                 }),
             },
-            Request::ConfigureRuntime {
-                systemd_cgroup: false,
-                sandbox_image: "pause:3".into(),
-                pod_network: None,
-            },
+            Request::ConfigureRuntime { pod_network: None },
             Request::RemoveCniConfig,
         ]
     }
@@ -423,16 +414,19 @@ mod tests {
             r#""path":"/etc""#,
             r#""content":"x""#,
             r#""conf_dir":"/tmp""#,
+            r#""sandbox_image":"p:1""#,
+            r#""systemd_cgroup":false"#,
         ] {
-            let configure = format!(
-                r#"{{"type":"configure_runtime","systemd_cgroup":true,"sandbox_image":"p:1","pod_network":null,{extra}}}"#
-            );
+            let configure = format!(r#"{{"type":"configure_runtime","pod_network":null,{extra}}}"#);
             assert!(
                 serde_json::from_str::<Request>(&configure).is_err(),
                 "{extra}"
             );
         }
-        let network = r#"{"bridge":"faberbr0","subnet":"10.200.3.0/24","mtu":1420,"dir":"/x"}"#;
+        let network = r#"{"subnet":"10.200.3.0/24","mtu":1420,"dir":"/x"}"#;
+        assert!(serde_json::from_str::<PodNetwork>(network).is_err());
+        // The bridge is faber-node's to name.
+        let network = r#"{"bridge":"wg0","subnet":"10.200.3.0/24","mtu":1420}"#;
         assert!(serde_json::from_str::<PodNetwork>(network).is_err());
     }
 

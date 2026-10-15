@@ -632,7 +632,6 @@ mod tests {
         assert_eq!(step.name(), "services");
         let view = ReplicatedStateView {
             mesh: None,
-            containerd: None,
             placement: Some(
                 Cluster::new(1, HTTP, &[1])
                     .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])

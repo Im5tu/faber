@@ -5,8 +5,8 @@
 //! [`Containerd`] is the one implementation today; supporting another runtime
 //! means adding another implementation of the trait.
 //!
-//! [`Containerd`] owns two files: the containerd drop-in, rendered from the
-//! cluster-wide settings, and the CNI network config ([`cni`]), rendered from
+//! [`Containerd`] owns two files: the containerd drop-in, rendered from its
+//! own fixed settings, and the CNI network config ([`cni`]), rendered from
 //! this node's container network and removed while the node has none.
 
 pub mod cni;
@@ -24,29 +24,9 @@ pub use containerd::Containerd;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// What a node's container runtime should be configured with. A serde type,
-/// so callers can store and replicate it as is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContainerRuntimeSpec {
-    /// Use the systemd cgroup driver (runc `SystemdCgroup`).
-    pub systemd_cgroup: bool,
-    pub sandbox_image: String,
-}
-
-impl Default for ContainerRuntimeSpec {
-    fn default() -> Self {
-        Self {
-            systemd_cgroup: true,
-            sandbox_image: "registry.k8s.io/pause:3.10".into(),
-        }
-    }
-}
-
 /// What `ContainerRuntime::reconcile` applies on one node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRuntimeSpec {
-    /// Cluster-wide settings, replicated as they are.
-    pub settings: ContainerRuntimeSpec,
     /// This node's container network. `None` until raft has allocated a subnet.
     pub pod_network: Option<PodNetworkSpec>,
 }
@@ -54,8 +34,6 @@ pub struct NodeRuntimeSpec {
 /// The container network of one node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodNetworkSpec {
-    /// Name of the bridge containers attach to.
-    pub bridge: String,
     /// This node's container subnet.
     pub subnet: Ipv4Net,
     pub mtu: u16,
@@ -91,7 +69,7 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> BoxFuture<'a, Result<bool, RuntimeError>>;
 
     /// Removes this node's container network config and nothing else, for a
-    /// node that is leaving the cluster. Needs no settings. Idempotent.
+    /// node that is leaving the cluster. Idempotent.
     /// Returns whether a file was removed.
     fn remove_pod_network(&self) -> BoxFuture<'_, Result<bool, RuntimeError>>;
 }
@@ -103,28 +81,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spec_default_and_shape() {
-        let s = ContainerRuntimeSpec::default();
-        let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(
-            v,
-            json!({
-                "systemd_cgroup": true,
-                "sandbox_image": "registry.k8s.io/pause:3.10"
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<ContainerRuntimeSpec>(v).unwrap(),
-            s
-        );
-    }
-
-    #[test]
     fn node_spec_shape() {
         let s = NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
             pod_network: Some(PodNetworkSpec {
-                bridge: "faberbr0".into(),
                 subnet: "10.200.3.0/24".parse().unwrap(),
                 mtu: 1420,
             }),
@@ -133,12 +92,7 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "settings": {
-                    "systemd_cgroup": true,
-                    "sandbox_image": "registry.k8s.io/pause:3.10"
-                },
                 "pod_network": {
-                    "bridge": "faberbr0",
                     "subnet": "10.200.3.0/24",
                     "mtu": 1420
                 }
@@ -146,10 +100,7 @@ mod tests {
         );
         assert_eq!(serde_json::from_value::<NodeRuntimeSpec>(v).unwrap(), s);
 
-        let none = NodeRuntimeSpec {
-            pod_network: None,
-            ..s
-        };
+        let none = NodeRuntimeSpec { pod_network: None };
         let v = serde_json::to_value(&none).unwrap();
         assert_eq!(v["pod_network"], serde_json::Value::Null);
         assert_eq!(serde_json::from_value::<NodeRuntimeSpec>(v).unwrap(), none);

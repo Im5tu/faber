@@ -23,6 +23,11 @@ pub use replica::{
 };
 pub use subnet::{MAX_CONTAINER_SUBNET_PREFIX, check_container_subnet};
 
+/// Name of the bridge containers attach to, the same on every node. faber-node
+/// writes it into the CNI config and fabercp names it in the firewall; no
+/// request carries it, so fabercp cannot point CNI at another link.
+pub const POD_BRIDGE: &str = "faberbr0";
+
 /// Bumped on any incompatible change to the frames.
 pub const PROTOCOL_VERSION: u32 = 1;
 

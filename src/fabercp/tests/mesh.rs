@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use faber_api_types::{CreateInviteRequest, ErrorBody, FaberClient, InviteResponse, error_code};
-use faber_container_runtime::cni::CONFLIST_FILE;
-use faber_container_runtime::{ContainerRuntimeSpec, Containerd};
 use faber_network_management::fake::{Call, RecordingRunner};
 use faber_network_management::{BoxFuture, CommandOutput, CommandRunner, NetworkManager};
 use fabercp::dto::{PeerJoinRequest, PeerRegisterRequest};
 use fabercp::lease::LeaseTiming;
 use fabercp::mesh::{BootstrapInput, InviteToken, PendingJoin, identity, public_key_of};
+use fabercp::runner::NodeRuntime;
+use fabercp::runner::node::fake::FakeNode;
 use fabercp::{Config, HostBackends, NodeHandle, PeerListener, start_or_idle, start_with};
 use reqwest::StatusCode;
 use tempfile::TempDir;
@@ -110,6 +110,9 @@ enum Bootstrap {
 struct MeshNode {
     dir: TempDir,
     host: Arc<FakeHost>,
+    /// faber-node, which writes the runtime config. It outlives a launch,
+    /// as the files on a real host do.
+    node: FakeNode,
     handle: Option<NodeHandle>,
     /// Commands the fake host had seen when the peer listener was bound.
     before_bind: Arc<Mutex<Option<Vec<Call>>>>,
@@ -130,29 +133,24 @@ impl MeshNode {
         self.dir.path().join("state")
     }
 
-    fn containerd_dir(&self) -> PathBuf {
-        self.dir.path().join("containerd")
+    /// The subnet of the CNI network config faber-node keeps for this node,
+    /// or `None` while it has none.
+    fn cni_subnet(&self) -> Option<String> {
+        let network = self.node.runtime_files()?.pod_network?;
+        Some(network.subnet.to_string())
     }
 
-    fn cni_dir(&self) -> PathBuf {
-        self.dir.path().join("cni")
+    /// Whether faber-node has been asked to configure the runtime at all.
+    fn runtime_configured(&self) -> bool {
+        self.node.runtime_files().is_some()
     }
 
-    /// The CNI network config the runtime backend keeps for this node.
-    fn conflist(&self) -> PathBuf {
-        self.cni_dir().join(CONFLIST_FILE)
-    }
-
-    /// The fake host for the network, and temp dirs for the containerd
-    /// drop-in and the CNI network config.
+    /// The fake host for the network, and the fake faber-node for the
+    /// runtime config.
     fn backends(&self) -> Option<HostBackends> {
         Some(HostBackends {
             network: NetworkManager::new(self.host.clone()),
-            runtime: Arc::new(Containerd {
-                conf_dir: self.containerd_dir(),
-                cni_conf_dir: self.cni_dir(),
-                cni_bin_dir: "/opt/cni/bin".into(),
-            }),
+            runtime: Arc::new(NodeRuntime::new(self.node.clone())),
         })
     }
 
@@ -196,11 +194,10 @@ impl MeshNode {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("state")).unwrap();
-        std::fs::create_dir_all(dir.path().join("containerd")).unwrap();
-        std::fs::create_dir_all(dir.path().join("cni")).unwrap();
         MeshNode {
             dir,
             host: Arc::new(FakeHost::default()),
+            node: FakeNode::default(),
             handle: None,
             before_bind: Arc::new(Mutex::new(None)),
             intended: Arc::new(Mutex::new(None)),
@@ -675,23 +672,16 @@ async fn founder_brings_host_up_before_binding_and_seeds_mesh() {
     assert!(nft_script.contains("table inet faber"), "{nft_script}");
     assert!(nft_script.contains("chain forward"), "{nft_script}");
 
-    // InitCluster seeded the mesh and the containerd settings.
+    // InitCluster seeded the mesh.
     let mesh = n1.handle().state().mesh().unwrap().unwrap();
     let me = &mesh.nodes[&1];
     assert_eq!(me.public_key, id.public_key().unwrap());
     assert_eq!(me.endpoint.as_deref(), Some(FOUNDER_ENDPOINT));
     assert_eq!(mesh.config.cidr.to_string(), "10.99.0.0/16");
     assert_eq!(mesh.config.wg_port, 51820);
-    assert_eq!(
-        n1.handle().state().containerd().unwrap(),
-        Some(ContainerRuntimeSpec::default())
-    );
 
-    // The containerd reconciler writes the drop-in.
-    let drop_in = n1.containerd_dir().join("faber.toml");
-    eventually("drop-in written", || drop_in.is_file()).await;
-    let text = std::fs::read_to_string(&drop_in).unwrap();
-    assert!(text.contains("registry.k8s.io/pause:3.10"), "{text}");
+    // The runtime step has faber-node write the containerd drop-in.
+    eventually("runtime configured", || n1.runtime_configured()).await;
 
     // A second init is a conflict.
     let err = n1.client().cluster_init().await.unwrap_err().to_string();
@@ -718,11 +708,8 @@ async fn the_founder_gets_the_first_container_subnet() {
 
     // The runtime step follows the network step of the same apply, so the
     // route and the table are there once the CNI config is.
-    let conflist = n1.conflist();
-    eventually("CNI config written", || conflist.is_file()).await;
-    let text = std::fs::read_to_string(&conflist).unwrap();
-    assert!(text.contains("10.200.0.0/24"), "{text}");
-    assert!(text.contains("faberbr0"), "{text}");
+    eventually("CNI config written", || n1.cni_subnet().is_some()).await;
+    assert_eq!(n1.cni_subnet().as_deref(), Some("10.200.0.0/24"));
 
     let calls = n1.host.calls();
     let route = position(&calls, "ip route replace 10.200.0.0/16 dev faber0");
@@ -781,13 +768,11 @@ async fn a_joined_node_gets_the_next_subnet_and_both_sides_route_it() {
         (&n1, "10.200.0.0/24", "10.200.1.0/24"),
         (&n2, "10.200.1.0/24", "10.200.0.0/24"),
     ] {
-        let conflist = node.conflist();
         eventually("CNI config has the node's subnet", || {
-            std::fs::read_to_string(&conflist).is_ok_and(|t| t.contains(subnet))
+            node.cni_subnet().as_deref() == Some(subnet)
         })
         .await;
-        let text = std::fs::read_to_string(&conflist).unwrap();
-        assert!(!text.contains(other), "{text}");
+        assert_ne!(node.cni_subnet().as_deref(), Some(other));
     }
 
     // Each firewall lets the other node, and no one else, reach the local
@@ -1050,8 +1035,7 @@ async fn node_joins_from_token_and_invites_are_single_use_and_expire() {
             .is_some_and(|m| m.nodes.len() == 2)
     })
     .await;
-    let drop_in = n2.containerd_dir().join("faber.toml");
-    eventually("node 2 drop-in", || drop_in.is_file()).await;
+    eventually("node 2 runtime configured", || n2.runtime_configured()).await;
     let n2_addr = n2.peer_addr();
 
     // The node record names the machine that registered.
@@ -1944,9 +1928,8 @@ async fn a_stopped_node_is_removed_when_its_lease_runs_out() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
     let (mut n1, mut n2, mut n3) = three_nodes(true).await;
-    let conflist = n3.conflist();
     eventually("node 3 has the CNI config of its subnet", || {
-        std::fs::read_to_string(&conflist).is_ok_and(|t| t.contains("10.200.2.0/24"))
+        n3.cni_subnet().as_deref() == Some("10.200.2.0/24")
     })
     .await;
     let port = n3.peer_addr().port();
@@ -1961,7 +1944,7 @@ async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
     // runs out, and sends the renewal there. Give it time to do so.
     n3.election_ms = Some((5_000, 6_000));
     n3.host.rec.clear();
-    assert!(n3.conflist().exists());
+    assert!(n3.cni_subnet().is_some());
     n3.launch(Bootstrap::Existing, Some(port)).await;
     let identity_file = n3.state_dir().join("identity.json");
     eventually("the identity is discarded", || !identity_file.exists()).await;
@@ -1972,7 +1955,7 @@ async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
     // The CNI config for the subnet it used to hold was still there when
     // it started. The teardown removed it: the subnet may be another
     // node's by now.
-    assert!(!n3.conflist().exists());
+    assert!(n3.cni_subnet().is_none());
     // The firewall table stays: only ever loaded, never deleted.
     assert!(
         n3.cmdlines()
@@ -2090,9 +2073,8 @@ async fn a_new_machine_takes_over_the_name_and_subnet_of_a_stopped_node() {
         .await;
     }
     // The new machine has the CNI config of the subnet it took over.
-    let conflist = n4.conflist();
     eventually("CNI config has the subnet", || {
-        std::fs::read_to_string(&conflist).is_ok_and(|t| t.contains("10.200.2.0/24"))
+        n4.cni_subnet().as_deref() == Some("10.200.2.0/24")
     })
     .await;
 
@@ -2260,7 +2242,7 @@ async fn assert_removed_and_idle(node: &MeshNode) {
     assert!(!node.host.link_up.load(Ordering::SeqCst));
     assert!(!node.state_dir().join("iface").exists());
     // Its CNI config went with the subnet, and the firewall table stayed.
-    assert!(!node.conflist().exists());
+    assert!(node.cni_subnet().is_none());
     assert!(
         lines
             .iter()
@@ -2287,9 +2269,8 @@ async fn assert_removed_and_idle(node: &MeshNode) {
 async fn a_running_node_whose_name_is_taken_over_tears_itself_down() {
     let (mut n1, mut n2, mut n3) = three_nodes(false).await;
     let pk3 = n3.identity().public_key().unwrap();
-    let conflist = n3.conflist();
     eventually("node 3 has the CNI config of its subnet", || {
-        std::fs::read_to_string(&conflist).is_ok_and(|t| t.contains("10.200.2.0/24"))
+        n3.cni_subnet().as_deref() == Some("10.200.2.0/24")
     })
     .await;
 
@@ -2352,9 +2333,8 @@ async fn taking_over_the_leaders_name_completes_against_the_next_leader() {
         n2.handle().raft().metrics().borrow().current_leader,
         Some(1)
     );
-    let conflist = n1.conflist();
     eventually("node 1 has the CNI config of its subnet", || {
-        std::fs::read_to_string(&conflist).is_ok_and(|t| t.contains("10.200.0.0/24"))
+        n1.cni_subnet().as_deref() == Some("10.200.0.0/24")
     })
     .await;
 

@@ -37,7 +37,6 @@ fn failed(action: &'static str, source: NodeCallError) -> RuntimeError {
 
 fn pod_network(spec: &PodNetworkSpec) -> PodNetwork {
     PodNetwork {
-        bridge: spec.bridge.clone(),
         subnet: spec.subnet,
         mtu: spec.mtu,
     }
@@ -50,8 +49,6 @@ impl<C: NodeClient> ContainerRuntime for NodeRuntime<C> {
     ) -> BoxFuture<'a, Result<bool, RuntimeError>> {
         Box::pin(async move {
             let request = Request::ConfigureRuntime {
-                systemd_cgroup: spec.settings.systemd_cgroup,
-                sandbox_image: spec.settings.sandbox_image.clone(),
                 pod_network: spec.pod_network.as_ref().map(pod_network),
             };
             call_changed(&self.client, request, "configure_runtime")
@@ -71,24 +68,18 @@ impl<C: NodeClient> ContainerRuntime for NodeRuntime<C> {
 
 #[cfg(test)]
 mod tests {
-    use faber_container_runtime::ContainerRuntimeSpec;
-
     use super::*;
     use crate::runner::node::fake::{FakeNode, RuntimeFiles};
 
     fn network() -> PodNetworkSpec {
         PodNetworkSpec {
-            bridge: "faberbr0".into(),
             subnet: "10.200.3.0/24".parse().unwrap(),
             mtu: 1420,
         }
     }
 
     fn spec(pod_network: Option<PodNetworkSpec>) -> NodeRuntimeSpec {
-        NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
-            pod_network,
-        }
+        NodeRuntimeSpec { pod_network }
     }
 
     #[tokio::test]
@@ -96,20 +87,11 @@ mod tests {
         let node = FakeNode::default();
         let runtime = NodeRuntime::new(node.clone());
         assert!(runtime.reconcile(&spec(Some(network()))).await.unwrap());
-        assert_eq!(
-            node.log(),
-            [
-                "configure_runtime cgroup=true image=registry.k8s.io/pause:3.10 \
-              network=faberbr0 10.200.3.0/24 1420"
-            ]
-        );
+        assert_eq!(node.log(), ["configure_runtime network=10.200.3.0/24 1420"]);
         assert_eq!(
             node.runtime_files(),
             Some(RuntimeFiles {
-                systemd_cgroup: true,
-                sandbox_image: "registry.k8s.io/pause:3.10".into(),
                 pod_network: Some(PodNetwork {
-                    bridge: "faberbr0".into(),
                     subnet: "10.200.3.0/24".parse().unwrap(),
                     mtu: 1420,
                 }),

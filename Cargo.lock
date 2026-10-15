@@ -721,6 +721,7 @@ name = "faber-container-runtime"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
@@ -789,6 +790,7 @@ dependencies = [
  "faber-image",
  "faber-network-management",
  "faber-node-protocol",
+ "ipnet",
  "nix",
  "serde_json",
  "sha2",

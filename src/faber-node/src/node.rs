@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use faber_api_types::workload::limits;
 use faber_container_runtime::{
-    ContainerRuntime, ContainerRuntimeSpec, Containerd, NodeRuntimeSpec, PodNetworkSpec,
-    RuntimeError,
+    ContainerRuntime, Containerd, NodeRuntimeSpec, PodNetworkSpec, RuntimeError,
 };
 use faber_cri::{
     ContainerFilter, ContainerState as CriContainerState, CriClient, CriError, PodSandboxFilter,
@@ -20,6 +19,8 @@ use faber_node_protocol::{
 
 use crate::config::UidRange;
 use crate::cri_config::{self, ANNOTATION_SPEC_HASH, ANNOTATION_UID_BASE, ResolvedMount};
+use crate::dirs::DirPolicy;
+use crate::host_net::{HostNetworks, check_subnet_free};
 use crate::trust;
 use crate::volume::{EnsureVolume, VolumeError, VolumeManager, VolumeRef};
 
@@ -107,6 +108,8 @@ pub struct Node<C> {
     images: ImagePuller<C>,
     volumes: Arc<dyn VolumeManager>,
     containerd: Containerd,
+    dirs: DirPolicy,
+    networks: Arc<dyn HostNetworks>,
 }
 
 impl<C: CriClient + Clone> Node<C> {
@@ -116,9 +119,13 @@ impl<C: CriClient + Clone> Node<C> {
         cri: C,
         volumes: Arc<dyn VolumeManager>,
         containerd: Containerd,
+        dirs: DirPolicy,
+        networks: Arc<dyn HostNetworks>,
     ) -> Self {
         Self {
             containerd,
+            dirs,
+            networks,
             sandbox_locks: ReplicaLocks::default(),
             uid_range,
             runtime_handler,
@@ -349,22 +356,14 @@ impl<C: CriClient + Clone> Node<C> {
             Request::ListVolumes => Ok(Response::Volumes {
                 volumes: self.volumes.list().await?,
             }),
-            Request::ConfigureRuntime {
-                systemd_cgroup,
-                sandbox_image,
-                pod_network,
-            } => {
-                trust::check_sandbox_image(&sandbox_image)?;
+            Request::ConfigureRuntime { pod_network } => {
                 if let Some(network) = &pod_network {
                     trust::check_pod_network(network)?;
+                    self.check_subnet_free(network.subnet).await?;
                 }
+                self.check_runtime_dirs()?;
                 let spec = NodeRuntimeSpec {
-                    settings: ContainerRuntimeSpec {
-                        systemd_cgroup,
-                        sandbox_image,
-                    },
                     pod_network: pod_network.map(|n| PodNetworkSpec {
-                        bridge: n.bridge,
                         subnet: n.subnet,
                         mtu: n.mtu,
                     }),
@@ -372,10 +371,38 @@ impl<C: CriClient + Clone> Node<C> {
                 let changed = self.containerd.reconcile(&spec).await?;
                 Ok(Response::Changed { changed })
             }
-            Request::RemoveCniConfig => Ok(Response::Changed {
-                changed: self.containerd.remove_pod_network().await?,
-            }),
+            Request::RemoveCniConfig => {
+                self.check_runtime_dirs()?;
+                Ok(Response::Changed {
+                    changed: self.containerd.remove_pod_network().await?,
+                })
+            }
         }
+    }
+
+    /// The directories root loads config from are checked again before every
+    /// write, not only at startup. The detail (a path) is logged, not sent.
+    fn check_runtime_dirs(&self) -> Result<(), Fail> {
+        self.dirs
+            .check_runtime_dirs(&self.containerd)
+            .map_err(|e| {
+                tracing::error!(role = e.role, detail = %e.detail, "a runtime directory cannot be trusted");
+                Fail::new(
+                    ErrorCode::Forbidden,
+                    format!("the {} cannot be trusted; nothing was written", e.role),
+                )
+            })
+    }
+
+    /// A subnet that overlaps what the host uses is refused. The faber
+    /// bridge's own current subnet does not count.
+    async fn check_subnet_free(&self, subnet: ipnet::Ipv4Net) -> Result<(), Fail> {
+        let claims = self.networks.claims().await.map_err(|e| {
+            tracing::error!(error = %e, "reading the host's addresses and routes failed");
+            Fail::new(ErrorCode::Runtime, "the host's addresses cannot be read")
+        })?;
+        check_subnet_free(&claims, subnet, &self.containerd.bridge)
+            .map_err(|e| Fail::new(ErrorCode::Forbidden, e))
     }
 
     async fn ensure_sandbox(

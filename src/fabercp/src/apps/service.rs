@@ -978,7 +978,6 @@ mod tests {
 
     use faber_api_types::workload::{Exposure, Scale, Strategy, WorkloadSpec, validate_workloads};
     use faber_api_types::{CreateInviteRequest, error_code};
-    use faber_container_runtime::ContainerRuntimeSpec;
     use serde_json::json;
 
     use super::*;
@@ -1767,7 +1766,6 @@ mod tests {
                     name: "node-1".into(),
                     lease_renewed_at: 0,
                 },
-                containerd: ContainerRuntimeSpec::default(),
             })
             .await
             .unwrap();

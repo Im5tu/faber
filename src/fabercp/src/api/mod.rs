@@ -66,7 +66,6 @@ mod tests {
     use axum::http::{Method, Request, header};
     use axum::middleware::from_fn_with_state;
     use faber_api_types::{ErrorBody, LeaseResponse, error_code};
-    use faber_container_runtime::ContainerRuntimeSpec;
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use tower::ServiceExt;
@@ -134,7 +133,6 @@ mod tests {
                     name: "node-1".into(),
                     lease_renewed_at: 0,
                 },
-                containerd: ContainerRuntimeSpec::default(),
             })
             .await
             .unwrap();

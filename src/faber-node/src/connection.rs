@@ -118,6 +118,8 @@ mod tests {
 
     use super::*;
     use crate::config::UidRange;
+    use crate::dirs::DirPolicy;
+    use crate::host_net::fake::FakeHostNetworks;
     use crate::peer::Peer;
     use crate::peer::fake::FakeStream;
     use crate::volume::fake::FakeVolumes;
@@ -132,7 +134,11 @@ mod tests {
                 conf_dir: "/nonexistent/conf.d".into(),
                 cni_conf_dir: "/nonexistent/net.d".into(),
                 cni_bin_dir: "/opt/cni/bin".into(),
+                sandbox_image: "pause:3".into(),
+                bridge: "faberbr0".into(),
             },
+            DirPolicy::root(),
+            Arc::new(FakeHostNetworks::default()),
         )
     }
 

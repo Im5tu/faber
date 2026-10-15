@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::sync::{Arc, Weak};
 
-use faber_container_runtime::ContainerRuntimeSpec;
 use openraft::storage::RaftStateMachine;
 use openraft::{AnyError, EntryPayload, OptionalSend, RaftSnapshotBuilder, StorageIOError};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
@@ -21,7 +20,7 @@ use super::status::NodeStatus;
 use super::{CF_SM_DATA, CF_SM_META, cf, keys, place, services, status, write_synced};
 use crate::apps::state::{ENV_PREFIX, KEY_PROJECTS, env_key, is_reserved_key};
 use crate::apps::{EnvironmentRecord, ProjectIndex};
-use crate::mesh::state::{KEY_CONTAINERD, KEY_MESH, RESERVED_KEYS};
+use crate::mesh::state::{KEY_MESH, RESERVED_KEYS};
 use crate::mesh::{MeshState, Rejection};
 use crate::raft::types::{
     Entry, LogId, Request, Response, Snapshot, SnapshotMeta, StorageError, StoredMembership,
@@ -559,12 +558,7 @@ impl StateMachineStore {
         pending: &mut Pending<'_>,
         req: Request,
     ) -> Result<Response, StorageError> {
-        if let Request::InitCluster {
-            mesh,
-            founder,
-            containerd,
-        } = req
-        {
+        if let Request::InitCluster { mesh, founder } = req {
             if self.current(&pending.values, KEY_MESH)?.is_some() {
                 return Ok(reject(
                     faber_api_types::error_code::ALREADY_INITIALIZED,
@@ -574,7 +568,6 @@ impl StateMachineStore {
             return Ok(match MeshState::init(mesh, founder) {
                 Ok(state) => {
                     pending.put(KEY_MESH, &state)?;
-                    pending.put(KEY_CONTAINERD, &containerd)?;
                     Response::None
                 }
                 Err(r) => r.into(),
@@ -913,12 +906,6 @@ impl StateReader {
     /// The replicated mesh, or `None` before `InitCluster`.
     pub fn mesh(&self) -> Result<Option<MeshState>, ReadError> {
         self.typed(KEY_MESH)
-    }
-
-    /// The replicated container runtime spec (`config/containerd`), or `None`
-    /// before `InitCluster`.
-    pub fn containerd(&self) -> Result<Option<ContainerRuntimeSpec>, ReadError> {
-        self.typed(KEY_CONTAINERD)
     }
 
     /// Every project and, per environment, the figures of its record.
@@ -1306,7 +1293,7 @@ mod tests {
 
     // --- mesh commands -----------------------------------------------------
 
-    use crate::mesh::state::{KEY_CONTAINERD, KEY_MESH};
+    use crate::mesh::state::KEY_MESH;
     use crate::mesh::{MeshConfig, MeshState, NodeRecord};
     use faber_api_types::error_code as ec;
 
@@ -1344,7 +1331,6 @@ mod tests {
         Request::InitCluster {
             mesh: MeshConfig::default(),
             founder: founder(),
-            containerd: ContainerRuntimeSpec::default(),
         }
     }
 
@@ -1373,11 +1359,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_cluster_seeds_mesh_and_containerd() {
+    async fn init_cluster_seeds_the_mesh() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path()).unwrap();
         assert_eq!(s.reader.mesh().unwrap(), None);
-        assert_eq!(s.reader.containerd().unwrap(), None);
 
         let replies = s
             .state_machine
@@ -1387,10 +1372,6 @@ mod tests {
         assert_eq!(replies, vec![Response::None]);
         let want = MeshState::init(MeshConfig::default(), founder()).unwrap();
         assert_eq!(s.reader.mesh().unwrap(), Some(want.clone()));
-        assert_eq!(
-            s.reader.containerd().unwrap(),
-            Some(ContainerRuntimeSpec::default())
-        );
         assert_eq!(
             s.reader.get(KEY_MESH).unwrap(),
             Some(serde_json::to_value(&want).unwrap())
@@ -1443,7 +1424,6 @@ mod tests {
         let replies = s.state_machine.apply([normal(1, bad)]).await.unwrap();
         assert!(rejected(ec::BAD_REQUEST)(&replies[0]));
         assert_eq!(s.reader.mesh().unwrap(), None);
-        assert_eq!(s.reader.containerd().unwrap(), None);
         assert_eq!(last_index(&mut s).await, Some(1));
         drop(s);
     }
@@ -1454,16 +1434,12 @@ mod tests {
         let mut s = open(dir.path()).unwrap();
         let replies = s
             .state_machine
-            .apply([
-                set(1, 1, KEY_MESH, json!({"forged": true})),
-                set(1, 2, KEY_CONTAINERD, json!({})),
-            ])
+            .apply([set(1, 1, KEY_MESH, json!({"forged": true}))])
             .await
             .unwrap();
         assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
         assert_eq!(s.reader.get(KEY_MESH).unwrap(), None);
-        assert_eq!(s.reader.get(KEY_CONTAINERD).unwrap(), None);
-        assert_eq!(last_index(&mut s).await, Some(2));
+        assert_eq!(last_index(&mut s).await, Some(1));
         drop(s);
     }
 
@@ -1651,7 +1627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_carries_mesh_and_containerd() {
+    async fn snapshot_carries_the_mesh() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let mut a = open(dir_a.path()).unwrap();
@@ -1673,10 +1649,6 @@ mod tests {
             .unwrap();
         assert_eq!(b.reader.mesh().unwrap(), a.reader.mesh().unwrap());
         assert!(b.reader.mesh().unwrap().is_some());
-        assert_eq!(
-            b.reader.containerd().unwrap(),
-            Some(ContainerRuntimeSpec::default())
-        );
         drop((a, b));
     }
 
@@ -1887,7 +1859,6 @@ mod tests {
                 ..MeshConfig::default()
             },
             founder: founder(),
-            containerd: ContainerRuntimeSpec::default(),
         }
     }
 
@@ -2360,7 +2331,6 @@ mod tests {
                 "node_id": 1, "public_key": "pk1", "mesh_ip": "10.99.0.1",
                 "endpoint": "203.0.113.1:51820", "invite_id": null
             },
-            "containerd": ContainerRuntimeSpec::default(),
         }}))
         .unwrap();
         let replies = s
@@ -2402,7 +2372,6 @@ mod tests {
             .unwrap();
         assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
         assert_eq!(s.reader.get(KEY_MESH).unwrap(), None);
-        assert_eq!(s.reader.get(KEY_CONTAINERD).unwrap(), None);
         assert_eq!(last_index(&mut s).await, Some(2));
 
         // The rejection left nothing behind: a good range still initialises.
@@ -2497,7 +2466,6 @@ mod tests {
         let reader = s.reader.clone();
         drop(s);
         assert!(matches!(reader.mesh(), Err(ReadError::Closed)));
-        assert!(matches!(reader.containerd(), Err(ReadError::Closed)));
     }
 
     #[tokio::test]
@@ -3539,7 +3507,6 @@ mod tests {
                 ..MeshConfig::default()
             },
             founder: founder(),
-            containerd: ContainerRuntimeSpec::default(),
         }
     }
 

@@ -287,10 +287,12 @@ impl NodeClient for SocketNodeClient {
     }
 }
 
-#[cfg(test)]
+// Public, but hidden, so that integration tests under `tests/` can use it,
+// as `faber_network_management::fake` is.
+#[doc(hidden)]
 pub mod fake {
-    //! An in-memory `faber-node`: it keeps sandboxes, containers and
-    //! volumes, and logs every request as a line.
+    //! An in-memory `faber-node`: it keeps sandboxes, containers, volumes and
+    //! the runtime config, and logs every request as a line.
 
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -312,12 +314,10 @@ pub mod fake {
         env: BTreeMap<String, String>,
     }
 
-    /// What the node's runtime config holds: the drop-in's settings and the
-    /// CNI network, if there is a CNI config.
+    /// What the node's runtime config holds: the CNI network, if there is a
+    /// CNI config. The drop-in has nothing a request can change.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RuntimeFiles {
-        pub systemd_cgroup: bool,
-        pub sandbox_image: String,
         pub pod_network: Option<PodNetwork>,
     }
 
@@ -487,16 +487,12 @@ pub mod fake {
                 ),
                 Request::ListReplicas => ("list_replicas".into(), "list_replicas"),
                 Request::ListVolumes => ("list_volumes".into(), "list_volumes"),
-                Request::ConfigureRuntime {
-                    systemd_cgroup,
-                    sandbox_image,
-                    pod_network,
-                } => (
+                Request::ConfigureRuntime { pod_network } => (
                     format!(
-                        "configure_runtime cgroup={systemd_cgroup} image={sandbox_image} network={}",
+                        "configure_runtime network={}",
                         pod_network.as_ref().map_or_else(
                             || "none".to_owned(),
-                            |n| format!("{} {} {}", n.bridge, n.subnet, n.mtu)
+                            |n| format!("{} {}", n.subnet, n.mtu)
                         )
                     ),
                     "configure_runtime",
@@ -657,16 +653,8 @@ pub mod fake {
                     });
                     Ok(Response::Volumes { volumes })
                 }
-                Request::ConfigureRuntime {
-                    systemd_cgroup,
-                    sandbox_image,
-                    pod_network,
-                } => {
-                    let files = RuntimeFiles {
-                        systemd_cgroup,
-                        sandbox_image,
-                        pod_network,
-                    };
+                Request::ConfigureRuntime { pod_network } => {
+                    let files = RuntimeFiles { pod_network };
                     let changed = inner.runtime.as_ref() != Some(&files);
                     inner.runtime = Some(files);
                     Ok(Response::Changed { changed })

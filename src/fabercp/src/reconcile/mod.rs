@@ -34,9 +34,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-use faber_container_runtime::{
-    ContainerRuntime, ContainerRuntimeSpec, NodeRuntimeSpec, PodNetworkSpec,
-};
+use faber_container_runtime::{ContainerRuntime, NodeRuntimeSpec, PodNetworkSpec};
 use faber_network_management::{
     ContainerFirewall, FirewallSpec, NetworkManager, NetworkSpec, WG_MTU, WireGuardPeer,
     WireGuardSpec, endpoint_ip,
@@ -68,8 +66,7 @@ pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Longest retry delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Name of the bridge containers attach to, the same on every node.
-pub const POD_BRIDGE: &str = "faberbr0";
+pub use faber_node_protocol::POD_BRIDGE;
 
 /// The network state this node should have on interface `iface`, plus a
 /// warning for every peer, endpoint or container subnet that was skipped
@@ -268,26 +265,20 @@ pub fn next_invite_expiry(mesh: Option<&MeshState>, now: u64) -> Option<Duration
         .map(|expires_at| Duration::from_secs(expires_at - now))
 }
 
-/// The runtime spec for node `node_id`: `settings` as replicated under
-/// `config/containerd`, plus the node's container network. `None` when
-/// `settings` is `None` (`InitCluster` has not replicated): nothing to apply
-/// yet.
+/// The runtime spec for node `node_id`: its container network. `None` when
+/// `mesh` is `None` (`InitCluster` has not replicated): nothing to apply yet.
 ///
-/// The network is the bridge [`POD_BRIDGE`] on the subnet `mesh.nodes` holds
-/// for this node, with the tunnel's MTU. It is `None` while the node has no
-/// subnet there, or one that does not fit the range ([`subnet_problem`];
+/// The network is the subnet `mesh.nodes` holds for this node, with the
+/// tunnel's MTU; faber-node names the bridge ([`POD_BRIDGE`]) and chooses
+/// every other runtime setting. It is `None` while the node has no subnet
+/// there, or one that does not fit the range ([`subnet_problem`];
 /// [`desired_network`] warns about it), and the runtime then removes its
 /// network config.
-pub fn desired_runtime(
-    settings: Option<ContainerRuntimeSpec>,
-    mesh: Option<&MeshState>,
-    node_id: u64,
-) -> Option<NodeRuntimeSpec> {
-    let subnet = mesh.and_then(|m| own_subnet(m, node_id).ok().flatten());
-    settings.map(|settings| NodeRuntimeSpec {
-        settings,
+pub fn desired_runtime(mesh: Option<&MeshState>, node_id: u64) -> Option<NodeRuntimeSpec> {
+    let mesh = mesh?;
+    let subnet = own_subnet(mesh, node_id).ok().flatten();
+    Some(NodeRuntimeSpec {
         pod_network: subnet.map(|subnet| PodNetworkSpec {
-            bridge: POD_BRIDGE.to_string(),
             subnet,
             mtu: WG_MTU,
         }),
@@ -389,7 +380,7 @@ impl ReconcileStep for RuntimeStep {
 
     fn plan(&self, view: &ReplicatedStateView) -> Planned<Option<NodeRuntimeSpec>> {
         Planned {
-            desired: desired_runtime(view.containerd.clone(), view.mesh.as_ref(), self.node_id),
+            desired: desired_runtime(view.mesh.as_ref(), self.node_id),
             warnings: Vec::new(),
         }
     }
@@ -794,8 +785,6 @@ mod tests {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use faber_container_runtime::Containerd;
-    use faber_container_runtime::containerd::DROP_IN_FILE;
     use faber_network_management::CommandOutput;
     use faber_network_management::fake::RecordingRunner;
     use tokio::sync::mpsc;
@@ -807,6 +796,7 @@ mod tests {
     };
     use crate::mesh::{PendingJoin, PrivateKey};
     use crate::reconcile::step::StepList;
+    use crate::runner::node::fake::FakeNode;
 
     // ---- derivation ----
 
@@ -1139,7 +1129,7 @@ mod tests {
             token_peer(3, key(3), "203.0.113.3:51820"),
         ];
         let host = HostReconciler {
-            backends: backends(&runner, dir.path()),
+            backends: backends(&runner, &FakeNode::default()),
             iface: "faber0".into(),
             identity: joiner(9, bootstrap),
             join_pending: JoinPending::new(true),
@@ -1161,7 +1151,6 @@ mod tests {
             payload: EntryPayload::Normal(Request::InitCluster {
                 mesh: MeshConfig::default(),
                 founder: node(1, Some("203.0.113.1:51820")),
-                containerd: ContainerRuntimeSpec::default(),
             }),
         };
         storage.state_machine.apply([seed]).await.unwrap();
@@ -1734,21 +1723,18 @@ mod tests {
             ],
             vec![],
         );
-        let settings = ContainerRuntimeSpec::default();
         assert_eq!(POD_BRIDGE, "faberbr0");
         assert_eq!(
-            desired_runtime(Some(settings.clone()), Some(&m), 2),
+            desired_runtime(Some(&m), 2),
             Some(NodeRuntimeSpec {
-                settings,
                 pod_network: Some(PodNetworkSpec {
-                    bridge: "faberbr0".into(),
                     subnet: net("10.200.1.0/24"),
                     mtu: 1420,
                 }),
             })
         );
-        // No settings replicated yet: nothing to apply, subnet or not.
-        assert_eq!(desired_runtime(None, Some(&m), 2), None);
+        // No mesh replicated yet: nothing to apply.
+        assert_eq!(desired_runtime(None, 2), None);
     }
 
     #[test]
@@ -1771,21 +1757,10 @@ mod tests {
         for bad in ["10.201.0.0/24", "10.200.1.0/25", "10.200.1.9/24"] {
             meshes.push(container_mesh(vec![node_with_subnet(2, bad)], vec![]));
         }
-        let none = NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
-            pod_network: None,
-        };
+        let none = NodeRuntimeSpec { pod_network: None };
         for m in &meshes {
-            assert_eq!(
-                desired_runtime(Some(ContainerRuntimeSpec::default()), Some(m), 2),
-                Some(none.clone()),
-                "{m:?}"
-            );
+            assert_eq!(desired_runtime(Some(m), 2), Some(none.clone()), "{m:?}");
         }
-        assert_eq!(
-            desired_runtime(Some(ContainerRuntimeSpec::default()), None, 2),
-            Some(none)
-        );
     }
 
     /// [`crate::host_steps`] over real storage: nothing before
@@ -1803,7 +1778,7 @@ mod tests {
         let mut storage = store::open(dir.path().join("data")).unwrap();
         let runner = Arc::new(RecordingRunner::new());
         let host = HostReconciler {
-            backends: backends(&runner, dir.path()),
+            backends: backends(&runner, &FakeNode::default()),
             iface: "faber0".into(),
             identity: local(1),
             join_pending: JoinPending::new(false),
@@ -1828,7 +1803,6 @@ mod tests {
                     ..MeshConfig::default()
                 },
                 founder: node(1, Some("203.0.113.1:51820")),
-                containerd: ContainerRuntimeSpec::default(),
             }),
         };
         storage.state_machine.apply([seed]).await.unwrap();
@@ -2149,12 +2123,9 @@ mod tests {
 
     // ---- host apply ----
 
-    /// The default settings with no container network.
+    /// No container network.
     fn runtime_spec() -> NodeRuntimeSpec {
-        NodeRuntimeSpec {
-            settings: ContainerRuntimeSpec::default(),
-            pod_network: None,
-        }
+        NodeRuntimeSpec { pod_network: None }
     }
 
     /// What the host steps want, as typed values.
@@ -2218,7 +2189,6 @@ mod tests {
         HostDesired { network, runtime }
     }
 
-    /// The fake network runner with containerd's drop-in written to `dir`.
     fn wiring() -> containers::ContainersWiring {
         containers::ContainersWiring {
             socket: PathBuf::from("/nonexistent/node.sock"),
@@ -2228,18 +2198,15 @@ mod tests {
         }
     }
 
-    fn backends(runner: &Arc<RecordingRunner>, dir: &std::path::Path) -> HostBackends {
+    /// The fake network runner, and faber-node's fake as the runtime.
+    fn backends(runner: &Arc<RecordingRunner>, node: &FakeNode) -> HostBackends {
         HostBackends {
             network: NetworkManager::new(runner.clone()),
-            runtime: Arc::new(Containerd {
-                conf_dir: dir.to_path_buf(),
-                cni_conf_dir: dir.join("cni"),
-                cni_bin_dir: "/opt/cni/bin".into(),
-            }),
+            runtime: Arc::new(crate::runner::runtime::NodeRuntime::new(node.clone())),
         }
     }
 
-    fn node_runtime_step(node: &crate::runner::node::fake::FakeNode) -> RuntimeStep {
+    fn node_runtime_step(node: &FakeNode) -> RuntimeStep {
         RuntimeStep::new(
             Arc::new(crate::runner::runtime::NodeRuntime::new(node.clone())),
             2,
@@ -2248,24 +2215,22 @@ mod tests {
 
     #[tokio::test]
     async fn the_runtime_step_has_faber_node_write_the_files() {
-        let node = crate::runner::node::fake::FakeNode::default();
+        let node = FakeNode::default();
         let step = node_runtime_step(&node);
         let mut spec = runtime_spec();
         spec.pod_network = Some(PodNetworkSpec {
-            bridge: POD_BRIDGE.into(),
             subnet: net("10.200.1.0/24"),
             mtu: WG_MTU,
         });
 
         step.apply(&Some(spec.clone())).await.unwrap();
         let files = node.runtime_files().expect("configured");
-        assert_eq!(files.sandbox_image, spec.settings.sandbox_image);
         assert_eq!(
-            files.pod_network.map(|n| (n.bridge, n.subnet, n.mtu)),
-            Some((POD_BRIDGE.to_owned(), net("10.200.1.0/24"), WG_MTU))
+            files.pod_network.map(|n| (n.subnet, n.mtu)),
+            Some((net("10.200.1.0/24"), WG_MTU))
         );
 
-        // No replicated settings yet: faber-node is not asked for anything.
+        // No mesh replicated yet: faber-node is not asked for anything.
         node.take_log();
         step.apply(&None).await.unwrap();
         assert!(node.log().is_empty());
@@ -2277,7 +2242,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_by_faber_node_fails_the_runtime_step() {
-        let node = crate::runner::node::fake::FakeNode::default();
+        let node = FakeNode::default();
         node.fail_next("configure_runtime");
         let step = node_runtime_step(&node);
         let err = step.apply(&Some(runtime_spec())).await.unwrap_err();
@@ -2291,18 +2256,16 @@ mod tests {
 
     #[test]
     fn startup_leaves_the_runtime_step_to_the_loop() {
-        let node = crate::runner::node::fake::FakeNode::default();
+        let node = FakeNode::default();
         assert!(!node_runtime_step(&node).required_at_startup());
     }
 
     #[tokio::test]
     async fn apply_host_runs_network_then_runtime() {
         let runner = Arc::new(RecordingRunner::new());
-        let dir = tempfile::tempdir().unwrap();
+        let node = FakeNode::default();
         let d = host_desired(Some(runtime_spec()));
-        apply_host(&backends(&runner, dir.path()), &d)
-            .await
-            .unwrap();
+        apply_host(&backends(&runner, &node), &d).await.unwrap();
         let lines = runner.cmdlines();
         let sync = lines
             .iter()
@@ -2310,32 +2273,37 @@ mod tests {
             .unwrap();
         let nft = lines.iter().position(|l| l == "nft -f -").unwrap();
         assert!(sync < nft, "{lines:?}");
-        assert!(dir.path().join(DROP_IN_FILE).is_file());
-        // No spec yet: nothing written, still Ok.
-        let empty = tempfile::tempdir().unwrap();
-        apply_host(&backends(&runner, empty.path()), &host_desired(None))
+        assert!(node.runtime_files().is_some());
+        // No spec yet: faber-node is asked for nothing, still Ok.
+        let idle = FakeNode::default();
+        apply_host(&backends(&runner, &idle), &host_desired(None))
             .await
             .unwrap();
-        assert!(!empty.path().join(DROP_IN_FILE).exists());
+        assert!(idle.log().is_empty());
     }
 
     #[tokio::test]
     async fn a_failing_network_step_does_not_skip_the_runtime_step() {
         let runner = Arc::new(RecordingRunner::new());
         runner.script("wg", None, CommandOutput::failure(1, "boom"));
-        let dir = tempfile::tempdir().unwrap();
+        let node = FakeNode::default();
         let d = host_desired(Some(runtime_spec()));
-        let err = apply_host(&backends(&runner, dir.path()), &d)
+        let err = apply_host(&backends(&runner, &node), &d).await.unwrap_err();
+        assert!(format!("{err:#}").contains("faber0"), "{err:#}");
+        assert!(node.runtime_files().is_some());
+
+        // And the other way round: a refusal by faber-node does not stop the
+        // network.
+        let runner = Arc::new(RecordingRunner::new());
+        let refusing = FakeNode::default();
+        refusing.fail_next("configure_runtime");
+        let err = apply_host(&backends(&runner, &refusing), &d)
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("faber0"), "{err:#}");
-        assert!(dir.path().join(DROP_IN_FILE).is_file());
-
-        // And the other way round: a bad drop-in dir does not stop the network.
-        let runner = Arc::new(RecordingRunner::new());
-        let missing = backends(&runner, &dir.path().join("missing"));
-        let err = apply_host(&missing, &d).await.unwrap_err();
-        assert!(format!("{err:#}").contains("drop-in"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("configure_runtime failed on purpose"),
+            "{err:#}"
+        );
         assert!(runner.cmdlines().iter().any(|l| l == "nft -f -"));
     }
 

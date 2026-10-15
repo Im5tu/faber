@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use faber_container_runtime::Containerd;
-use faber_node_protocol::USERNS_LENGTH;
+use faber_node_protocol::{POD_BRIDGE, USERNS_LENGTH};
 
 pub const DEFAULT_SOCKET: &str = "/run/faber/node.sock";
 pub const DEFAULT_VOLUME_ROOT: &str = "/var/lib/faber-node/volumes";
@@ -16,6 +16,8 @@ pub const DEFAULT_ENV_FILE: &str = "/etc/faber/faber-node.env";
 pub const DEFAULT_CONTAINERD_CONF_DIR: &str = "/etc/containerd/conf.d";
 pub const DEFAULT_CNI_CONF_DIR: &str = "/etc/cni/net.d";
 pub const DEFAULT_CNI_BIN_DIR: &str = "/opt/cni/bin";
+/// The pause image of containerd 2.x.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "registry.k8s.io/pause:3.10";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -103,6 +105,8 @@ pub struct NodeConfig {
     pub cni_conf_dir: PathBuf,
     /// Where containerd is told to find the CNI plugins it runs as root.
     pub cni_bin_dir: PathBuf,
+    /// The pause image of every pod sandbox.
+    pub sandbox_image: String,
     pub containerd_socket: PathBuf,
     /// Directories of the host tools, run by absolute path.
     pub bin_dir: PathBuf,
@@ -123,6 +127,8 @@ impl NodeConfig {
             conf_dir: self.containerd_conf_dir.clone(),
             cni_conf_dir: self.cni_conf_dir.clone(),
             cni_bin_dir: self.cni_bin_dir.clone(),
+            sandbox_image: self.sandbox_image.clone(),
+            bridge: POD_BRIDGE.to_owned(),
         }
     }
 
@@ -192,6 +198,13 @@ impl NodeConfig {
                 reason: "the faber user and group must lie outside the pod uid range".to_owned(),
             });
         }
+        let sandbox_image = map
+            .get("FABER_NODE_SANDBOX_IMAGE")
+            .map_or(DEFAULT_SANDBOX_IMAGE, String::as_str);
+        crate::trust::check_image(sandbox_image).map_err(|e| ConfigError::Invalid {
+            key: "FABER_NODE_SANDBOX_IMAGE",
+            reason: e.message,
+        })?;
         Ok(Self {
             socket: path("FABER_NODE_SOCKET", DEFAULT_SOCKET)?,
             volume_root: path("FABER_NODE_VOLUME_ROOT", DEFAULT_VOLUME_ROOT)?,
@@ -201,6 +214,7 @@ impl NodeConfig {
             )?,
             cni_conf_dir: path("FABER_NODE_CNI_CONF_DIR", DEFAULT_CNI_CONF_DIR)?,
             cni_bin_dir: path("FABER_NODE_CNI_BIN_DIR", DEFAULT_CNI_BIN_DIR)?,
+            sandbox_image: sandbox_image.to_owned(),
             containerd_socket: path("FABER_NODE_CONTAINERD_SOCKET", faber_cri::DEFAULT_SOCKET)?,
             bin_dir: path("FABER_NODE_BIN_DIR", "/usr/bin")?,
             sbin_dir: path("FABER_NODE_SBIN_DIR", "/usr/sbin")?,
@@ -243,6 +257,7 @@ FABER_NODE_FABER_GID=989
         );
         assert_eq!(cfg.cni_conf_dir, PathBuf::from("/etc/cni/net.d"));
         assert_eq!(cfg.cni_bin_dir, PathBuf::from("/opt/cni/bin"));
+        assert_eq!(cfg.sandbox_image, "registry.k8s.io/pause:3.10");
         assert_eq!((cfg.faber_uid, cfg.faber_gid), (990, 989));
         assert_eq!(cfg.bin_dir, PathBuf::from("/usr/bin"));
         assert_eq!(cfg.sbin_dir, PathBuf::from("/usr/sbin"));
@@ -293,6 +308,30 @@ FABER_NODE_FABER_GID=989
                     "{key}={bad}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_sandbox_image_comes_from_the_file_and_is_checked() {
+        let text = format!("{GOOD}FABER_NODE_SANDBOX_IMAGE=registry.example/pause:3.9\n");
+        let cfg = NodeConfig::parse(&text).unwrap();
+        assert_eq!(cfg.sandbox_image, "registry.example/pause:3.9");
+        let containerd = cfg.containerd();
+        assert_eq!(containerd.sandbox_image, "registry.example/pause:3.9");
+        assert_eq!(containerd.bridge, faber_node_protocol::POD_BRIDGE);
+
+        for bad in ["", "a b"] {
+            let text = format!("{GOOD}FABER_NODE_SANDBOX_IMAGE={bad}\n");
+            assert!(
+                matches!(
+                    NodeConfig::parse(&text),
+                    Err(ConfigError::Invalid {
+                        key: "FABER_NODE_SANDBOX_IMAGE",
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
         }
     }
 

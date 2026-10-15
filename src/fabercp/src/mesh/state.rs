@@ -13,9 +13,6 @@
 //! by a new node registering under its name. Either way the node has to be
 //! out of the raft membership first. Node names are unique.
 //!
-//! The value under [`KEY_CONTAINERD`] is a
-//! [`faber_container_runtime::ContainerRuntimeSpec`], stored as that crate
-//! serializes it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -27,10 +24,8 @@ use serde::{Deserialize, Serialize};
 
 /// `sm_data` key holding the JSON [`MeshState`].
 pub const KEY_MESH: &str = "mesh";
-/// `sm_data` key holding the JSON [`faber_container_runtime::ContainerRuntimeSpec`].
-pub const KEY_CONTAINERD: &str = "config/containerd";
 /// Keys that only the typed mesh commands may write; `Request::Set` rejects them.
-pub const RESERVED_KEYS: &[&str] = &[KEY_MESH, KEY_CONTAINERD];
+pub const RESERVED_KEYS: &[&str] = &[KEY_MESH];
 
 /// Mesh CIDR used when `--mesh-cidr` is not given: `10.99.0.0/16`.
 pub const DEFAULT_MESH_CIDR: Ipv4Net = match Ipv4Net::new(Ipv4Addr::new(10, 99, 0, 0), 16) {
@@ -905,8 +900,7 @@ mod tests {
     #[test]
     fn constants() {
         assert_eq!(KEY_MESH, "mesh");
-        assert_eq!(KEY_CONTAINERD, "config/containerd");
-        assert_eq!(RESERVED_KEYS, &["mesh", "config/containerd"]);
+        assert_eq!(RESERVED_KEYS, &["mesh"]);
         assert_eq!(DEFAULT_MESH_CIDR.to_string(), "10.99.0.0/16");
         assert_eq!(DEFAULT_CONTAINER_CIDR.to_string(), "10.200.0.0/16");
         assert_eq!(DEFAULT_CONTAINER_SUBNET_PREFIX, 24);

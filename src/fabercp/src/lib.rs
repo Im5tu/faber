@@ -2122,7 +2122,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use faber_api_types::{ErrorBody, error_code};
-    use faber_container_runtime::Containerd;
+    use faber_container_runtime::{NodeRuntimeSpec, PodNetworkSpec};
     use faber_network_management::fake::RecordingRunner;
     use faber_network_management::{CommandOutput, CommandRunner};
 
@@ -2134,32 +2134,32 @@ mod tests {
         assert_eq!(RemovalEvidence::LeftMembership.code(), "left_membership");
     }
 
-    /// A node can leave the mesh before any runtime settings reached it, and
-    /// with a conflist from an earlier life still on disk. The removal needs
-    /// no settings and does not write the containerd drop-in.
+    /// A node can leave the mesh before the mesh reached it, and with a CNI
+    /// config from an earlier life still on faber-node's disk. The removal
+    /// needs no replicated state and asks faber-node for the removal only.
     #[tokio::test]
-    async fn the_pod_network_is_removed_without_replicated_runtime_settings() {
+    async fn the_pod_network_is_removed_without_replicated_state() {
         let dir = tempfile::tempdir().unwrap();
         let storage = raft::store::open(dir.path().join("data")).unwrap();
-        assert!(storage.reader.containerd().unwrap().is_none());
-        let conf_dir = dir.path().join("containerd");
-        let cni_conf_dir = dir.path().join("cni");
-        std::fs::create_dir_all(&conf_dir).unwrap();
-        std::fs::create_dir_all(&cni_conf_dir).unwrap();
-        let conflist = cni_conf_dir.join(faber_container_runtime::cni::CONFLIST_FILE);
-        std::fs::write(&conflist, "{}").unwrap();
-        let runtime = Containerd {
-            conf_dir: conf_dir.clone(),
-            cni_conf_dir,
-            cni_bin_dir: "/opt/cni/bin".into(),
+        assert!(storage.reader.mesh().unwrap().is_none());
+        let node = runner::node::fake::FakeNode::default();
+        let runtime = runner::NodeRuntime::new(node.clone());
+        let spec = NodeRuntimeSpec {
+            pod_network: Some(PodNetworkSpec {
+                subnet: "10.200.3.0/24".parse().unwrap(),
+                mtu: 1420,
+            }),
         };
+        runtime.reconcile(&spec).await.unwrap();
+        node.take_log();
 
         remove_pod_network(&runtime, &storage.reader).await;
-        assert!(!conflist.exists());
-        assert_eq!(std::fs::read_dir(&conf_dir).unwrap().count(), 0);
+        assert_eq!(node.log(), ["remove_cni_config"]);
+        assert_eq!(node.runtime_files().unwrap().pod_network, None);
 
         // Nothing left to remove: still not a failure.
         remove_pod_network(&runtime, &storage.reader).await;
+        assert_eq!(node.runtime_files().unwrap().pod_network, None);
     }
 
     #[test]
@@ -2848,11 +2848,9 @@ mod tests {
             let (host, network) = link_host(&state_dir);
             let backends = HostBackends {
                 network,
-                runtime: Arc::new(Containerd {
-                    conf_dir: dir.path().join("containerd"),
-                    cni_conf_dir: dir.path().join("cni"),
-                    cni_bin_dir: "/opt/cni/bin".into(),
-                }),
+                runtime: Arc::new(runner::NodeRuntime::new(
+                    runner::node::fake::FakeNode::default(),
+                )),
             };
 
             let node = start_or_idle(
@@ -3069,11 +3067,9 @@ mod tests {
         config.wg_endpoint = Some("203.0.113.1:51820".into());
         let backends = HostBackends {
             network: net,
-            runtime: Arc::new(Containerd {
-                conf_dir: dir.path().join("containerd"),
-                cni_conf_dir: dir.path().join("cni"),
-                cni_bin_dir: "/opt/cni/bin".into(),
-            }),
+            runtime: Arc::new(runner::NodeRuntime::new(
+                runner::node::fake::FakeNode::default(),
+            )),
         };
         let node = start_with(
             config,

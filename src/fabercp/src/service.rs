@@ -21,7 +21,6 @@ use faber_api_types::{
     InviteResponse, JoinRequest, LeaseResponse, MemberStatus, Role, StatusIntervalResponse,
     error_code,
 };
-use faber_container_runtime::ContainerRuntimeSpec;
 use openraft::error::{ClientWriteError, InitializeError, RaftError};
 use openraft::{ChangeMembers, RaftMetrics, ServerState};
 use serde::Serialize;
@@ -355,9 +354,8 @@ impl FaberService {
 
     /// Makes this node a single-node cluster.
     ///
-    /// In mesh mode the founder also proposes `InitCluster`, seeding `mesh`
-    /// and `config/containerd`. If an earlier init stopped between the two
-    /// steps, a repeated init on the leader completes the seed. A node that
+    /// In mesh mode the founder also proposes `InitCluster`, seeding `mesh`. If an earlier init stopped between raft's initialisation and the
+    /// seed, a repeated init on the leader completes the seed. A node that
     /// joined (or is joining) from an invite cannot found a cluster.
     ///
     /// The seed carries the container range, and apply gives the founder
@@ -427,7 +425,6 @@ impl FaberService {
             let seed = Request::InitCluster {
                 mesh: mesh.config,
                 founder: mesh.record.clone(),
-                containerd: ContainerRuntimeSpec::default(),
             };
             match self.propose(seed).await {
                 Ok(_) | Err(ServiceError::AlreadyInitialized) => {}
@@ -2064,7 +2061,6 @@ mod tests {
                     name: "node-1".into(),
                     lease_renewed_at: 0,
                 },
-                containerd: ContainerRuntimeSpec::default(),
             })
             .await
             .unwrap();

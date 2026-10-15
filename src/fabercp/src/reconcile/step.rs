@@ -17,7 +17,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use faber_container_runtime::ContainerRuntimeSpec;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -35,8 +34,6 @@ pub type StepFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send
 pub struct ReplicatedStateView {
     /// `None` before `InitCluster`.
     pub mesh: Option<MeshState>,
-    /// The replicated container runtime settings, `None` before `InitCluster`.
-    pub containerd: Option<ContainerRuntimeSpec>,
     /// The workloads, where they are placed, what the nodes reported and the
     /// virtual IPs, from one read. `None` where a test has no cluster.
     pub placement: Option<PlacementView>,
@@ -64,7 +61,6 @@ impl ReplicatedStateView {
         }
         Ok(Self {
             mesh: reader.mesh()?,
-            containerd: reader.containerd()?,
             status_interval_secs: reader.status_setting()?.effective(clock),
             placement: Some(placement),
             data_keys,
@@ -499,7 +495,6 @@ mod tests {
             placement: None,
             status_interval_secs: 5,
             mesh: None,
-            containerd: None,
             data_keys: BTreeMap::new(),
             now: 0,
         }
