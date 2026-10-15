@@ -10,6 +10,7 @@
 mod frame;
 mod message;
 mod replica;
+mod subnet;
 
 pub use frame::{FrameError, MAX_FRAME_BYTES, encode_frame, read_frame, write_frame};
 pub use message::{
@@ -20,6 +21,7 @@ pub use replica::{
     LABEL_CONTAINER, LABEL_ENV, LABEL_MANAGED, LABEL_PROJECT, LABEL_REPLICA, LABEL_REVISION,
     LABEL_WORKLOAD, ReplicaRef,
 };
+pub use subnet::{MAX_CONTAINER_SUBNET_PREFIX, check_container_subnet};
 
 /// Bumped on any incompatible change to the frames.
 pub const PROTOCOL_VERSION: u32 = 1;

@@ -111,8 +111,6 @@ where
 mod tests {
     use std::sync::Arc;
 
-    use std::path::Path;
-
     use faber_container_runtime::Containerd;
     use faber_cri::fake::FakeCri;
     use faber_node_protocol::{PROTOCOL_VERSION, encode_frame};
@@ -122,7 +120,6 @@ mod tests {
     use crate::config::UidRange;
     use crate::peer::Peer;
     use crate::peer::fake::FakeStream;
-    use crate::runtime_config::RuntimeConfig;
     use crate::volume::fake::FakeVolumes;
 
     fn node(cri: FakeCri) -> Node<FakeCri> {
@@ -131,14 +128,11 @@ mod tests {
             String::new(),
             cri,
             Arc::new(FakeVolumes::new("/vol")),
-            RuntimeConfig::new(
-                Arc::new(Containerd {
-                    conf_dir: "/nonexistent/conf.d".into(),
-                    cni_conf_dir: "/nonexistent/net.d".into(),
-                }),
-                Path::new("/opt/cni/bin"),
-                Path::new("/nonexistent/net.d"),
-            ),
+            Containerd {
+                conf_dir: "/nonexistent/conf.d".into(),
+                cni_conf_dir: "/nonexistent/net.d".into(),
+                cni_bin_dir: "/opt/cni/bin".into(),
+            },
         )
     }
 

@@ -789,7 +789,6 @@ dependencies = [
  "faber-image",
  "faber-network-management",
  "faber-node-protocol",
- "ipnet",
  "nix",
  "serde_json",
  "sha2",

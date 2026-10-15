@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use faber_container_runtime::Containerd;
 use faber_node_protocol::USERNS_LENGTH;
 
 pub const DEFAULT_SOCKET: &str = "/run/faber/node.sock";
@@ -116,6 +117,15 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// containerd's config files, in the directories this config names.
+    pub fn containerd(&self) -> Containerd {
+        Containerd {
+            conf_dir: self.containerd_conf_dir.clone(),
+            cni_conf_dir: self.cni_conf_dir.clone(),
+            cni_bin_dir: self.cni_bin_dir.clone(),
+        }
+    }
+
     /// Parses an env file: `KEY=VALUE` lines, `#` comments, blank lines, and
     /// optional single or double quotes around a value.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {

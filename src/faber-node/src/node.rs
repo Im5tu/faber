@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use faber_api_types::workload::limits;
-use faber_container_runtime::RuntimeError;
+use faber_container_runtime::{
+    ContainerRuntime, ContainerRuntimeSpec, Containerd, NodeRuntimeSpec, PodNetworkSpec,
+    RuntimeError,
+};
 use faber_cri::{
     ContainerFilter, ContainerState as CriContainerState, CriClient, CriError, PodSandboxFilter,
     PodSandboxState,
@@ -17,7 +20,6 @@ use faber_node_protocol::{
 
 use crate::config::UidRange;
 use crate::cri_config::{self, ANNOTATION_SPEC_HASH, ANNOTATION_UID_BASE, ResolvedMount};
-use crate::runtime_config::RuntimeConfig;
 use crate::trust;
 use crate::volume::{EnsureVolume, VolumeError, VolumeManager, VolumeRef};
 
@@ -104,7 +106,7 @@ pub struct Node<C> {
     cri: C,
     images: ImagePuller<C>,
     volumes: Arc<dyn VolumeManager>,
-    runtime_config: RuntimeConfig,
+    containerd: Containerd,
 }
 
 impl<C: CriClient + Clone> Node<C> {
@@ -113,10 +115,10 @@ impl<C: CriClient + Clone> Node<C> {
         runtime_handler: String,
         cri: C,
         volumes: Arc<dyn VolumeManager>,
-        runtime_config: RuntimeConfig,
+        containerd: Containerd,
     ) -> Self {
         Self {
-            runtime_config,
+            containerd,
             sandbox_locks: ReplicaLocks::default(),
             uid_range,
             runtime_handler,
@@ -356,14 +358,22 @@ impl<C: CriClient + Clone> Node<C> {
                 if let Some(network) = &pod_network {
                     trust::check_pod_network(network)?;
                 }
-                let changed = self
-                    .runtime_config
-                    .configure(systemd_cgroup, &sandbox_image, pod_network.as_ref())
-                    .await?;
+                let spec = NodeRuntimeSpec {
+                    settings: ContainerRuntimeSpec {
+                        systemd_cgroup,
+                        sandbox_image,
+                    },
+                    pod_network: pod_network.map(|n| PodNetworkSpec {
+                        bridge: n.bridge,
+                        subnet: n.subnet,
+                        mtu: n.mtu,
+                    }),
+                };
+                let changed = self.containerd.reconcile(&spec).await?;
                 Ok(Response::Changed { changed })
             }
             Request::RemoveCniConfig => Ok(Response::Changed {
-                changed: self.runtime_config.remove_cni_config().await?,
+                changed: self.containerd.remove_pod_network().await?,
             }),
         }
     }

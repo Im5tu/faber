@@ -2151,6 +2151,7 @@ mod tests {
         let runtime = Containerd {
             conf_dir: conf_dir.clone(),
             cni_conf_dir,
+            cni_bin_dir: "/opt/cni/bin".into(),
         };
 
         remove_pod_network(&runtime, &storage.reader).await;
@@ -2850,6 +2851,7 @@ mod tests {
                 runtime: Arc::new(Containerd {
                     conf_dir: dir.path().join("containerd"),
                     cni_conf_dir: dir.path().join("cni"),
+                    cni_bin_dir: "/opt/cni/bin".into(),
                 }),
             };
 
@@ -3070,6 +3072,7 @@ mod tests {
             runtime: Arc::new(Containerd {
                 conf_dir: dir.path().join("containerd"),
                 cni_conf_dir: dir.path().join("cni"),
+                cni_bin_dir: "/opt/cni/bin".into(),
             }),
         };
         let node = start_with(

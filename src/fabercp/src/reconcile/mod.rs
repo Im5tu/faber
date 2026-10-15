@@ -2234,6 +2234,7 @@ mod tests {
             runtime: Arc::new(Containerd {
                 conf_dir: dir.to_path_buf(),
                 cni_conf_dir: dir.join("cni"),
+                cni_bin_dir: "/opt/cni/bin".into(),
             }),
         }
     }

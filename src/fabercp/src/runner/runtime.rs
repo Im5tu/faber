@@ -3,8 +3,7 @@
 //! containerd runs as root and loads the files this writes, so fabercp does
 //! not write them. [`NodeRuntime`] sends the values to `faber-node`, which
 //! checks them and writes the files to paths of its own. No path or file
-//! body is ever sent, and the CNI directories in the replicated
-//! `ContainerRuntimeSpec` are not read: `faber-node` owns both.
+//! body is ever sent: `faber-node` owns the directories.
 
 use std::io;
 
@@ -93,15 +92,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_sends_the_settings_and_the_network_and_no_paths() {
+    async fn reconcile_sends_the_settings_and_the_network() {
         let node = FakeNode::default();
         let runtime = NodeRuntime::new(node.clone());
-        // Directories in the replicated settings stay on this side.
-        let mut with_dirs = spec(Some(network()));
-        with_dirs.settings.cni_bin_dir = "/tmp/evil-plugins".into();
-        with_dirs.settings.cni_conf_dir = "/tmp/evil-conf".into();
-
-        assert!(runtime.reconcile(&with_dirs).await.unwrap());
+        assert!(runtime.reconcile(&spec(Some(network()))).await.unwrap());
         assert_eq!(
             node.log(),
             [

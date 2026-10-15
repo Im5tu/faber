@@ -30,15 +30,18 @@ const REMOVE_CONFLIST: &str = "removing the CNI network config";
 const RECONCILE: &str = "configuring containerd";
 
 /// containerd, configured through the drop-in `<conf_dir>/faber.toml` and the
-/// CNI network config `<cni_conf_dir>/10-faber.conflist`.
+/// CNI network config `<cni_conf_dir>/10-faber.conflist`. The drop-in tells
+/// containerd to read CNI configs from `cni_conf_dir` and to run CNI plugins
+/// from `cni_bin_dir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Containerd {
     /// Directory the drop-in is written to.
     pub conf_dir: PathBuf,
-    /// Directory the CNI network config is written to. This is where the
-    /// file goes on this host; `ContainerRuntimeSpec::cni_conf_dir` is what
+    /// Directory the CNI network config is written to, and the one
     /// containerd is told to read.
     pub cni_conf_dir: PathBuf,
+    /// Directory containerd is told to run CNI plugins from.
+    pub cni_bin_dir: PathBuf,
 }
 
 impl ContainerRuntime for Containerd {
@@ -57,8 +60,13 @@ impl ContainerRuntime for Containerd {
         let spec = spec.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                let drop_in = write_if_changed(&this.conf_dir, &spec.settings)
-                    .map_err(|e| (WRITE_DROP_IN, e))?;
+                let drop_in = write_if_changed(
+                    &this.conf_dir,
+                    &spec.settings,
+                    &this.cni_bin_dir,
+                    &this.cni_conf_dir,
+                )
+                .map_err(|e| (WRITE_DROP_IN, e))?;
                 let conflist = apply_pod_network(&this.cni_conf_dir, spec.pod_network.as_ref())?;
                 Ok(drop_in || conflist)
             })
@@ -102,7 +110,7 @@ impl ContainerRuntime for Containerd {
 ///
 /// Starts with [`MANAGED_MARKER`] and `version = 2`. Strings are TOML-escaped.
 /// Deterministic for equal input.
-fn render(settings: &ContainerRuntimeSpec) -> String {
+fn render(settings: &ContainerRuntimeSpec, cni_bin_dir: &Path, cni_conf_dir: &Path) -> String {
     const CRI: &str = r#"plugins."io.containerd.grpc.v1.cri""#;
     format!(
         "{MANAGED_MARKER}\n\
@@ -117,8 +125,8 @@ fn render(settings: &ContainerRuntimeSpec) -> String {
          [{CRI}.cni]\n  bin_dir = {bin}\n  conf_dir = {conf}\n",
         sandbox = toml_string(&settings.sandbox_image),
         cgroup = settings.systemd_cgroup,
-        bin = toml_string(&settings.cni_bin_dir),
-        conf = toml_string(&settings.cni_conf_dir),
+        bin = toml_string(&cni_bin_dir.to_string_lossy()),
+        conf = toml_string(&cni_conf_dir.to_string_lossy()),
     )
 }
 
@@ -148,8 +156,17 @@ fn toml_string(value: &str) -> String {
 
 /// Writes [`render`] to `<dir>/faber.toml` unless the file already holds
 /// exactly that (`file::write_if_changed`). Returns whether it wrote.
-fn write_if_changed(dir: &Path, settings: &ContainerRuntimeSpec) -> io::Result<bool> {
-    file::write_if_changed(dir, DROP_IN_FILE, render(settings).as_bytes())
+fn write_if_changed(
+    dir: &Path,
+    settings: &ContainerRuntimeSpec,
+    cni_bin_dir: &Path,
+    cni_conf_dir: &Path,
+) -> io::Result<bool> {
+    file::write_if_changed(
+        dir,
+        DROP_IN_FILE,
+        render(settings, cni_bin_dir, cni_conf_dir).as_bytes(),
+    )
 }
 
 /// Brings `<dir>/10-faber.conflist` to `network`: written if it differs,
@@ -174,6 +191,17 @@ fn apply_pod_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BIN: &str = "/opt/cni/bin";
+    const CONF: &str = "/etc/cni/net.d";
+
+    fn render_with(settings: &ContainerRuntimeSpec) -> String {
+        render(settings, Path::new(BIN), Path::new(CONF))
+    }
+
+    fn write_with(dir: &Path, settings: &ContainerRuntimeSpec) -> io::Result<bool> {
+        write_if_changed(dir, settings, Path::new(BIN), Path::new(CONF))
+    }
 
     /// The default settings with no container network.
     fn node_spec() -> NodeRuntimeSpec {
@@ -201,7 +229,7 @@ version = 2
   bin_dir = "/opt/cni/bin"
   conf_dir = "/etc/cni/net.d"
 "#;
-        assert_eq!(render(&ContainerRuntimeSpec::default()), expected);
+        assert_eq!(render_with(&ContainerRuntimeSpec::default()), expected);
     }
 
     #[test]
@@ -209,10 +237,8 @@ version = 2
         let s = ContainerRuntimeSpec {
             systemd_cgroup: false,
             sandbox_image: "reg.example/pause:\"x\"".into(),
-            cni_bin_dir: "C:\\cni\\bin".into(),
-            cni_conf_dir: "/etc/cni\n[evil]".into(),
         };
-        let out = render(&s);
+        let out = render(&s, Path::new("C:\\cni\\bin"), Path::new("/etc/cni\n[evil]"));
         assert!(
             out.starts_with("# managed by faber\nversion = 2\n"),
             "{out}"
@@ -247,19 +273,22 @@ version = 2
         let s = ContainerRuntimeSpec::default();
         let path = dir.path().join(DROP_IN_FILE);
 
-        assert!(write_if_changed(dir.path(), &s).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), render(&s));
+        assert!(write_with(dir.path(), &s).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(&s));
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        assert!(!write_if_changed(dir.path(), &s).unwrap());
+        assert!(!write_with(dir.path(), &s).unwrap());
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
 
         let changed = ContainerRuntimeSpec {
             systemd_cgroup: false,
             ..s
         };
-        assert!(write_if_changed(dir.path(), &changed).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), render(&changed));
+        assert!(write_with(dir.path(), &changed).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            render_with(&changed)
+        );
 
         // Only the drop-in is left; no temp files.
         let names: Vec<_> = std::fs::read_dir(dir.path())
@@ -274,10 +303,10 @@ version = 2
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DROP_IN_FILE);
         std::fs::write(&path, "junk").unwrap();
-        assert!(write_if_changed(dir.path(), &ContainerRuntimeSpec::default()).unwrap());
+        assert!(write_with(dir.path(), &ContainerRuntimeSpec::default()).unwrap());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            render(&ContainerRuntimeSpec::default())
+            render_with(&ContainerRuntimeSpec::default())
         );
     }
 
@@ -285,13 +314,14 @@ version = 2
     fn write_if_changed_missing_dir_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert!(write_if_changed(&missing, &ContainerRuntimeSpec::default()).is_err());
+        assert!(write_with(&missing, &ContainerRuntimeSpec::default()).is_err());
     }
 
     #[tokio::test]
     async fn reconcile_writes_once_then_reports_no_change() {
         let dir = tempfile::tempdir().unwrap();
         let runtime: std::sync::Arc<dyn ContainerRuntime> = std::sync::Arc::new(Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().to_path_buf(),
             cni_conf_dir: dir.path().join("cni"),
         });
@@ -299,7 +329,7 @@ version = 2
         assert!(runtime.reconcile(&spec).await.unwrap());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings)
+            render(&spec.settings, Path::new(BIN), &dir.path().join("cni"))
         );
         assert!(!runtime.reconcile(&spec).await.unwrap());
     }
@@ -309,6 +339,7 @@ version = 2
         use std::error::Error as _;
         let dir = tempfile::tempdir().unwrap();
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().join("nope"),
             cni_conf_dir: dir.path().join("cni"),
         };
@@ -323,6 +354,7 @@ version = 2
         std::fs::create_dir(&cni_conf_dir).unwrap();
         let conflist = cni_conf_dir.join(CONFLIST_FILE);
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.to_path_buf(),
             cni_conf_dir,
         };
@@ -353,7 +385,7 @@ version = 2
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings)
+            render(&spec.settings, Path::new(BIN), &dir.path().join("cni"))
         );
         assert!(!runtime.reconcile(&spec).await.unwrap());
 
@@ -443,6 +475,7 @@ version = 2
         use std::error::Error as _;
         let dir = tempfile::tempdir().unwrap();
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().to_path_buf(),
             cni_conf_dir: dir.path().join("nope"),
         };
@@ -452,7 +485,7 @@ version = 2
         assert!(err.source().is_some());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(DROP_IN_FILE)).unwrap(),
-            render(&spec.settings)
+            render(&spec.settings, Path::new(BIN), &dir.path().join("nope"))
         );
     }
 
@@ -460,6 +493,7 @@ version = 2
     async fn reconcile_missing_cni_dir_is_fine_without_a_pod_network() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().to_path_buf(),
             cni_conf_dir: dir.path().join("nope"),
         };
@@ -502,6 +536,7 @@ version = 2
     async fn remove_pod_network_needs_neither_directory() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().join("nope"),
             cni_conf_dir: dir.path().join("nor-this"),
         };
@@ -516,6 +551,7 @@ version = 2
         let conflist = cni_conf_dir.join(CONFLIST_FILE);
         std::fs::write(&conflist, "{}").unwrap();
         let runtime = Containerd {
+            cni_bin_dir: "/opt/cni/bin".into(),
             conf_dir: dir.path().join("nope"),
             cni_conf_dir,
         };
@@ -542,7 +578,7 @@ version = 2
     fn write_if_changed_sets_mode_0644() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        write_if_changed(dir.path(), &ContainerRuntimeSpec::default()).unwrap();
+        write_with(dir.path(), &ContainerRuntimeSpec::default()).unwrap();
         let mode = std::fs::metadata(dir.path().join(DROP_IN_FILE))
             .unwrap()
             .permissions()

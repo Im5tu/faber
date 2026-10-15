@@ -48,7 +48,6 @@ mod linux {
     use faber_node::listener;
     use faber_node::node::Node;
     use faber_node::peer::Authorizer;
-    use faber_node::runtime_config::RuntimeConfig;
     use faber_node::volume::{CommandMounter, HostVolumes, ToolPaths};
 
     /// The env file decides what pods may map, so it must be root's alone.
@@ -111,7 +110,7 @@ mod linux {
             config.runtime_handler.clone(),
             cri,
             Arc::new(volumes),
-            RuntimeConfig::for_host(&config),
+            config.containerd(),
         ));
         let listener = listener::bind(&config)?;
         tracing::info!(socket = %config.socket.display(), "faber-node listening");

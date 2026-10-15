@@ -31,8 +31,6 @@ pub struct ContainerRuntimeSpec {
     /// Use the systemd cgroup driver (runc `SystemdCgroup`).
     pub systemd_cgroup: bool,
     pub sandbox_image: String,
-    pub cni_bin_dir: String,
-    pub cni_conf_dir: String,
 }
 
 impl Default for ContainerRuntimeSpec {
@@ -40,8 +38,6 @@ impl Default for ContainerRuntimeSpec {
         Self {
             systemd_cgroup: true,
             sandbox_image: "registry.k8s.io/pause:3.10".into(),
-            cni_bin_dir: "/opt/cni/bin".into(),
-            cni_conf_dir: "/etc/cni/net.d".into(),
         }
     }
 }
@@ -114,9 +110,7 @@ mod tests {
             v,
             json!({
                 "systemd_cgroup": true,
-                "sandbox_image": "registry.k8s.io/pause:3.10",
-                "cni_bin_dir": "/opt/cni/bin",
-                "cni_conf_dir": "/etc/cni/net.d"
+                "sandbox_image": "registry.k8s.io/pause:3.10"
             })
         );
         assert_eq!(
@@ -141,9 +135,7 @@ mod tests {
             json!({
                 "settings": {
                     "systemd_cgroup": true,
-                    "sandbox_image": "registry.k8s.io/pause:3.10",
-                    "cni_bin_dir": "/opt/cni/bin",
-                    "cni_conf_dir": "/etc/cni/net.d"
+                    "sandbox_image": "registry.k8s.io/pause:3.10"
                 },
                 "pod_network": {
                     "bridge": "faberbr0",

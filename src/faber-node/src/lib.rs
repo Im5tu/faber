@@ -19,6 +19,5 @@ pub mod node;
 #[cfg(test)]
 mod node_tests;
 pub mod peer;
-pub mod runtime_config;
 pub mod trust;
 pub mod volume;

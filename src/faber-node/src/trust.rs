@@ -1,7 +1,6 @@
 //! The checks `faber-node` runs on every request, whatever fabercp sends.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
 
 use faber_api_types::name::validate_dns_label;
 use faber_api_types::workload::{
@@ -9,8 +8,8 @@ use faber_api_types::workload::{
 };
 use faber_node_protocol::{
     DnsConfig, ErrorCode, NodeError, PodNetwork, ReplicaRef, SecretEnv, VolumeKind,
+    check_container_subnet,
 };
-use ipnet::Ipv4Net;
 
 use crate::config::UidRange;
 
@@ -118,16 +117,6 @@ pub fn check_volume_size(kind: VolumeKind, size_bytes: u64) -> Result<(), NodeEr
 const BRIDGE_PREFIX: &str = "faber";
 /// The longest interface name Linux accepts (`IFNAMSIZ` less the NUL).
 const MAX_BRIDGE_BYTES: usize = 15;
-/// Prefix lengths a node's container subnet may have.
-const SUBNET_PREFIX: std::ops::RangeInclusive<u8> = 16..=28;
-/// Subnets a node's containers may use: the private ranges and carrier-grade
-/// NAT space, never public, loopback or link-local addresses.
-const SUBNET_RANGES: [Ipv4Net; 4] = [
-    Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8),
-    Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12),
-    Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
-    Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10),
-];
 /// MTUs a bridge may have: the IPv4 minimum up to jumbo frames.
 const MTU: std::ops::RangeInclusive<u16> = 576..=9000;
 
@@ -151,20 +140,8 @@ pub fn check_pod_network(network: &PodNetwork) -> Result<(), NodeError> {
              starting with {BRIDGE_PREFIX}"
         )));
     }
-    let subnet = network.subnet;
-    if !SUBNET_PREFIX.contains(&subnet.prefix_len()) {
-        return Err(invalid(format!(
-            "subnet: the prefix length must be from {} to {}",
-            SUBNET_PREFIX.start(),
-            SUBNET_PREFIX.end()
-        )));
-    }
-    if subnet != subnet.trunc() {
-        return Err(invalid("subnet: host bits are set"));
-    }
-    if !SUBNET_RANGES.iter().any(|range| range.contains(&subnet)) {
-        return Err(invalid("subnet: must be a private or shared address range"));
-    }
+    // The rule fabercp hands subnets out by, so the two cannot disagree.
+    check_container_subnet(network.subnet).map_err(|e| invalid(format!("subnet: {e}")))?;
     if !MTU.contains(&network.mtu) {
         return Err(invalid(format!(
             "mtu: must be from {} to {}",
@@ -411,14 +388,16 @@ mod tests {
     }
 
     #[test]
-    fn pod_network_subnets() {
+    fn pod_network_subnets_follow_the_shared_rule() {
+        // Every subnet fabercp can hand out: any prefix up to /30, any
+        // address outside the reserved ranges, public ones included.
         for ok in [
             "10.200.3.0/24",
             "10.0.0.0/16",
             "172.16.0.0/28",
-            "172.31.255.0/24",
-            "192.168.1.0/24",
+            "192.168.1.4/30",
             "100.64.0.0/16",
+            "8.8.8.0/24",
         ] {
             assert!(
                 check_pod_network(&network("faberbr0", ok, 1420)).is_ok(),
@@ -427,17 +406,12 @@ mod tests {
         }
         for bad in [
             "0.0.0.0/0",
-            "10.0.0.0/8",     // too wide
-            "10.200.3.0/15",  // too wide
-            "10.200.3.0/29",  // too narrow
-            "10.200.3.0/32",  // one host
-            "10.200.3.4/24",  // host bits set
-            "8.8.8.0/24",     // public
-            "127.0.0.0/24",   // loopback
-            "169.254.1.0/24", // link-local
-            "172.32.0.0/24",  // just outside 172.16/12
-            "100.128.0.0/24", // just outside 100.64/10
-            "224.0.0.0/24",   // multicast
+            "127.0.0.0/24",
+            "169.254.1.0/24",
+            "224.0.0.0/24",
+            "10.200.3.4/24",
+            "10.200.3.0/31",
+            "10.200.3.1/32",
         ] {
             assert_eq!(
                 code(check_pod_network(&network("faberbr0", bad, 1420))),

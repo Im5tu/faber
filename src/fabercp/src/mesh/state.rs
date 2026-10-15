@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use faber_api_types::{DEFAULT_PEER_PORT, error_code};
+use faber_node_protocol::{MAX_CONTAINER_SUBNET_PREFIX, check_container_subnet};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
@@ -814,10 +815,6 @@ pub(crate) fn is_host_addr(net: Ipv4Net, ip: Ipv4Addr) -> bool {
     net.contains(&ip) && (net.prefix_len() >= 31 || (ip != net.network() && ip != net.broadcast()))
 }
 
-/// Longest container subnet prefix accepted: a /30 is the smallest subnet
-/// with a gateway and one container address.
-const MAX_CONTAINER_SUBNET_PREFIX: u8 = 30;
-
 /// Checks the container range `range` of `config` and returns its first
 /// subnet, the founder's. Every failure is a `bad_request`; see
 /// [`MeshState::init`] for the rules.
@@ -834,12 +831,10 @@ fn first_container_subnet(config: &MeshConfig, range: Ipv4Net) -> Result<Ipv4Net
             "container range {range} is smaller than one /{prefix} subnet"
         )));
     }
-    if range != range.trunc() {
-        return Err(bad(format!(
-            "container range {range} has host bits set; did you mean {}?",
-            range.trunc()
-        )));
-    }
+    // The rule faber-node applies to every subnet it writes, so a subnet
+    // handed out here is never refused there. A range that passes holds only
+    // subnets that pass.
+    check_container_subnet(range).map_err(|e| bad(format!("container range {e}")))?;
     if range.contains(&config.cidr.network()) || config.cidr.contains(&range.network()) {
         return Err(bad(format!(
             "container range {range} overlaps the mesh CIDR {}",
@@ -1550,6 +1545,12 @@ mod tests {
             ("10.99.0.0/16", 24, "same as the mesh"),
             ("10.99.4.0/22", 24, "inside the mesh"),
             ("10.0.0.0/8", 24, "contains the mesh"),
+            ("127.0.0.0/16", 24, "loopback"),
+            ("169.254.0.0/16", 24, "link-local"),
+            ("224.0.0.0/16", 24, "multicast"),
+            ("0.0.0.0/8", 24, "this network"),
+            ("240.0.0.0/8", 24, "reserved, holds the broadcast address"),
+            ("128.0.0.0/2", 24, "holds link-local"),
         ] {
             let err =
                 MeshState::init(cfg_with_range(range, prefix), node(1, "10.99.0.1")).unwrap_err();

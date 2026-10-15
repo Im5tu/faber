@@ -17,7 +17,6 @@ use faber_node_protocol::{
 
 use crate::config::UidRange;
 use crate::node::Node;
-use crate::runtime_config::RuntimeConfig;
 use crate::volume::fake::FakeVolumes;
 
 const BASE: u32 = 65536 * 2;
@@ -61,21 +60,18 @@ fn rig() -> Rig {
     let dirs = tempfile::tempdir().unwrap();
     std::fs::create_dir(dirs.path().join("conf.d")).unwrap();
     std::fs::create_dir(dirs.path().join("net.d")).unwrap();
-    let runtime = RuntimeConfig::new(
-        Arc::new(Containerd {
-            conf_dir: dirs.path().join("conf.d"),
-            cni_conf_dir: dirs.path().join("net.d"),
-        }),
-        std::path::Path::new("/opt/cni/bin"),
-        &dirs.path().join("net.d"),
-    );
+    let containerd = Containerd {
+        conf_dir: dirs.path().join("conf.d"),
+        cni_conf_dir: dirs.path().join("net.d"),
+        cni_bin_dir: "/opt/cni/bin".into(),
+    };
     Rig {
         node: Node::new(
             UidRange::new(65536 * 2, 65536 * 8).unwrap(),
             "runc".into(),
             cri.clone(),
             volumes.clone(),
-            runtime,
+            containerd,
         ),
         cri,
         volumes,
@@ -837,7 +833,7 @@ async fn an_invalid_runtime_config_is_refused_and_writes_nothing() {
         ),
         configure("pause:3", Some(pod_network("eth0", "10.200.3.0/24"))),
         configure("pause:3", Some(pod_network("faberbr0\"x", "10.200.3.0/24"))),
-        configure("pause:3", Some(pod_network("faberbr0", "8.8.8.0/24"))),
+        configure("pause:3", Some(pod_network("faberbr0", "127.0.0.0/24"))),
         configure("pause:3", Some(pod_network("faberbr0", "10.200.3.1/24"))),
         configure("pause:3", Some(pod_network("faberbr0", "0.0.0.0/0"))),
         configure("pause:3", Some(mtu)),

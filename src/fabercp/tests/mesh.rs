@@ -151,6 +151,7 @@ impl MeshNode {
             runtime: Arc::new(Containerd {
                 conf_dir: self.containerd_dir(),
                 cni_conf_dir: self.cni_dir(),
+                cni_bin_dir: "/opt/cni/bin".into(),
             }),
         })
     }

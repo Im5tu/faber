@@ -283,11 +283,8 @@ impl Config {
                  /{DEFAULT_CONTAINER_SUBNET_PREFIX} of it"
             );
         }
-        if range != range.trunc() {
-            anyhow::bail!(
-                "--container-cidr {range} has host bits set; did you mean {}?",
-                range.trunc()
-            );
+        if let Err(e) = faber_node_protocol::check_container_subnet(range) {
+            anyhow::bail!("--container-cidr {e}");
         }
         if range.contains(&mesh.network()) || mesh.contains(&range.network()) {
             anyhow::bail!("--container-cidr {range} overlaps --mesh-cidr {mesh}");
@@ -796,6 +793,18 @@ mod tests {
         assert!(err.contains("--container-cidr 10.200.1.0/16"), "{err}");
         assert!(err.contains("host bits"), "{err}");
         assert!(err.contains("10.200.0.0/16"), "{err}");
+        // Reserved ranges, which faber-node refuses to write into the CNI
+        // config.
+        for reserved in [
+            "127.0.0.0/16",
+            "169.254.0.0/16",
+            "224.0.0.0/16",
+            "0.0.0.0/8",
+        ] {
+            let err = error("10.99.0.0/16", reserved);
+            assert!(err.contains("--container-cidr"), "{err}");
+            assert!(err.contains("reserved"), "{err}");
+        }
         // Overlap, whichever range holds the other.
         for (mesh, containers) in [
             ("10.99.0.0/16", "10.99.0.0/16"),
