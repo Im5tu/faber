@@ -7,7 +7,7 @@
 #   tests/e2e/run.sh              build the binaries and images, run everything
 #
 # Environment:
-#   E2E_SKIP_BUILD=1   reuse tmp/e2e-bin/{fabercp,faber} instead of building
+#   E2E_SKIP_BUILD=1   reuse tmp/e2e-bin/{fabercp,faber,faber-node} instead of building
 #   E2E_KEEP=1         leave the containers and the network up afterwards
 #   E2E_PHASES="..."   phases to run, default "A B H J C D E F I G", always
 #                      in that order (B needs A; H, J, C, D, E, F and I need B)
@@ -35,6 +35,14 @@
 #      of a running node, the removed node's way back, and --join --reset on
 #      a configured node (joins C and E first when F did not run). No lease
 #      is left to run out: the shortest one is 300 s
+#   M  milestone 1 on A and B (needs A and B): redis from Docker Hub with
+#      `faber deploy spec` (2 replicas, block volume, ramdisk, probe): both
+#      replicas available, its name resolves to the virtual IP and answers
+#      PING from containers on both nodes, a killed redis comes back with
+#      its data, and a redeploy with a changed env keeps the virtual IP.
+#      E2E_CGROUPFS_WORKAROUND=1 sets runc to cgroupfs first (see
+#      e2e-findings.md). M is not in the default phases: J still tests the
+#      removed compose and k8s deploys.
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -205,7 +213,8 @@ start_node() {
   docker cp -q "$(host_path "$REPO/src/install.sh")" "$name:$SRC/install.sh"
   docker cp -q "$(host_path "$BIN_DIR/fabercp")" "$name:$SRC/fabercp"
   docker cp -q "$(host_path "$BIN_DIR/faber")" "$name:$SRC/faber"
-  docker exec "$name" bash -c "chown -R root:root $SRC && chmod 0755 $SRC/install.sh $SRC/fabercp $SRC/faber"
+  docker cp -q "$(host_path "$BIN_DIR/faber-node")" "$name:$SRC/faber-node"
+  docker exec "$name" bash -c "chown -R root:root $SRC && chmod 0755 $SRC/install.sh $SRC/fabercp $SRC/faber $SRC/faber-node"
   info "$name up: ip $(node_ip "$name"), systemd $state"
 }
 
@@ -285,7 +294,7 @@ cleanup() {
 # --- setup ------------------------------------------------------------------
 
 build_binaries() {
-  if [[ "${E2E_SKIP_BUILD:-0}" == 1 && -f "$BIN_DIR/fabercp" && -f "$BIN_DIR/faber" ]]; then
+  if [[ "${E2E_SKIP_BUILD:-0}" == 1 && -f "$BIN_DIR/fabercp" && -f "$BIN_DIR/faber" && -f "$BIN_DIR/faber-node" ]]; then
     info "E2E_SKIP_BUILD=1: using the binaries in $BIN_DIR"
     return 0
   fi
@@ -300,8 +309,8 @@ build_binaries() {
       set -e
       apt-get update -qq
       apt-get install -y -qq clang libclang-dev cmake >/dev/null
-      cargo build -p fabercp -p faber
-      cp /target/debug/fabercp /target/debug/faber /code/tmp/e2e-bin/'
+      cargo build --release -p fabercp -p faber -p faber-node
+      cp /target/release/fabercp /target/release/faber /target/release/faber-node /code/tmp/e2e-bin/'
 }
 
 build_images() {
@@ -313,7 +322,7 @@ build_images() {
 
 check_binaries() {
   docker run --rm -v "$(host_path "$BIN_DIR"):/b:ro" "$IMAGE" bash -c '
-    cp /b/fabercp /b/faber /tmp/ && chmod +x /tmp/fabercp /tmp/faber &&
+    cp /b/fabercp /b/faber /b/faber-node /tmp/ && chmod +x /tmp/fabercp /tmp/faber /tmp/faber-node &&
     /tmp/fabercp --version && /tmp/faber --version' 2>&1
 }
 
@@ -1935,6 +1944,244 @@ phase_g() {
   fi
 }
 
+# --- phase M: redis behind a virtual IP -------------------------------------
+
+M_PROJECT="shop"
+M_ENV="staging"
+M_APP="redis"
+M_NAME="redis.staging.shop.faber.local"
+M_CLIENT_CID=""
+
+# m_spec GREETING: the spec of this phase. One service with two replicas
+# spread over the two nodes, a block volume for the data, a ramdisk, a tcp
+# probe. command replaces the image's entrypoint, so redis runs as the
+# container's root, which the pod's user namespace maps to the service's
+# host uid. appendfsync always makes a SIGKILL lose nothing.
+m_spec() {
+  cat <<EOF
+{"redis":{
+  "scale":{"replicas":{"count":2}},
+  "volumes":{
+    "data":{"type":"block","size_bytes":268435456},
+    "scratch":{"type":"ramdisk","size_bytes":16777216}},
+  "containers":[{
+    "name":"redis","image":"redis:7-alpine",
+    "command":["redis-server"],
+    "args":["--appendonly","yes","--appendfsync","always","--dir","/data"],
+    "env":{"GREETING":"$1"},
+    "ports":[{"name":"redis","port":6379}],
+    "mounts":[{"volume":"data","path":"/data"},{"volume":"scratch","path":"/scratch"}],
+    "probe":{"action":{"type":"tcp","port":6379},"interval_secs":2}}]}}
+EOF
+}
+
+# m_deploy GREETING: deploy the spec on NODE_A. Sets M_OUT and M_RC.
+m_deploy() {
+  m_spec "$1" | docker exec -i "$NODE_A" faber deploy spec - --project "$M_PROJECT" --env "$M_ENV" >"$LOG_DIR/m-deploy-$1.log" 2>&1
+  M_RC=${PIPESTATUS[1]}
+  M_OUT="$(tr -d '' <"$LOG_DIR/m-deploy-$1.log")"
+}
+
+# m_show NODE: faber app show of the service.
+m_show() { dx "$1" "faber app show $M_APP --project $M_PROJECT --env $M_ENV"; }
+
+# m_revision NODE
+m_revision() { m_show "$1" | awk '$1 == "revision:" { print $2 }'; }
+
+# m_replicas NODE: one line per replica: index node revision state pod-ip.
+m_replicas() {
+  m_show "$1" | awk '/^  REPLICA/ { f = 1; next } /^[a-z]/ { f = 0 } f && /^  [0-9]+ / { print $1, $2, $3, $4, $5 }'
+}
+
+# m_available NODE REV: how many replicas are available on revision REV.
+m_available() { m_replicas "$1" | awk -v r="$2" '$3 == r && $4 == "available" { n++ } END { print n + 0 }'; }
+
+# m_wait_available SECONDS NODE REV: poll until both replicas are available
+# on REV.
+m_wait_available() {
+  local deadline=$((SECONDS + $1))
+  while ((SECONDS < deadline)); do
+    [[ "$(m_available "$2" "$3")" == 2 ]] && return 0
+    sleep 3
+  done
+  return 1
+}
+
+# m_vip NODE: the virtual IP that NODE's nat chain sends port 6379 to.
+m_vip() { dx "$1" "nft list table inet faber | grep -oE 'ip daddr [0-9.]+ tcp dport 6379' | head -n 1 | awk '{ print \$3 }'"; }
+
+# m_start_client NODE: a pod with a redis-alpine container that only sleeps,
+# whose resolver is the node's bridge address. It plays "another container".
+# Sets M_CLIENT_CID.
+m_start_client() {
+  local n="$1" out rc
+  out="$(dx "$n" "set -e
+    crictl pull redis:7-alpine >/dev/null
+    gw=\$(ip -4 -o addr show dev faberbr0 | awk '{ split(\$4, a, \"/\"); print a[1] }')
+    mkdir -p /tmp/e2e-client
+    printf '%s\n' \"{\\\"metadata\\\":{\\\"name\\\":\\\"e2e-client\\\",\\\"namespace\\\":\\\"e2e\\\",\\\"uid\\\":\\\"e2e-client-uid\\\",\\\"attempt\\\":1},\\\"log_directory\\\":\\\"/tmp/e2e-client\\\",\\\"dns_config\\\":{\\\"servers\\\":[\\\"\$gw\\\"]},\\\"linux\\\":{\\\"cgroup_parent\\\":\\\"e2epods.slice\\\"}}\" > /tmp/e2e-client/pod.json
+    printf '%s\n' '{\"metadata\":{\"name\":\"client\"},\"image\":{\"image\":\"redis:7-alpine\"},\"command\":[\"sleep\",\"3600\"],\"log_path\":\"client.log\"}' > /tmp/e2e-client/ctr.json
+    pod=\$(crictl runp /tmp/e2e-client/pod.json)
+    cid=\$(crictl create \$pod /tmp/e2e-client/ctr.json /tmp/e2e-client/pod.json)
+    crictl start \$cid >/dev/null
+    echo \$cid")"
+  rc=$?
+  M_CLIENT_CID="$(tail -n 1 <<<"$out")"
+  assert_ok "M $n: a client container is running next to faber's pods [${M_CLIENT_CID:0:13}]" "$rc" "$out"
+}
+
+# m_cx NODE CID COMMAND...: run COMMAND in the container CID on NODE.
+m_cx() {
+  local n="$1" cid="$2"
+  shift 2
+  dx "$n" "crictl exec $cid $*"
+}
+
+# m_redis_cid NODE: the id of the redis container on NODE.
+m_redis_cid() { dx "$1" "crictl ps -q --name '^redis-' | head -n 1"; }
+
+phase_m() {
+  local out rc rev1 rev2 vip1 vip2 cid_a cid_b ca cb ip_a ip_b pid pid2 pfx_a n seen who
+  section "M: redis from Docker Hub behind a virtual IP, on $NODE_A and $NODE_B"
+  pfx_a="${SUBNET_A%.0/24}."
+
+  # containerd 2.x with systemd cgroups needs a pod cgroup parent that is a
+  # slice. See e2e-findings.md. Until faber sets one, E2E_CGROUPFS_WORKAROUND=1
+  # makes runc use cgroupfs so the rest of the phase can run.
+  if [[ "${E2E_CGROUPFS_WORKAROUND:-0}" == 1 ]]; then
+    for n in "$NODE_A" "$NODE_B"; do
+      dx "$n" 'printf "version = 2\n[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]\n  SystemdCgroup = false\n" > /etc/containerd/conf.d/zz-e2e-cgroupfs.toml && systemctl restart containerd' >/dev/null
+    done
+    info "E2E_CGROUPFS_WORKAROUND=1: runc uses cgroupfs on both nodes"
+  fi
+  for n in "$NODE_A" "$NODE_B"; do
+    out="$(install_crictl "$n")"
+    assert_ok "M $n: crictl is installed" "$?" "$out"
+    assert_eq "M $n: faber-node is active" "$(dx "$n" 'systemctl is-active faber-node')" "active"
+  done
+
+  # Deploy.
+  out="$(dx "$NODE_A" "faber project create $M_PROJECT")"
+  assert_ok "M $NODE_A: faber project create $M_PROJECT" "$?" "$out"
+  m_deploy one
+  out="$M_OUT"
+  rc="$M_RC"
+  evidence "$out"
+  assert_ok "M $NODE_A: faber deploy spec (redis, 2 replicas, block volume, probe) exits 0" "$rc" "$out"
+  assert_has "M the deploy created redis" "$out" '^created: +redis$'
+
+  rev1="$(m_revision "$NODE_A")"
+  if m_wait_available 300 "$NODE_A" "$rev1"; then
+    pass "M both replicas become available on revision $rev1"
+  else
+    fail "M both replicas become available on revision $rev1 (300 s)" "$(m_show "$NODE_A")"$'\n'"$(dx "$NODE_A" 'journalctl -u fabercp --no-pager -o cat | grep -v INFO | tail -n 3 | cut -c1-600')"
+  fi
+  out="$(m_show "$NODE_A")"
+  evidence "$(sed -n '/^replicas:/,/^volumes:/p' <<<"$out")"
+  assert_eq "M faber app show lists 2 available replicas" "$(grep -cE '^  [0-9]+ +[0-9]+ +[0-9]+ +available +10\.' <<<"$out")" "2"
+  out="$(dx "$NODE_A" 'faber app ls')"
+  evidence "$out"
+  assert_has "M faber app ls shows 2/2 available" "$out" "^$M_APP +$M_PROJECT +$M_ENV +2 \(spread\) +2/2 "
+  assert_has "M $NODE_B sees the service as 2/2 too" "$(dx "$NODE_B" 'faber app ls')" "^$M_APP +$M_PROJECT +$M_ENV +2 \(spread\) +2/2 "
+
+  # User namespace, block volume and ramdisk inside the containers.
+  for n in "$NODE_A" "$NODE_B"; do
+    pid="$(dx "$n" 'pgrep -x redis-server | head -n 1')"
+    out="$(dx "$n" "cat /proc/$pid/uid_map; awk '/^Uid/ { print \$2 }' /proc/$pid/status")"
+    evidence "$out"
+    assert_has "M $n: redis runs in a user namespace that maps root to a host range of 65536" "$out" '^ +0 +[0-9]{7,} +65536$'
+    assert_has "M $n: redis runs as a host uid inside the pod range, not as root" "$(tail -n 1 <<<"$out")" '^[0-9]{7,}$'
+    cid_a="$(m_redis_cid "$n")"
+    out="$(m_cx "$n" "$cid_a" "sh -c 'touch /data/e2e-write && touch /scratch/e2e-write && grep -E \" /(data|scratch) \" /proc/mounts'")"
+    rc=$?
+    evidence "$out"
+    assert_ok "M $n: /data (block volume) and /scratch (ramdisk) are writable in the container" "$rc" "$out"
+    assert_has "M $n: /data is an ext4 loop mount" "$out" '/dev/loop[0-9]+ /data ext4 rw'
+    assert_has "M $n: /scratch is tmpfs" "$out" 'tmpfs /scratch tmpfs rw'
+  done
+
+  # DNS and the virtual IP, from other containers.
+  m_start_client "$NODE_A"
+  ca="$M_CLIENT_CID"
+  m_start_client "$NODE_B"
+  cb="$M_CLIENT_CID"
+  vip1="$(m_vip "$NODE_A")"
+  assert_has "M $NODE_A: nft has a virtual IP for port 6379 [$vip1]" "$vip1" '^10\.201\.'
+  assert_eq "M $NODE_B: nft has the same virtual IP" "$(m_vip "$NODE_B")" "$vip1"
+  for n in "$NODE_A:$ca" "$NODE_B:$cb"; do
+    out="$(m_cx "${n%%:*}" "${n##*:}" "nslookup $M_NAME" | awk '/^Name:/ { f = 1; next } f && /^Address/ { print $2; exit }')"
+    assert_eq "M ${n%%:*}: $M_NAME resolves to the virtual IP from a container" "$out" "$vip1"
+  done
+
+  ip_a="$(m_replicas "$NODE_A" | awk -v p="$pfx_a" 'index($5, p) == 1 { print $5 }')"
+  ip_b="$(m_replicas "$NODE_A" | awk -v p="$pfx_a" 'index($5, p) != 1 { print $5 }')"
+  info "replica pod IPs: $NODE_A $ip_a, $NODE_B $ip_b"
+  for n in "$NODE_A:$ca" "$NODE_B:$cb"; do
+    out="$(m_cx "${n%%:*}" "${n##*:}" "redis-cli -h $M_NAME ping")"
+    assert_eq "M ${n%%:*}: PING $M_NAME answers PONG" "$out" "PONG"
+  done
+  out="$(m_cx "$NODE_A" "$ca" "redis-cli -h $ip_a ping")"
+  assert_eq "M same node: PING the replica on $NODE_A from a container on $NODE_A" "$out" "PONG"
+  out="$(m_cx "$NODE_A" "$ca" "redis-cli -h $ip_b ping")"
+  assert_eq "M across nodes: PING the replica on $NODE_B from a container on $NODE_A" "$out" "PONG"
+  out="$(m_cx "$NODE_B" "$cb" "redis-cli -h $ip_a ping")"
+  assert_eq "M across nodes: PING the replica on $NODE_A from a container on $NODE_B" "$out" "PONG"
+  # Tell the replicas apart, then see that the virtual IP reaches both.
+  m_cx "$NODE_A" "$ca" "redis-cli -h $ip_a set who A" >/dev/null
+  m_cx "$NODE_A" "$ca" "redis-cli -h $ip_b set who B" >/dev/null
+  for n in "$NODE_A:$ca" "$NODE_B:$cb"; do
+    seen="$(m_cx "${n%%:*}" "${n##*:}" "sh -c 'for i in \$(seq 40); do redis-cli -h $M_NAME get who; done | sort -u | tr \"\\n\" \" \"'")"
+    assert_eq "M ${n%%:*}: through $M_NAME a container reaches the replica on both nodes" "$seen" "A B "
+  done
+
+  # A restart of the container keeps the data of the block volume.
+  m_cx "$NODE_A" "$ca" "redis-cli -h $ip_a set persist survived" >/dev/null
+  pid="$(dx "$NODE_A" 'pgrep -x redis-server | head -n 1')"
+  dx "$NODE_A" "kill -9 $pid" >/dev/null
+  if wait_for 90 "$NODE_A" "p=\$(pgrep -x redis-server | head -n 1); [[ -n \$p && \$p != $pid ]]"; then
+    pass "M $NODE_A: killing redis (pid $pid) makes faber start it again"
+  else
+    fail "M $NODE_A: killing redis (pid $pid) makes faber start it again (90 s)" "$(dx "$NODE_A" 'crictl ps -a | head; journalctl -u fabercp --no-pager -o cat | tail -n 3 | cut -c1-400')"
+  fi
+  wait_for 60 "$NODE_A" "crictl exec $ca redis-cli -h $ip_a ping | grep -q PONG"
+  out="$(m_cx "$NODE_A" "$ca" "redis-cli -h $ip_a get persist")"
+  assert_eq "M $NODE_A: the key written before the kill is still there (block volume survived)" "$out" "survived"
+  assert_eq "M $NODE_A: the replica kept its pod IP across the restart" "$(m_replicas "$NODE_A" | awk -v p="$pfx_a" 'index($5, p) == 1 { print $5 }')" "$ip_a"
+  m_wait_available 120 "$NODE_A" "$rev1"
+  assert_eq "M both replicas are available again after the restart" "$(m_available "$NODE_A" "$rev1")" "2"
+
+  # A redeploy with a changed env var.
+  vip1="$(m_vip "$NODE_A")"
+  m_deploy two
+  out="$M_OUT"
+  rc="$M_RC"
+  assert_ok "M redeploy with GREETING=two exits 0" "$rc" "$out"
+  assert_has "M the redeploy updated redis" "$out" '^updated: +redis$'
+  rev2="$(m_revision "$NODE_A")"
+  assert_ne "M the redeploy made a new revision (was $rev1)" "$rev2" "$rev1"
+  if m_wait_available 300 "$NODE_A" "$rev2"; then
+    pass "M both replicas become available on the new revision $rev2"
+  else
+    fail "M both replicas become available on the new revision $rev2 (300 s)" "$(m_show "$NODE_A")"$'\n'"$(dx "$NODE_A" 'journalctl -u fabercp --no-pager -o cat | grep -v INFO | tail -n 3 | cut -c1-600')"
+  fi
+  assert_has "M the new revision has GREETING=two" "$(m_show "$NODE_A")" 'GREETING=two'
+  vip2="$(m_vip "$NODE_A")"
+  assert_eq "M the virtual IP did not change on $NODE_A" "$vip2" "$vip1"
+  assert_eq "M the virtual IP did not change on $NODE_B" "$(m_vip "$NODE_B")" "$vip1"
+  out="$(m_cx "$NODE_A" "$ca" "nslookup $M_NAME" | awk '/^Name:/ { f = 1; next } f && /^Address/ { print $2; exit }')"
+  assert_eq "M $M_NAME still resolves to the same virtual IP" "$out" "$vip1"
+  wait_for 60 "$NODE_A" "crictl exec $ca redis-cli -h $M_NAME ping | grep -q PONG"
+  for n in "$NODE_A:$ca" "$NODE_B:$cb"; do
+    out="$(m_cx "${n%%:*}" "${n##*:}" "redis-cli -h $M_NAME ping")"
+    assert_eq "M ${n%%:*}: PING $M_NAME answers after the redeploy" "$out" "PONG"
+  done
+  info "persist key after the redeploy, on $NODE_A: $(m_cx "$NODE_A" "$ca" "redis-cli -h $M_NAME get persist" | tr '\n' ' ')"
+
+  for n in "$NODE_A" "$NODE_B"; do
+    dx "$n" 'for p in $(crictl pods --name e2e-client -q); do crictl stopp $p; crictl rmp $p; done' >/dev/null
+  done
+}
+
 # refusal_warnings: a node whose raft RPCs a peer answers with 403 logs a
 # warning, at most once a minute per peer. Nothing in this suite makes that
 # happen on purpose, so this only reports what the journals hold.
@@ -1991,6 +2238,7 @@ main() {
   has_phase F && phase_f
   has_phase I && phase_i
   has_phase G && phase_g
+  has_phase M && phase_m
   refusal_warnings
   [[ -n "$SANDBOX_PATH" ]] && info "pod sandboxes: $SANDBOX_PATH"
 
