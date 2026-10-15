@@ -409,7 +409,7 @@ pub fn availability(w: &WorkloadResponse) -> (usize, usize) {
     let desired = match w.spec.scale {
         Scale::Replicas { count, .. } => count as usize,
         Scale::Daemon => {
-            let mut nodes: Vec<u64> = w.replicas.iter().map(|r| r.node).collect();
+            let mut nodes: Vec<u64> = w.replicas.iter().filter_map(|r| r.node).collect();
             nodes.sort_unstable();
             nodes.dedup();
             nodes.len()
@@ -464,7 +464,7 @@ fn replicas(replicas: &[ReplicaStatus]) -> String {
     if replicas.is_empty() {
         return "replicas: -\n".to_string();
     }
-    let header = ["REPLICA", "NODE", "REVISION", "STATE", "POD IP"].map(String::from);
+    let header = ["REPLICA", "NODE", "REVISION", "STATE", "POD IP", "REASON"].map(String::from);
     let rows = replicas.iter().map(|r| {
         let state = match r.state {
             ReplicaState::Deploying => "deploying",
@@ -473,13 +473,14 @@ fn replicas(replicas: &[ReplicaStatus]) -> String {
         };
         [
             r.replica_index.to_string(),
-            r.node.to_string(),
+            r.node.map_or_else(none, |n| n.to_string()),
             r.revision.to_string(),
             state.to_string(),
             r.pod_ip.map_or_else(none, |ip| ip.to_string()),
+            r.reason.clone().unwrap_or_else(none),
         ]
     });
-    let all: Vec<[String; 5]> = std::iter::once(header).chain(rows).collect();
+    let all: Vec<[String; 6]> = std::iter::once(header).chain(rows).collect();
     format!("replicas:\n{}", table("  ", &all))
 }
 

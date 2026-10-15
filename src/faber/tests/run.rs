@@ -1395,6 +1395,8 @@ fn workload_body() -> Value {
             {"node": 2, "replica_index": 0, "revision": 7, "state": "available",
              "pod_ip": "10.200.2.5"},
             {"node": 3, "replica_index": 1, "revision": 7, "state": "unavailable"},
+            {"node": null, "replica_index": 2, "revision": 7, "state": "unavailable",
+             "reason": "insufficient_capacity"},
         ],
     })
 }
@@ -1412,9 +1414,10 @@ expose:      cluster
 nodes:       node-1, node-2
 stop_grace:  30s
 replicas:
-  REPLICA  NODE  REVISION  STATE        POD IP
-  0        2     7         available    10.200.2.5
-  1        3     7         unavailable  -
+  REPLICA  NODE  REVISION  STATE        POD IP      REASON
+  0        2     7         available    10.200.2.5  -
+  1        3     7         unavailable  -           -
+  2        -     7         unavailable  -           insufficient_capacity
 volumes:
   data:  block, 1073741824 bytes
   spare: block, 2097152 bytes
