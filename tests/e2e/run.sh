@@ -9,8 +9,9 @@
 # Environment:
 #   E2E_SKIP_BUILD=1   reuse tmp/e2e-bin/{fabercp,faber,faber-node} instead of building
 #   E2E_KEEP=1         leave the containers and the network up afterwards
-#   E2E_PHASES="..."   phases to run, default "A B H J C D E F I G", always
-#                      in that order (B needs A; H, J, C, D, E, F and I need B)
+#   E2E_PHASES="..."   phases to run, default "A B H J M C D E F I G", always
+#                      in that order (B needs A; H, J, M, C, D, E, F and I need B;
+#                      M runs before F and I, which add nodes it would place on)
 #
 # Phases:
 #   A  new mesh on node A; containerd config and the reload path unit
@@ -21,10 +22,9 @@
 #      crictl that reach each other across the nodes and nothing else; the
 #      bridge takes nothing from the Docker network, a forged source address
 #      or IPv6 (the test gives the nodes IPv6 addresses for that check)
-#   J  projects, environments and workloads through the CLI on A and B:
-#      compose, Kubernetes and spec deploys, --dry-run and --strict, files
-#      that are refused, removal, and the records after a restart of
-#      fabercp. Nothing runs a container here: the phase checks the records
+#   J  projects through the CLI on A and B, deploys to unknown projects
+#      and environments, and the records after a restart of fabercp. No
+#      workload is deployed here
 #   C  install.sh re-run changes nothing
 #   D  restart and stop of fabercp
 #   E  hardening of the service and the files
@@ -41,8 +41,7 @@
 #      PING from containers on both nodes, a killed redis comes back with
 #      its data, and a redeploy with a changed env keeps the virtual IP.
 #      E2E_CGROUPFS_WORKAROUND=1 sets runc to cgroupfs first (see
-#      e2e-findings.md). M is not in the default phases: J still tests the
-#      removed compose and k8s deploys.
+#      e2e-findings.md).
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -85,7 +84,7 @@ NODE_E="faber-e2e-e"
 NODE_F="faber-e2e-f"
 ALL_NODES=("$NODE_A" "$NODE_B" "$NODE_C" "$NODE_D" "$NODE_E" "$NODE_F")
 SRC="/root/faber-src"
-PHASES="${E2E_PHASES:-A B H J C D E F I G}"
+PHASES="${E2E_PHASES:-A B H J M C D E F I G}"
 
 WG_PORT=51820
 PEER_PORT=7401
@@ -1031,7 +1030,7 @@ EOF" >/dev/null
   remove_sandbox "$NODE_B" "$pod_b"
 }
 
-# --- phase J: projects, deploys and workloads -------------------------------
+# --- phase J: projects and the records after a restart ----------------------
 
 J_DIR="/root/e2e-j"
 
@@ -1042,26 +1041,9 @@ j_put() { docker exec -i "$1" bash -c "mkdir -p $J_DIR && cat >$J_DIR/$2"; }
 # as NODE has it.
 j_gen() { dx "$1" "faber project show shop | awk -v e=$2 '\$1 == e { print \$3 }'"; }
 
-# j_compose TAG: the compose file of this phase, with nginx:TAG for web.
-j_compose() {
-  cat <<EOF
-services:
-  web:
-    image: nginx:$1
-    ports: ["80"]
-    environment:
-      GREETING: hello
-  api:
-    image: ghcr.io/example/api:1
-    command: ["serve"]
-    deploy:
-      replicas: 2
-EOF
-}
-
 phase_j() {
-  local out rc gen gen2 n before
-  section "J: projects, deploys and workloads (records only, nothing runs)"
+  local out rc gen n before
+  section "J: projects, deploys to unknown targets and the records after a restart"
 
   # Projects.
   out="$(dx "$NODE_A" 'faber project create shop')"
@@ -1079,225 +1061,13 @@ phase_j() {
   rc=$?
   assert_fails "J $NODE_B: a second project create shop fails" "$rc" "$out"
   assert_has "J the second create answers project_exists (forwarded from the leader)" "$out" '^error: project_exists'
-
-  # A compose file, deployed on the leader.
-  j_compose 1.27 | j_put "$NODE_A" compose.yaml
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/compose.yaml --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J $NODE_A: faber deploy compose exits 0" "$rc" "$out"
-  assert_has "J deploy compose created api and web" "$out" '^created: +api, web$'
-  assert_has "J deploy compose prints the generation" "$out" '^generation: +[0-9]+$'
-  assert_has "J deploy compose notes that containers get no capabilities" "$out" '^note: .*capabilities'
-  wait_for 10 "$NODE_B" 'faber app ls --project shop | grep -q "^web "'
-  out="$(dx "$NODE_B" 'faber app ls')"
-  evidence "$out"
-  assert_has "J $NODE_B: faber app ls names web.staging.shop.faber.internal" "$out" '^web +shop +staging +1 +environment +web\.staging\.shop\.faber\.internal$'
-  assert_has "J $NODE_B: faber app ls names api.staging.shop.faber.internal with scale 2" "$out" '^api +shop +staging +2 +environment +api\.staging\.shop\.faber\.internal$'
   assert_eq "J both nodes have the same generation of staging" "$(j_gen "$NODE_B" staging)" "$(j_gen "$NODE_A" staging)"
-
-  # A changed file, deployed on the follower. B forwards the write and has
-  # applied it by the time the command returns.
-  gen="$(j_gen "$NODE_B" staging)"
-  j_compose 1.28 | j_put "$NODE_B" compose.yaml
-  out="$(dx "$NODE_B" "faber deploy compose $J_DIR/compose.yaml --project shop --env staging && faber -o json app show web --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J $NODE_B: deploy of the changed file (forwarded) exits 0" "$rc" "$out"
-  assert_has "J the changed deploy updated web" "$out" '^updated: +web$'
-  assert_has "J the changed deploy left api unchanged" "$out" '^unchanged: +api$'
-  assert_has "J $NODE_B reads the new image back at once" "$out" '"image": "nginx:1\.28"'
-  gen2="$(j_gen "$NODE_B" staging)"
-  assert_ne "J the generation of staging moved (was $gen)" "$gen2" "$gen"
-  out="$(dx "$NODE_B" "faber deploy compose $J_DIR/compose.yaml --project shop --env staging")"
-  assert_has "J the same file again changes nothing" "$out" '^unchanged: +api, web$'
-  assert_eq "J the same file again keeps the generation" "$(j_gen "$NODE_B" staging)" "$gen2"
-  gen="$gen2"
-
-  # --dry-run sends nothing.
-  j_compose 1.29 | j_put "$NODE_B" dry.yaml
-  dx "$NODE_B" "cd $J_DIR && faber deploy compose dry.yaml --project shop --env staging --dry-run >dry.json 2>dry.err" >/dev/null
-  rc=$?
-  assert_ok "J --dry-run exits 0" "$rc"
-  out="$(dx "$NODE_B" "cat $J_DIR/dry.json")"
-  assert_has "J --dry-run prints the converted workloads on stdout" "$out" '"image": "nginx:1\.29"'
-  out="$(dx "$NODE_B" "cat $J_DIR/dry.err")"
-  evidence "$out"
-  assert_has "J --dry-run lists the file it read on stderr" "$out" '^read: .*dry\.yaml$'
-  assert_eq "J --dry-run keeps the generation" "$(j_gen "$NODE_B" staging)" "$gen"
-  out="$(dx "$NODE_A" 'faber -o json app show web --project shop --env staging')"
-  assert_has "J --dry-run changed no workload" "$out" '"image": "nginx:1\.28"'
-
-  # A file that cannot be converted, and a warning under --strict.
-  j_put "$NODE_A" build.yaml <<'EOF'
-services:
-  web:
-    image: nginx:1.30
-    build: .
-EOF
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/build.yaml --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_eq "J a compose file with build: exits 1" "$rc" "1"
-  assert_has "J the error names services.web.build" "$out" '^error: .*services\.web\.build'
-  assert_has "J the error says nothing was deployed" "$out" '^error: nothing was deployed$'
-  assert_eq "J the refused file keeps the generation" "$(j_gen "$NODE_A" staging)" "$gen"
-
-  j_put "$NODE_A" strict.yaml <<'EOF'
-services:
-  web:
-    image: nginx:1.30
-    depends_on: [api]
-  api:
-    image: ghcr.io/example/api:1
-EOF
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/strict.yaml --project shop --env staging --strict")"
-  rc=$?
-  evidence "$out"
-  assert_eq "J --strict with a warning exits 1" "$rc" "1"
-  assert_has "J --strict prints the warning" "$out" '^warning: .*services\.web\.depends_on'
-  assert_has "J --strict says nothing was deployed" "$out" '^error: nothing was deployed: --strict'
-  assert_eq "J --strict keeps the generation" "$(j_gen "$NODE_A" staging)" "$gen"
-  out="$(dx "$NODE_A" 'faber -o json app show web --project shop --env staging')"
-  assert_has "J neither refused file changed web" "$out" '"image": "nginx:1\.28"'
-
-  # Capabilities: one outside the allowed list is refused, one inside it is
-  # stored. The workload edge is removed again, so staging ends as it was.
-  j_put "$NODE_A" cap-refused.yaml <<'EOF'
-services:
-  edge:
-    image: nginx:1.28
-    cap_add: [SYS_ADMIN]
-EOF
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/cap-refused.yaml --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_eq "J a compose file with cap_add: [SYS_ADMIN] exits 1" "$rc" "1"
-  assert_has "J the error says SYS_ADMIN is not allowed" "$out" '^error: .*cap_add.*`SYS_ADMIN` is not allowed'
-  assert_has "J the SYS_ADMIN file deployed nothing" "$out" '^error: nothing was deployed$'
-  assert_eq "J the SYS_ADMIN file keeps the generation" "$(j_gen "$NODE_A" staging)" "$gen"
-  out="$(dx "$NODE_A" 'faber app ls --project shop --env staging')"
-  assert_hasnt "J the SYS_ADMIN file made no workload" "$out" '^edge '
-
-  j_put "$NODE_A" cap-allowed.yaml <<'EOF'
-services:
-  edge:
-    image: nginx:1.28
-    cap_add: [NET_BIND_SERVICE]
-EOF
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/cap-allowed.yaml --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J a compose file with cap_add: [NET_BIND_SERVICE] exits 0" "$rc" "$out"
-  assert_has "J the NET_BIND_SERVICE file created edge" "$out" '^created: +edge$'
-  out="$(dx "$NODE_A" 'faber app show edge --project shop --env staging')"
-  evidence "$out"
-  assert_has "J app show edge lists the capability" "$out" 'capabilities: +NET_BIND_SERVICE'
-  out="$(dx "$NODE_A" 'faber app rm edge --project shop --env staging')"
-  assert_has "J app rm prints removed edge.staging.shop.faber.internal" "$out" '^removed edge\.staging\.shop\.faber\.internal$'
-  wait_for 10 "$NODE_B" '! faber app ls --project shop --env staging | grep -q "^edge "'
-  gen="$(j_gen "$NODE_A" staging)"
-  assert_eq "J both nodes have the same generation of staging after edge" "$(j_gen "$NODE_B" staging)" "$gen"
-
-  # --prune with every service behind a profile that is not active.
-  j_put "$NODE_A" profiles.yaml <<'EOF'
-services:
-  web:
-    image: nginx:1.30
-    profiles: [debug]
-  api:
-    image: ghcr.io/example/api:1
-    profiles: [debug]
-EOF
-  out="$(dx "$NODE_A" "faber deploy compose $J_DIR/profiles.yaml --project shop --env staging --prune")"
-  rc=$?
-  evidence "$out"
-  assert_eq "J --prune with every service behind an inactive profile exits 1" "$rc" "1"
-  assert_has "J the error names --prune and what would be removed" "$out" '^error: --prune: .*removed'
-  assert_has "J the --prune refusal deployed nothing" "$out" '^error: nothing was deployed$'
-  assert_eq "J the --prune refusal keeps the generation" "$(j_gen "$NODE_A" staging)" "$gen"
-  out="$(dx "$NODE_A" 'faber app ls --project shop --env staging')"
-  evidence "$out"
-  assert_has "J the --prune refusal left web" "$out" '^web +shop +staging '
-  assert_has "J the --prune refusal left api" "$out" '^api +shop +staging '
-
-  # A variable the file takes from the environment of faber is named, and
-  # named before the request is sent.
-  j_compose '${J_TAG}' | j_put "$NODE_B" var.yaml
-  out="$(dx "$NODE_B" "J_TAG=1.28 faber deploy compose $J_DIR/var.yaml --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J a compose file with an interpolated variable exits 0" "$rc" "$out"
-  assert_has "J the deploy names the variable it used" "$out" '^uses variable: J_TAG$'
-  assert_hasnt "J the deploy does not print the value of the variable" "$out" '^uses variable: .*1\.28'
-  assert_has "J the variable gave the image that is deployed already" "$out" '^unchanged: +api, web$'
-  assert_eq "J the variable is named before the result" \
-    "$(grep -nE '^(uses variable|generation):' <<<"$out" | cut -d: -f2 | tr '\n' ' ')" \
-    "uses variable generation "
-  assert_eq "J the unchanged deploy keeps the generation" "$(j_gen "$NODE_B" staging)" "$gen"
-
-  # A Kubernetes manifest into the other environment.
-  j_put "$NODE_A" k8s.yaml <<'EOF'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: cache
-spec:
-  replicas: 2
-  selector:
-    matchLabels: {app: cache}
-  template:
-    metadata:
-      labels: {app: cache}
-    spec:
-      containers:
-        - name: redis
-          image: redis:7
-          ports:
-            - containerPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: cache
-spec:
-  selector: {app: cache}
-  ports:
-    - port: 6379
-EOF
-  out="$(dx "$NODE_A" "faber deploy k8s $J_DIR/k8s.yaml --project shop --env production")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J faber deploy k8s exits 0" "$rc" "$out"
-  assert_has "J deploy k8s warns that the Service is skipped" "$out" '^warning: .*Service .cache. is skipped'
-  assert_has "J deploy k8s created cache" "$out" '^created: +cache$'
-  wait_for 10 "$NODE_B" 'faber app ls --env production | grep -q "^cache "'
-  out="$(dx "$NODE_B" 'faber app ls --project shop --env production')"
-  evidence "$out"
-  assert_has "J $NODE_B lists cache.production.shop.faber.internal with scale 2" "$out" '^cache +shop +production +2 +environment +cache\.production\.shop\.faber\.internal$'
-  assert_hasnt "J the environment filter leaves staging out" "$out" 'staging'
-  assert_eq "J the deploy to production left staging alone" "$(j_gen "$NODE_A" staging)" "$gen"
-
-  # The --dry-run output is what deploy spec reads.
-  dx "$NODE_A" "cd $J_DIR && faber deploy compose compose.yaml --project shop --env staging --dry-run >was.json 2>/dev/null" >/dev/null
-  dx "$NODE_B" "cd $J_DIR && faber deploy compose compose.yaml --project shop --env staging --dry-run >spec.json 2>/dev/null" >/dev/null
-  rc=$?
-  assert_ok "J --dry-run of the deployed file exits 0" "$rc"
-  out="$(dx "$NODE_B" "faber deploy spec $J_DIR/spec.json --project shop --env staging")"
-  rc=$?
-  evidence "$out"
-  assert_ok "J faber deploy spec of the saved --dry-run output exits 0" "$rc" "$out"
-  assert_has "J deploy spec finds both workloads unchanged" "$out" '^unchanged: +api, web$'
-  assert_eq "J deploy spec keeps the generation" "$(j_gen "$NODE_B" staging)" "$gen"
-  out="$(dx "$NODE_A" "faber deploy spec $J_DIR/was.json --project shop --env staging")"
-  evidence "$out"
-  assert_has "J deploy spec of the older file puts web back" "$out" '^updated: +web$'
-  out="$(dx "$NODE_B" "faber deploy spec - --project shop --env staging <$J_DIR/spec.json")"
-  assert_has "J deploy spec from stdin updates web again" "$out" '^updated: +web$'
-  wait_for 10 "$NODE_A" "faber -o json app show web --project shop --env staging | grep -q 'nginx:1.28'"
   gen="$(j_gen "$NODE_B" staging)"
 
-  # Unknown targets.
+  # Unknown targets. The spec is never deployed: the target is refused first.
+  j_put "$NODE_B" spec.json <<'EOF'
+{"web":{"containers":[{"name":"web","image":"nginx:1.27"}]}}
+EOF
   out="$(dx "$NODE_B" "faber deploy spec $J_DIR/spec.json --project nope --env staging")"
   rc=$?
   assert_eq "J deploy to an unknown project exits 1" "$rc" "1"
@@ -1310,6 +1080,7 @@ EOF
   assert_has "J deploy to an unknown environment answers not_found and says what is missing" "$out" '^error: not_found: environment "nope" of project "shop" does not exist'
   out="$(dx "$NODE_A" 'faber project ls')"
   assert_hasnt "J neither failed deploy made a project" "$out" '^nope '
+  assert_eq "J the failed deploys keep the generation" "$(j_gen "$NODE_A" staging)" "$gen"
 
   # The records survive a restart. Only B is restarted, as in phase D, so
   # that A stays the leader for the phases that follow.
@@ -1321,37 +1092,12 @@ EOF
   wait_for 30 "$NODE_A" "faber -o json cluster status | grep -q '\"leader_id\": [0-9]'"
   wait_for 30 "$n" "faber -o json cluster status | grep -q '\"leader_id\": [0-9]'"
   assert_ne "J $n: fabercp has a new MainPID after systemctl restart (was $before)" "$(main_pid "$n" fabercp)" "$before"
-  out="$(dx "$n" 'faber app ls')"
+  out="$(dx "$n" 'faber project ls')"
   evidence "$out"
-  assert_eq "J $n lists the same 3 workloads after the restart" \
-    "$(awk 'NR > 1 { print $NF }' <<<"$out" | sort | tr '\n' ' ')" \
-    "api.staging.shop.faber.internal cache.production.shop.faber.internal web.staging.shop.faber.internal "
+  assert_has "J $n still has project shop after the restart" "$out" '^shop +production, staging +0 '
   assert_eq "J $n has the same generation of staging after the restart" "$(j_gen "$n" staging)" "$gen"
-  out="$(dx "$n" 'faber -o json app show web --project shop --env staging')"
-  assert_has "J $n still has the spec of web after the restart" "$out" '"image": "nginx:1\.28"'
 
   # Removal.
-  out="$(dx "$NODE_B" 'faber project rm shop')"
-  rc=$?
-  evidence "$out"
-  assert_eq "J faber project rm of a project with workloads exits 1" "$rc" "1"
-  assert_has "J faber project rm of a project with workloads answers not_empty" "$out" '^error: not_empty'
-  out="$(dx "$NODE_B" 'faber app rm web api --project shop --env staging')"
-  rc=$?
-  evidence "$out"
-  assert_ok "J $NODE_B: faber app rm web api exits 0" "$rc" "$out"
-  assert_has "J app rm prints removed web.staging.shop.faber.internal" "$out" '^removed web\.staging\.shop\.faber\.internal$'
-  assert_has "J app rm prints removed api.staging.shop.faber.internal" "$out" '^removed api\.staging\.shop\.faber\.internal$'
-  out="$(dx "$NODE_B" 'faber app rm web --project shop --env staging')"
-  rc=$?
-  assert_eq "J faber app rm of a removed workload exits 1" "$rc" "1"
-  assert_has "J faber app rm of a removed workload answers not_found" "$out" '^error: not_found'
-  out="$(dx "$NODE_A" 'faber project rm shop')"
-  rc=$?
-  assert_eq "J faber project rm still fails while production has cache" "$rc" "1"
-  assert_has "J that failure is not_empty too" "$out" '^error: not_empty'
-  out="$(dx "$NODE_A" 'faber app rm cache --project shop --env production')"
-  assert_has "J app rm prints removed cache.production.shop.faber.internal" "$out" '^removed cache\.production\.shop\.faber\.internal$'
   out="$(dx "$NODE_A" 'faber project rm shop')"
   rc=$?
   evidence "$out"
@@ -1360,7 +1106,7 @@ EOF
   wait_for 10 "$NODE_B" '! faber project ls | grep -q "^shop "'
   out="$(dx "$NODE_B" 'faber project ls; faber app ls')"
   evidence "$out"
-  assert_hasnt "J $NODE_B has no project shop and no workload of it left" "$out" 'shop'
+  assert_hasnt "J $NODE_B has no project shop left" "$out" 'shop'
   assert_eq "J still 2 voters at the end" "$(voters "$NODE_A")" "2"
 }
 
@@ -1979,7 +1725,8 @@ EOF
 m_deploy() {
   m_spec "$1" | docker exec -i "$NODE_A" faber deploy spec - --project "$M_PROJECT" --env "$M_ENV" >"$LOG_DIR/m-deploy-$1.log" 2>&1
   M_RC=${PIPESTATUS[1]}
-  M_OUT="$(tr -d '' <"$LOG_DIR/m-deploy-$1.log")"
+  M_OUT="$(tr -d '
+' <"$LOG_DIR/m-deploy-$1.log")"
 }
 
 # m_show NODE: faber app show of the service.
@@ -2232,13 +1979,13 @@ main() {
   has_phase B && phase_b
   has_phase H && phase_h
   has_phase J && phase_j
+  has_phase M && phase_m
   has_phase C && phase_c
   has_phase D && phase_d
   has_phase E && phase_e
   has_phase F && phase_f
   has_phase I && phase_i
   has_phase G && phase_g
-  has_phase M && phase_m
   refusal_warnings
   [[ -n "$SANDBOX_PATH" ]] && info "pod sandboxes: $SANDBOX_PATH"
 
