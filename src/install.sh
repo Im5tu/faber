@@ -2300,17 +2300,15 @@ check_faber_account() {
 }
 
 # check_root_only_path PATH NAME [REASON]: PATH, as far as it exists, and every ancestor
-# must belong to root and not be writable by group or others (a sticky
-# directory such as /tmp is let through: others cannot replace root's entries
-# in it; faber-node itself has no such exception). Only checked as root; a
-# non-root dry-run cannot tell.
+# must belong to root and not be writable by group or others, sticky or not,
+# as faber-node requires. Only checked as root; a non-root dry-run cannot tell.
 check_root_only_path() {
   local dir="$1" name="$2" reason="${3:-faber-node runs as root from there}" uid mode
   [[ "$EUID" == 0 ]] || return 0
   while [[ -n "$dir" && "$dir" != / ]]; do
     if [[ -e "$dir" || -L "$dir" ]]; then
       read -r uid mode < <(stat -L -c '%u %a' "$dir")
-      if [[ "$uid" != 0 ]] || { (((8#$mode & 8#022) != 0)) && (((8#$mode & 8#1000) == 0)); }; then
+      if [[ "$uid" != 0 ]] || (((8#$mode & 8#022) != 0)); then
         die "$name: $dir must be owned by root and not group/world-writable (${reason})"
       fi
     fi

@@ -10,7 +10,13 @@ setup() {
   source "$SCRIPT"
   # The script enables nounset/pipefail; bats internals are not nounset-safe.
   set +u
-  TMP="$(mktemp -d)"
+  # As root, install.sh refuses paths under a world-writable directory even when it is
+  # sticky, so the root of the tree is not /tmp.
+  if [ "$(id -u)" = 0 ]; then
+    TMP="$(mktemp -d -p /root)"
+  else
+    TMP="$(mktemp -d)"
+  fi
   export CNI_BIN_DIR="$TMP/cni"
   export FABER_ARCH=x86_64
   export FABER_HOME="$TMP/opt/faber"
@@ -4735,6 +4741,10 @@ removed_node() {
   need_root_faber_account
   mkdir -p "$TMP/loose/sbin"
   chmod 0777 "$TMP/loose"
+  FABER_NODE_INSTALL_DIR="$TMP/loose/sbin" run check_node_paths
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$TMP/loose must be owned by root and not group/world-writable"* ]]
+  chmod 1777 "$TMP/loose"
   FABER_NODE_INSTALL_DIR="$TMP/loose/sbin" run check_node_paths
   [ "$status" -eq 1 ]
   [[ "$output" == *"$TMP/loose must be owned by root and not group/world-writable"* ]]
