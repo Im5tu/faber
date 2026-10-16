@@ -2219,6 +2219,18 @@ async fn a_node_without_a_leader_keeps_its_identity_and_the_cluster_recovers() {
         n3.mesh().lease_secs == SHORT_LEASE_SECS
     })
     .await;
+    // Every lease runs while the first node back leads and the second is
+    // still opening its store, so stop with all three just renewed: each
+    // lease then has most of its period left for that gap.
+    eventually("every lease was just renewed", || {
+        let mesh = n3.mesh();
+        mesh.nodes.len() == 3
+            && mesh
+                .nodes
+                .values()
+                .all(|r| mesh.clock - r.lease_renewed_at <= SHORT_LEASE_SECS / 8)
+    })
+    .await;
     let (port1, port2) = (n1.peer_addr().port(), n2.peer_addr().port());
     n1.stop().await;
     n2.stop().await;
@@ -2239,8 +2251,12 @@ async fn a_node_without_a_leader_keeps_its_identity_and_the_cluster_recovers() {
         n3.cmdlines()
     );
 
-    n1.launch(Bootstrap::Existing, Some(port1)).await;
-    n2.launch(Bootstrap::Existing, Some(port2)).await;
+    // Together, so that the node that opens first leads for as short a
+    // time as possible before the other renews.
+    tokio::join!(
+        n1.launch(Bootstrap::Existing, Some(port1)),
+        n2.launch(Bootstrap::Existing, Some(port2))
+    );
     eventually("a leader again", || {
         n3.handle()
             .raft()
@@ -2255,10 +2271,44 @@ async fn a_node_without_a_leader_keeps_its_identity_and_the_cluster_recovers() {
         n3.mesh().clock >= clock + SHORT_LEASE_SECS + SHORT_LEASE_SECS / 2
     })
     .await;
-    for node in [&n1, &n2, &n3] {
-        assert_eq!(node.sorted_voters(), [1, 2, 3]);
-        assert_eq!(node.mesh().nodes.len(), 3);
-        assert_eq!(node.bootstrap_error(), None);
+    // Every node has applied what the leader has written, so a view that
+    // differs is a removal and not a node that is behind.
+    let written = [&n1, &n2, &n3]
+        .iter()
+        .filter_map(|n| n.handle().raft().metrics().borrow().last_log_index)
+        .max()
+        .unwrap();
+    for (name, node) in [("n1", &n1), ("n2", &n2), ("n3", &n3)] {
+        eventually(&format!("{name} applied index {written}"), || {
+            let m = node.handle().raft().metrics().borrow().clone();
+            m.last_applied.is_some_and(|id| id.index >= written)
+        })
+        .await;
+    }
+    for (name, node) in [("n1", &n1), ("n2", &n2), ("n3", &n3)] {
+        let m = node.handle().raft().metrics().borrow().clone();
+        let mesh = node.mesh();
+        let renewed: Vec<_> = mesh
+            .nodes
+            .values()
+            .map(|r| (r.node_id, r.lease_renewed_at))
+            .collect();
+        assert_eq!(
+            node.sorted_voters(),
+            [1, 2, 3],
+            "{name}: leader {:?}, last applied {:?}, mesh nodes {renewed:?}, clock {}",
+            m.current_leader,
+            m.last_applied,
+            mesh.clock
+        );
+        assert_eq!(
+            mesh.nodes.len(),
+            3,
+            "{name}: leader {:?}, mesh nodes {renewed:?}, clock {}",
+            m.current_leader,
+            mesh.clock
+        );
+        assert_eq!(node.bootstrap_error(), None, "{name}");
     }
 
     n3.stop().await;
