@@ -1890,8 +1890,10 @@ m_roll_old_down_samples() {
     END { flush(); print bad + 0 }' "$1"
 }
 
-# m_roll_both_revisions_samples FILE OLD NEW: the number of samples that list
-# a row of revision OLD and a row of revision NEW.
+# m_roll_both_revisions_samples FILE OLD NEW: the number of samples whose table
+# has a row of revision OLD and a row of revision NEW, on the same index or on
+# different ones (a roll replaces one index at a time, so one index can be on
+# NEW while another is still on OLD).
 m_roll_both_revisions_samples() {
   awk -v o="$2" -v n="$3" '
     function flush() { if (cur != "" && hasold && hasnew) both++; hasold = 0; hasnew = 0 }
@@ -2047,7 +2049,7 @@ phase_m() {
   fi
   assert_eq "M rolling: the two replicas were never both on the old revision and down" "$(m_roll_old_down_samples "$LOG_DIR/m-roll-samples.log" "$rev2")" "0"
   assert_ne "M rolling: the samples saw replicas on the old revision" "$(awk -v r="$rev1" '$3 == r' "$LOG_DIR/m-roll-samples.log" | wc -l)" "0"
-  assert_ne "M rolling: app show listed the old and the new revision in one sample" "$(m_roll_both_revisions_samples "$LOG_DIR/m-roll-samples.log" "$rev1" "$rev2")" "0"
+  assert_ne "M rolling: one app show table listed both the old and the new revision" "$(m_roll_both_revisions_samples "$LOG_DIR/m-roll-samples.log" "$rev1" "$rev2")" "0"
   assert_has "M the new revision has GREETING=two" "$(m_show "$NODE_A")" 'GREETING=two'
   vip2="$(m_vip "$NODE_A")"
   assert_eq "M the virtual IP did not change on $NODE_A" "$vip2" "$vip1"
