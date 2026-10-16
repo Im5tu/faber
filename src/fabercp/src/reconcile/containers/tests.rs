@@ -839,3 +839,40 @@ fn without_a_mesh_the_roll_gate_is_skipped() {
     assert!(view.placement.as_ref().unwrap().mesh.is_none());
     assert!(step.plan(&view).desired.waiting.is_empty());
 }
+
+#[tokio::test]
+async fn a_dead_old_pod_that_will_not_restart_is_removed_from_a_closed_slot() {
+    // (policy, exit code, removed at once)
+    let table = [
+        (RestartPolicy::Never, 0, true),
+        (RestartPolicy::Never, 1, true),
+        (RestartPolicy::OnFailure, 0, true),
+        (RestartPolicy::OnFailure, 1, false),
+        (RestartPolicy::Always, 0, false),
+    ];
+    for (policy, code, removed) in table {
+        let (c, node, state) = (
+            Cluster::new().restarting(policy),
+            FakeNode::default(),
+            Arc::<RunnerState>::default(),
+        );
+        let (step, _sup) = serving_old_replica(&c, &node, &state).await;
+        node.exit(&web(7, 1), "app", code);
+        let stuck = rolling(
+            &c,
+            9,
+            &[Some(2), Some(NODE)],
+            100,
+            Some((100, vec![report(9, 0, ReplicaState::Deploying)])),
+        );
+        let planned = step.plan(&stuck);
+        assert_eq!(planned.desired.waiting, HashSet::from([web(9, 1)]));
+        step.apply(&planned.desired).await.unwrap();
+        let want = removed.then_some(StopReason::Replaced);
+        assert_eq!(
+            state.entry(&web(7, 1)).unwrap().stop,
+            want,
+            "{policy:?} exit {code}"
+        );
+    }
+}

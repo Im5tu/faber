@@ -38,8 +38,8 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use faber_api_types::workload::{DNS_SUFFIX, VolumeSource, WorkloadSpec};
-use faber_node_protocol::{DnsConfig, ReplicaInfo, ReplicaRef, VolumeKind};
+use faber_api_types::workload::{DNS_SUFFIX, RestartPolicy, VolumeSource, WorkloadSpec};
+use faber_node_protocol::{ContainerState, DnsConfig, ReplicaInfo, ReplicaRef, VolumeKind};
 use ipnet::Ipv4Net;
 
 use super::step::{Planned, ReconcileStep, ReplicatedStateView, StepFuture};
@@ -161,11 +161,12 @@ impl<C: NodeClient> ContainersStep<C> {
                 (true, true) if !waiting_slots.contains(&(workload.clone(), key.replica_index)) => {
                     self.state.request_stop(key, StopReason::Replaced);
                 }
-                // Not its turn. One that never started has nothing to keep.
+                // Not its turn. One that never started has nothing to keep,
+                // and nor has one that is dead and will stay dead.
                 (true, true) => {
                     let running =
                         pods.contains_key(key) || self.state.entry(key).is_some_and(|e| e.launched);
-                    if !running {
+                    if !running || self.is_dead_for_good(key, pods.get(key).copied()) {
                         self.state.request_stop(key, StopReason::Replaced);
                     }
                 }
@@ -229,6 +230,32 @@ impl<C: NodeClient> ContainersStep<C> {
         } else {
             anyhow::bail!("{}", errors.join("; "))
         }
+    }
+
+    /// Whether the old pod `key` has nothing left to serve: every container
+    /// has exited and its own restart policy (not the newer revision's) will
+    /// not bring it back. A pod the runner does not know has no policy to
+    /// judge by and is kept.
+    fn is_dead_for_good(&self, key: &ReplicaRef, pod: Option<&ReplicaInfo>) -> bool {
+        let Some(pod) = pod.filter(|p| !p.containers.is_empty()) else {
+            return false;
+        };
+        let Some(restart) = self
+            .state
+            .entry(key)
+            .and_then(|e| e.desired)
+            .map(|d| d.restart)
+        else {
+            return false;
+        };
+        pod.containers.iter().all(|c| {
+            c.state == ContainerState::Exited
+                && match restart {
+                    RestartPolicy::Always => false,
+                    RestartPolicy::OnFailure => c.exit_code == Some(0),
+                    RestartPolicy::Never => true,
+                }
+        })
     }
 
     /// The other replicas in `d`'s slot, known to the runner or listed by
