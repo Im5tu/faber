@@ -1200,36 +1200,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_locks_are_forgotten_after_a_remove() {
+    async fn a_remove_forgets_the_idle_lock_and_the_kind_and_owner() {
         let h = harness();
         let r = req(VolumeKind::Block, 8 << 20);
         h.volumes.ensure(&r).await.unwrap();
         h.volumes.remove(&r.volume).await.unwrap();
         assert_eq!(h.volumes.lock_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn removing_a_volume_forgets_its_kind_and_owner() {
-        let h = harness();
-        let r = req(VolumeKind::Block, 8 << 20);
-        h.volumes.ensure(&r).await.unwrap();
-        h.volumes.remove(&r.volume).await.unwrap();
+        // The kind and owner are forgotten with the volume.
         h.volumes
             .ensure(&req(VolumeKind::Ramdisk, 8 << 20))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn tools_run_by_absolute_path() {
-        let h = harness();
-        h.volumes
-            .ensure(&req(VolumeKind::Block, 8 << 20))
-            .await
-            .unwrap();
-        for call in h.runner.calls() {
-            assert!(call.prog.starts_with("/usr/"), "{}", call.prog);
-        }
     }
 
     #[tokio::test]

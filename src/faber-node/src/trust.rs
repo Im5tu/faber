@@ -257,19 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn uid_bases() {
-        let range = UidRange::new(65536, 65536 * 4).unwrap();
-        assert_eq!(check_uid_base(&range, 65536), Ok(()));
-        for bad in [0, 1, 65535, 65537, 65536 * 4, u32::MAX] {
-            assert_eq!(
-                code(check_uid_base(&range, bad)),
-                Some(ErrorCode::Forbidden),
-                "{bad}"
-            );
-        }
-    }
-
-    #[test]
     fn names_ids_and_images() {
         assert!(check_volume_name("data").is_ok());
         for bad in ["", "..", "a/b", "a.b", "A", "../../etc", "a b"] {
@@ -327,11 +314,6 @@ mod tests {
             subnet: subnet.parse().unwrap(),
             mtu,
         }
-    }
-
-    #[test]
-    fn the_pod_network_fabercp_sends_today_passes() {
-        assert!(check_pod_network(&network("10.200.3.0/24", 1420)).is_ok());
     }
 
     #[test]

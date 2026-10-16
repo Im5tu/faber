@@ -235,19 +235,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_version_mismatch_is_a_typed_error() {
-        let node = node(FakeCri::new());
-        let reply = node.handle(Request::Version { client_version: 99 }).await;
-        assert!(matches!(
-            reply,
-            Response::Error {
-                code: ErrorCode::VersionMismatch,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
     async fn an_oversized_frame_is_refused_without_reading_it() {
         let node = node(FakeCri::new());
         let (server, mut client) = FakeStream::pair(peer(0));

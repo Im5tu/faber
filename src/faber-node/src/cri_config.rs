@@ -393,6 +393,14 @@ mod tests {
         r.workload = "web-1".into();
         // A dash inside a name is not a level of the hierarchy.
         assert_eq!(cgroup_parent(&r), "faber-my_shop-prod-web_1.slice");
+        // Names that differ only in where the dashes sit do not share a slice.
+        let mut a = replica();
+        let mut b = replica();
+        a.project = "a-b".into();
+        a.env = "c".into();
+        b.project = "a".into();
+        b.env = "b-c".into();
+        assert_ne!(cgroup_parent(&a), cgroup_parent(&b));
     }
 
     #[test]
@@ -421,17 +429,6 @@ mod tests {
                 "{bad:?} {slice}"
             );
         }
-    }
-
-    #[test]
-    fn different_workloads_get_different_slices() {
-        let mut a = replica();
-        let mut b = replica();
-        a.project = "a-b".into();
-        a.env = "c".into();
-        b.project = "a".into();
-        b.env = "b-c".into();
-        assert_ne!(cgroup_parent(&a), cgroup_parent(&b));
     }
 
     fn assert_userns(opts: &NamespaceOption, base: u32) {
