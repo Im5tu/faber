@@ -58,7 +58,39 @@ pub struct ImagePuller<C, A = Anonymous> {
     auth: A,
     /// One lock per image reference being ensured, so concurrent callers for
     /// the same reference share a single pull.
-    in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    in_flight: InFlightMap,
+}
+
+type InFlightMap = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A caller's hold on the lock-map entry for one image. Dropping it, also
+/// when the `ensure` future is cancelled, removes the entry once nobody else
+/// holds or waits on it.
+struct InFlight<'a> {
+    map: &'a InFlightMap,
+    image: &'a str,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> InFlight<'a> {
+    fn enter(map: &'a InFlightMap, image: &'a str) -> Self {
+        let lock = {
+            let mut entries = map.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(entries.entry(image.to_owned()).or_default())
+        };
+        Self { map, image, lock }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // Callers clone the Arc under the map lock, so a count of 2 (map and
+        // ours) means no one else holds or waits on the entry.
+        let mut entries = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&self.lock) == 2 {
+            entries.remove(self.image);
+        }
+    }
 }
 
 impl<C: CriClient> ImagePuller<C> {
@@ -82,21 +114,10 @@ impl<C: CriClient, A: RegistryAuth> ImagePuller<C, A> {
     /// Concurrent calls for the same reference are serialised, so the image
     /// is pulled once and the others find it present.
     pub async fn ensure(&self, image: &str) -> Result<String, ImageError> {
-        let lock = {
-            let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(map.entry(image.to_owned()).or_default())
-        };
-        let result = {
-            let _guard = lock.lock().await;
-            self.ensure_locked(image).await
-        };
-        // Drop the map entry once nobody else holds or waits on it. Waiters
-        // clone the Arc under the map lock, so a count of 2 (map + ours) is exact.
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        if Arc::strong_count(&lock) == 2 {
-            map.remove(image);
-        }
-        result
+        // Declared before the guard so the guard is released first.
+        let entry = InFlight::enter(&self.in_flight, image);
+        let _guard = entry.lock.lock().await;
+        self.ensure_locked(image).await
     }
 
     async fn ensure_locked(&self, image: &str) -> Result<String, ImageError> {
@@ -139,7 +160,10 @@ mod tests {
                 Ok(Some(RegistryCredentials {
                     username: "bot".to_owned(),
                     server_address: image.split('/').next().unwrap_or_default().to_owned(),
-                    ..Default::default()
+                    password: String::new(),
+                    auth: String::new(),
+                    identity_token: String::new(),
+                    registry_token: String::new(),
                 }))
             })
         }
@@ -154,6 +178,39 @@ mod tests {
         ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>> {
             Box::pin(async { Err(AuthError("vault sealed".to_owned())) })
         }
+    }
+
+    /// Never answers on the first call, so a pull stalls; answers after.
+    struct StallsOnce(std::sync::atomic::AtomicBool);
+
+    impl RegistryAuth for StallsOnce {
+        fn auth_for<'a>(
+            &'a self,
+            _image: &'a str,
+        ) -> BoxFuture<'a, Result<Option<RegistryCredentials>, AuthError>> {
+            let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if first {
+                    std::future::pending::<()>().await;
+                }
+                Ok(None)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_ensure_leaves_no_entry_and_a_later_pull_works() {
+        let cri = FakeCri::new();
+        let puller = ImagePuller::with_auth(cri.clone(), StallsOnce(Default::default()));
+        tokio::select! {
+            biased;
+            _ = puller.ensure("nginx:1") => panic!("the stalled pull finished"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(puller.in_flight.lock().unwrap().is_empty());
+        let id = puller.ensure("nginx:1").await.unwrap();
+        assert!(id.starts_with("sha256:"));
+        assert!(puller.in_flight.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
