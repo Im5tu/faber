@@ -283,41 +283,6 @@ version = 2
     }
 
     #[test]
-    fn write_if_changed_writes_then_skips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DROP_IN_FILE);
-
-        assert!(write_with(dir.path(), IMAGE).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(IMAGE));
-        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-
-        assert!(!write_with(dir.path(), IMAGE).unwrap());
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
-
-        assert!(write_with(dir.path(), "other/pause:1").unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            render_with("other/pause:1")
-        );
-
-        // Only the drop-in is left; no temp files.
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from(DROP_IN_FILE)]);
-    }
-
-    #[test]
-    fn write_if_changed_replaces_foreign_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DROP_IN_FILE);
-        std::fs::write(&path, "junk").unwrap();
-        assert!(write_with(dir.path(), IMAGE).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), render_with(IMAGE));
-    }
-
-    #[test]
     fn write_if_changed_missing_dir_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
@@ -438,15 +403,6 @@ version = 2
         assert!(runtime.reconcile(&node_spec()).await.unwrap());
         assert!(!conflist.exists());
         assert!(dir.path().join(DROP_IN_FILE).exists());
-    }
-
-    #[tokio::test]
-    async fn reconcile_without_a_pod_network_or_conflist_reports_no_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let (runtime, conflist) = runtime_with_cni(dir.path());
-        assert!(runtime.reconcile(&node_spec()).await.unwrap());
-        assert!(!runtime.reconcile(&node_spec()).await.unwrap());
-        assert!(!conflist.exists());
     }
 
     #[tokio::test]

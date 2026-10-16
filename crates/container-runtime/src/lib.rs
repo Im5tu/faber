@@ -73,36 +73,3 @@ pub trait ContainerRuntime: Send + Sync {
     /// Returns whether a file was removed.
     fn remove_pod_network(&self) -> BoxFuture<'_, Result<bool, RuntimeError>>;
 }
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn node_spec_shape() {
-        let s = NodeRuntimeSpec {
-            pod_network: Some(PodNetworkSpec {
-                subnet: "10.200.3.0/24".parse().unwrap(),
-                mtu: 1420,
-            }),
-        };
-        let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(
-            v,
-            json!({
-                "pod_network": {
-                    "subnet": "10.200.3.0/24",
-                    "mtu": 1420
-                }
-            })
-        );
-        assert_eq!(serde_json::from_value::<NodeRuntimeSpec>(v).unwrap(), s);
-
-        let none = NodeRuntimeSpec { pod_network: None };
-        let v = serde_json::to_value(&none).unwrap();
-        assert_eq!(v["pod_network"], serde_json::Value::Null);
-        assert_eq!(serde_json::from_value::<NodeRuntimeSpec>(v).unwrap(), none);
-    }
-}

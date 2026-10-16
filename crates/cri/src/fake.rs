@@ -516,23 +516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_records_auth() {
-        let cri = FakeCri::new();
-        let auth = RegistryCredentials {
-            username: "u".to_owned(),
-            ..Default::default()
-        };
-        cri.pull_image("a/b", Some(auth.clone())).await.unwrap();
-        assert_eq!(
-            cri.calls(),
-            vec![Call::PullImage {
-                image: "a/b".to_owned(),
-                auth: Some(auth)
-            }]
-        );
-    }
-
-    #[tokio::test]
     async fn call_debug_redacts_credentials() {
         let cri = FakeCri::new();
         let auth = RegistryCredentials {

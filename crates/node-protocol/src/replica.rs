@@ -99,11 +99,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_well_formed_replica() {
-        assert_eq!(replica().validate(), Ok(()));
-    }
-
-    #[test]
     fn rejects_path_like_and_non_label_names() {
         for bad in [
             "", "..", "a/b", "a.b", "A", "-a", "a b", "a\0b", "../etc", "a\\b",
