@@ -6,13 +6,17 @@ use std::net::Ipv4Addr;
 use faber_api_types::name::validate_dns_label;
 use faber_api_types::workload::DNS_SUFFIX;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::A;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::rdata::{A, SOA};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use super::{LookupFailed, ServiceIps};
 
 /// Seconds a client may cache a service address.
 const ANSWER_TTL: u32 = 30;
+
+/// Seconds a resolver may cache a negative answer (RFC 2308). Short, because
+/// services come and go.
+const NEGATIVE_TTL: u32 = 5;
 
 /// Labels of a service name before the zone: `<svc>.<env>.<project>`.
 const SERVICE_PREFIX_LABELS: usize = 3;
@@ -44,6 +48,10 @@ pub fn answer(packet: &[u8], ips: &dyn ServiceIps) -> Outcome {
     };
     if request.metadata.message_type == MessageType::Response {
         return Outcome::Drop;
+    }
+    // RFC 6891 section 6.1.3: only EDNS version 0 is implemented.
+    if request.edns.as_ref().is_some_and(|edns| edns.version() > 0) {
+        return reply(&request, ResponseCode::BADVERS, None);
     }
     if request.metadata.op_code != OpCode::Query {
         return reply(&request, ResponseCode::NotImp, None);
@@ -156,6 +164,24 @@ fn a_record(query: &Query, ip: Ipv4Addr) -> Record {
     Record::from_rdata(query.name().clone(), ANSWER_TTL, RData::A(A(ip)))
 }
 
+/// The SOA of the zone, sent with negative answers so resolvers can cache
+/// them (RFC 2308). Its TTL and minimum are [`NEGATIVE_TTL`]; the other
+/// fields are fixed, as the zone is not transferred.
+fn zone_soa() -> Record {
+    let zone = Name::from_ascii(format!("{DNS_SUFFIX}.")).unwrap_or_else(|_| Name::root());
+    let child = |label: &str| zone.prepend_label(label).unwrap_or_else(|_| zone.clone());
+    let soa = SOA::new(
+        child("ns"),
+        child("hostmaster"),
+        1,
+        3600,
+        600,
+        86400,
+        NEGATIVE_TTL,
+    );
+    Record::from_rdata(zone.clone(), NEGATIVE_TTL, RData::SOA(soa))
+}
+
 fn response_to(request: &Message, code: ResponseCode) -> Message {
     let mut message = Message::error_msg(request.metadata.id, request.metadata.op_code, code);
     message.metadata.recursion_desired = request.metadata.recursion_desired;
@@ -170,6 +196,9 @@ fn reply(request: &Message, code: ResponseCode, answer: Option<Record>) -> Outco
     let mut message = response_to(request, code);
     message.metadata.authoritative = true;
     message.queries.clone_from(&request.queries);
+    if code == ResponseCode::NXDomain || (code == ResponseCode::NoError && answer.is_none()) {
+        message.authorities.push(zone_soa());
+    }
     message.answers.extend(answer);
     message.to_vec().map_or(Outcome::Drop, Outcome::Reply)
 }
@@ -311,6 +340,88 @@ mod tests {
             &ips,
         ));
         assert_eq!(m.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    fn soa_of(m: &Message) -> &hickory_proto::rr::rdata::SOA {
+        let [soa] = m.authorities.as_slice() else {
+            panic!("expected one authority record, got {:?}", m.authorities);
+        };
+        assert_eq!(soa.name, Name::from_ascii("faber.local.").unwrap());
+        assert_eq!(soa.ttl, NEGATIVE_TTL);
+        match &soa.data {
+            RData::SOA(soa) => soa,
+            other => panic!("expected an SOA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_answers_carry_the_zone_soa() {
+        for (name, kind, code) in [
+            (
+                "api.prod.shop.faber.local.",
+                RecordType::A,
+                ResponseCode::NXDomain,
+            ),
+            ("faber.local.", RecordType::A, ResponseCode::NXDomain),
+            (
+                "web.prod.shop.faber.local.",
+                RecordType::AAAA,
+                ResponseCode::NoError,
+            ),
+        ] {
+            let m = reply_of(answer(&query_packet(name, kind), &ips()));
+            assert_eq!(m.metadata.response_code, code, "{name}");
+            assert!(m.answers.is_empty());
+            assert_eq!(soa_of(&m).minimum, NEGATIVE_TTL, "{name}");
+        }
+    }
+
+    #[test]
+    fn positive_and_failed_answers_carry_no_soa() {
+        let m = reply_of(answer(
+            &query_packet("web.prod.shop.faber.local.", RecordType::A),
+            &ips(),
+        ));
+        assert!(m.authorities.is_empty());
+        let failing = ips();
+        failing.set_failing(true);
+        let m = reply_of(answer(
+            &query_packet("web.prod.shop.faber.local.", RecordType::A),
+            &failing,
+        ));
+        assert!(m.authorities.is_empty());
+    }
+
+    fn edns_query(version: u8, name: &str) -> Vec<u8> {
+        let mut m = Message::from_vec(&query_packet(name, RecordType::A)).unwrap();
+        let mut e = Edns::new();
+        e.set_version(version);
+        m.set_edns(e);
+        m.to_vec().unwrap()
+    }
+
+    #[test]
+    fn edns_version_above_zero_gets_badvers_with_opt() {
+        // Zone names and forwarded names alike: the version is checked first.
+        for name in ["web.prod.shop.faber.local.", "example.com."] {
+            let m = reply_of(answer(&edns_query(1, name), &ips()));
+            let edns = m.edns.as_ref().expect("OPT record");
+            assert_eq!(edns.version(), 0, "{name}");
+            // BADVERS is 16: the low four bits are 0 and the rest is in the OPT.
+            assert_eq!(edns.rcode_high(), 1, "{name}");
+            assert_eq!(m.metadata.response_code.low(), 0, "{name}");
+            assert!(m.answers.is_empty());
+            assert_eq!(m.queries.len(), 1);
+            assert_eq!(m.metadata.id, 7);
+        }
+    }
+
+    #[test]
+    fn edns_version_zero_is_answered_normally() {
+        let m = reply_of(answer(&edns_query(0, "web.prod.shop.faber.local."), &ips()));
+        assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(m.answers.len(), 1);
+        assert_eq!(m.edns.as_ref().map(Edns::rcode_high), Some(0));
     }
 
     fn big_response(query: &[u8]) -> Vec<u8> {
