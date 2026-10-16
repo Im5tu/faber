@@ -1374,8 +1374,9 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
     flag="${flag%% *}"
     OS_RELEASE_FILE="$FIXTURES/os-release.ubuntu" PATH="$TMP/bin:$PATH" \
       run bash "$SCRIPT" --dry-run "$flag" "$value"
+    echo "case: $flag" >&3
     [ "$status" -eq 1 ]
-    [[ "$output" == *"$flag"* ]]
+    [[ "$output" == *"$flag only applies to a new mesh"* ]]
     [[ "$output" != *"apt-get"* ]]
   done
 }
@@ -2898,6 +2899,7 @@ write_identity() {
     "255.255.255.0/24 0.0.0.0/8"; do
     # shellcheck disable=SC2086
     run cidrs_overlap $pair
+    echo "case: $pair" >&3
     [ "$status" -eq 1 ]
   done
 }
@@ -2965,6 +2967,7 @@ write_identity() {
   local flag
   for flag in --container-cidr --service-cidr; do
     install_run --dry-run "$flag" 10.99.128.0/17
+    echo "case: $flag" >&3
     [ "$status" -eq 1 ]
     [[ "$output" == *"overlaps the mesh CIDR"* ]]
     [[ "$output" != *"apt-get"* ]]
@@ -4121,6 +4124,7 @@ removed_node() {
     value="${flag#* }"
     flag="${flag%% *}"
     run bash "$SCRIPT" --dry-run --join "$TOKEN" "$flag" "$value"
+    echo "case: $flag" >&3
     [ "$status" -eq 2 ]
     [[ "$output" == *"--join and $flag cannot be combined"* ]]
     [[ "$output" != *"$TOKEN"* ]]

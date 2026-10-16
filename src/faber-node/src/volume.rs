@@ -982,6 +982,10 @@ mod tests {
 
     fn lines(h: &Harness) -> Vec<String> {
         let root = h.root.to_string_lossy().into_owned();
+        // Every tool the volume code runs is named by absolute path.
+        for call in h.runner.calls() {
+            assert!(call.prog.starts_with("/usr/"), "{}", call.prog);
+        }
         h.runner
             .cmdlines()
             .into_iter()
