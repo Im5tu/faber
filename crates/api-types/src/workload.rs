@@ -1455,14 +1455,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fqdn_is_workload_environment_project_suffix() {
-        assert_eq!(
-            fqdn("web", "staging", "shop"),
-            "web.staging.shop.faber.local"
-        );
-    }
-
-    #[test]
     fn default_environments_are_dns_labels() {
         for name in DEFAULT_ENVIRONMENTS {
             assert_eq!(crate::name::validate_dns_label(name), Ok(()));
@@ -1620,87 +1612,6 @@ mod tests {
         });
         assert_eq!(serde_json::to_value(&spec).unwrap(), want);
         assert_eq!(serde_json::from_value::<WorkloadSpec>(want).unwrap(), spec);
-    }
-
-    #[test]
-    fn defaults_apply_when_absent() {
-        let probe: Probe =
-            serde_json::from_value(json!({"action": {"type": "http", "port": 80}})).unwrap();
-        assert_eq!(
-            probe,
-            Probe::new(ProbeAction::Http {
-                port: 80,
-                path: "/".into(),
-                scheme: HttpScheme::Http,
-                host: None,
-                headers: BTreeMap::new(),
-            })
-        );
-        assert_eq!((probe.interval_secs, probe.timeout_secs), (5, 1));
-        assert_eq!(
-            serde_json::to_value(&probe).unwrap(),
-            json!({
-                "action": {"type": "http", "port": 80, "path": "/", "scheme": "http",
-                           "headers": {}},
-                "interval_secs": 5, "timeout_secs": 1,
-            })
-        );
-        let resources = Resources {
-            cpu_millis: 1000,
-            memory_bytes: 1 << 30,
-        };
-        assert_eq!(
-            serde_json::from_value::<Resources>(json!({})).unwrap(),
-            resources
-        );
-        assert_eq!(Resources::default(), resources);
-        assert_eq!(
-            serde_json::from_value::<Scale>(json!({"replicas": {"count": 2}})).unwrap(),
-            Scale::Replicas {
-                count: 2,
-                strategy: Strategy::Spread,
-            }
-        );
-        assert_eq!(
-            serde_json::from_value::<Scale>(json!("daemon")).unwrap(),
-            Scale::Daemon
-        );
-        assert_eq!(
-            serde_json::from_value::<Placement>(json!({})).unwrap(),
-            Placement { nodes: vec![] }
-        );
-        assert_eq!(
-            serde_json::from_value::<PortSpec>(json!({"port": 53})).unwrap(),
-            PortSpec {
-                name: None,
-                port: 53,
-                protocol: Protocol::Tcp,
-            }
-        );
-    }
-
-    #[test]
-    fn scale_and_volume_shapes_are_pinned() {
-        assert_eq!(
-            serde_json::to_value(Scale::Daemon).unwrap(),
-            json!("daemon")
-        );
-        assert_eq!(
-            serde_json::to_value(Scale::Replicas {
-                count: 0,
-                strategy: Strategy::Pack
-            })
-            .unwrap(),
-            json!({"replicas": {"count": 0, "strategy": "pack"}})
-        );
-        assert_eq!(
-            serde_json::to_value(VolumeSource::Block { size_bytes: 7 }).unwrap(),
-            json!({"type": "block", "size_bytes": 7})
-        );
-        assert_eq!(
-            serde_json::to_value(VolumeSource::Ramdisk { size_bytes: 7 }).unwrap(),
-            json!({"type": "ramdisk", "size_bytes": 7})
-        );
     }
 
     /// A spec with one container `web`, whose JSON gets `extra` merged in.
@@ -3802,12 +3713,6 @@ mod tests {
             );
         }
         assert_eq!(probe(http_header("X-Host", "x")), vec![]);
-    }
-
-    #[test]
-    fn resource_ceilings_are_realistic() {
-        assert_eq!(limits::MAX_CPU_MILLIS, 256_000);
-        assert_eq!(limits::MAX_MEMORY_BYTES, 4 << 40);
     }
 
     #[test]

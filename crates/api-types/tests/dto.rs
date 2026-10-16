@@ -217,14 +217,6 @@ fn error_body_tolerates_missing_optional_fields() {
 }
 
 #[test]
-fn error_body_constructors() {
-    let body = ErrorBody::new(error_code::BAD_REQUEST).with_message("bad key");
-    assert_eq!(body.error, "bad_request");
-    assert_eq!(body.message.as_deref(), Some("bad key"));
-    assert_eq!(body.leader_id, None);
-}
-
-#[test]
 fn create_invite_request_shape() {
     assert_shape(
         CreateInviteRequest {

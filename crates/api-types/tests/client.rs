@@ -182,18 +182,47 @@ async fn unavailable_health_is_an_api_error() {
     );
 }
 
+/// A proxy or a limit layer may answer with plain text; the client keeps the
+/// status and carries the text as the message, whichever call it was.
 #[tokio::test]
-async fn non_json_error_body_still_yields_api_error() {
+async fn non_json_error_bodies_still_yield_api_errors() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/health"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
+    for (verb, route, status, text) in [
+        ("GET", "/api/v1/health", 500, "boom"),
+        ("GET", "/api/v1/projects", 500, "boom"),
+        ("POST", DEPLOY_PATH, 413, "length limit exceeded"),
+        ("DELETE", WORKLOAD_PATH, 502, "bad gateway"),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).set_body_string(text))
+            .mount(&server)
+            .await;
+    }
+    let c = client(&server);
 
-    let err = client(&server).health().await.unwrap_err();
-    let body = assert_api_error(err, 500, error_code::INTERNAL);
-    assert_eq!(body.message.as_deref(), Some("boom"));
+    let errors = [
+        (c.health().await.unwrap_err(), 500, "boom"),
+        (c.project_list().await.unwrap_err(), 500, "boom"),
+        (
+            c.deploy("shop", "staging", &deploy_request())
+                .await
+                .unwrap_err(),
+            413,
+            "length limit exceeded",
+        ),
+        (
+            c.workload_delete("shop", "staging", "web")
+                .await
+                .unwrap_err(),
+            502,
+            "bad gateway",
+        ),
+    ];
+    for (err, status, text) in errors {
+        let body = assert_api_error(err, status, error_code::INTERNAL);
+        assert_eq!(body.message.as_deref(), Some(text));
+    }
 }
 
 #[tokio::test]
@@ -612,20 +641,6 @@ async fn project_list_returns_the_projects() {
 }
 
 #[tokio::test]
-async fn project_list_non_json_error_still_yields_api_error() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/projects"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-
-    let err = client(&server).project_list().await.unwrap_err();
-    let body = assert_api_error(err, 500, error_code::INTERNAL);
-    assert_eq!(body.message.as_deref(), Some("boom"));
-}
-
-#[tokio::test]
 async fn project_get_returns_the_project() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -860,23 +875,6 @@ async fn deploy_errors_are_decoded() {
     }
 }
 
-#[tokio::test]
-async fn deploy_non_json_error_still_yields_api_error() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(DEPLOY_PATH))
-        .respond_with(ResponseTemplate::new(413).set_body_string("length limit exceeded"))
-        .mount(&server)
-        .await;
-
-    let err = client(&server)
-        .deploy("shop", "staging", &deploy_request())
-        .await
-        .unwrap_err();
-    let body = assert_api_error(err, 413, error_code::INTERNAL);
-    assert_eq!(body.message.as_deref(), Some("length limit exceeded"));
-}
-
 /// Only the filters that are set go into the query.
 #[tokio::test]
 async fn workload_list_sends_the_filters_that_are_set() {
@@ -1073,23 +1071,6 @@ async fn workload_delete_errors_are_decoded() {
         .await
         .unwrap_err();
     assert_api_error(err, 404, error_code::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn delete_non_json_error_still_yields_api_error() {
-    let server = MockServer::start().await;
-    Mock::given(method("DELETE"))
-        .and(path(WORKLOAD_PATH))
-        .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
-        .mount(&server)
-        .await;
-
-    let err = client(&server)
-        .workload_delete("shop", "staging", "web")
-        .await
-        .unwrap_err();
-    let body = assert_api_error(err, 502, error_code::INTERNAL);
-    assert_eq!(body.message.as_deref(), Some("bad gateway"));
 }
 
 /// Every argument that becomes part of a URL is refused, with its own name
