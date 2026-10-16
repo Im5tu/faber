@@ -781,7 +781,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let handle = start(fast_config(id, dir.path()), api, peer).await.unwrap();
+            // Election timeouts that a busy machine does not outrun: a leader
+            // that changes in the middle of a test fails what it asks of it.
+            let mut config = fast_config(id, dir.path());
+            config.election_min_ms = 1500;
+            config.election_max_ms = 3000;
+            let handle = start(config, api, peer).await.unwrap();
             Self {
                 id,
                 handle,

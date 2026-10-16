@@ -41,6 +41,17 @@ pub fn fast_config(node_id: u64, dir: &Path) -> Config {
     c
 }
 
+/// Election timeouts long enough that a stalled heartbeat starts no
+/// election. Tests that count on a node staying the leader use this: with
+/// the 150 to 300 ms of [`fast_config`] a busy machine now and then elects
+/// another node in the middle of a test, and a request that meets the change
+/// is answered 503 (`not_leader`, `no_leader`) or 502 (`peer_unreachable`,
+/// when a follower still forwards to a leader that has stopped).
+pub fn steady(c: &mut Config) {
+    c.election_min_ms = 1500;
+    c.election_max_ms = 3000;
+}
+
 pub fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

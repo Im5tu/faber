@@ -14,7 +14,7 @@ use faber_api_types::workload::{
 use faber_api_types::{ClientError, FaberClient, error_code};
 use serde_json::json;
 
-use common::{TestNode, WAIT};
+use common::{TestNode, WAIT, steady};
 
 fn client(node: &TestNode) -> FaberClient {
     FaberClient::new(&format!("http://{}", node.api_addr())).unwrap()
@@ -100,16 +100,6 @@ async fn wait_voters(node: &TestNode, want: &[u64]) {
         )
         .await
         .unwrap();
-}
-
-/// Election timeouts long enough that a stalled heartbeat starts no
-/// election. The tests below count on node 1 staying the leader: with the
-/// 150 to 300 ms of `fast_config` a busy machine now and then elects
-/// another node in the middle of a test, and a write that meets the change
-/// is answered 503 `not_leader` or `no_leader`.
-fn steady(c: &mut fabercp::Config) {
-    c.election_min_ms = 1500;
-    c.election_max_ms = 3000;
 }
 
 /// Node 1 leads, nodes 2 and 3 follow.

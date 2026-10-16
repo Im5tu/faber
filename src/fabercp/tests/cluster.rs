@@ -11,7 +11,7 @@ use fabercp::dto::PeerJoinRequest;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use common::{TestNode, WAIT};
+use common::{TestNode, WAIT, steady};
 use fabercp::raft::types::Node;
 use tokio::net::TcpListener;
 
@@ -69,9 +69,9 @@ async fn wait_replication(leader: &TestNode, followers: &[u64]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_forms_forwards_and_fails_over() {
     let mut nodes = vec![
-        TestNode::start(1).await,
-        TestNode::start(2).await,
-        TestNode::start(3).await,
+        TestNode::start_with(1, steady).await,
+        TestNode::start_with(2, steady).await,
+        TestNode::start_with(3, steady).await,
     ];
 
     nodes[0].init().await;
@@ -154,7 +154,7 @@ async fn cluster_forms_forwards_and_fails_over() {
     );
 
     // Joining still works after failover, through the follower.
-    let n4 = TestNode::start(4).await;
+    let n4 = TestNode::start_with(4, steady).await;
     let s4 = n4.join(&nodes[follower_idx]).await;
     assert!(s4.joined);
     assert_eq!(s4.leader_id, Some(new_leader));
@@ -173,6 +173,7 @@ async fn new_joiner_catches_up_from_snapshot() {
     let snapshot_every = |c: &mut fabercp::Config| {
         c.snapshot_logs = 10;
         c.keep_logs = 0;
+        steady(c);
     };
     let mut n1 = TestNode::start_with(1, snapshot_every).await;
     n1.init().await;
@@ -221,7 +222,7 @@ async fn new_joiner_catches_up_from_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_learner_does_not_count_as_joined() {
     let mut n1 = common::single_node().await;
-    let mut n2 = TestNode::start(2).await;
+    let mut n2 = TestNode::start_with(2, steady).await;
     n1.handle()
         .raft()
         .add_learner(2, Node::new(n2.peer_addr().to_string()), true)
@@ -305,9 +306,9 @@ async fn a_learner_is_promoted_only_once_it_has_caught_up() {
     let dir2 = tempfile::tempdir().unwrap();
     let api2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer2 = reserved.listen(1024).unwrap();
-    let n2 = fabercp::start(common::fast_config(2, dir2.path()), api2, peer2)
-        .await
-        .unwrap();
+    let mut config2 = common::fast_config(2, dir2.path());
+    steady(&mut config2);
+    let n2 = fabercp::start(config2, api2, peer2).await.unwrap();
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         let (status, code) = join().await;

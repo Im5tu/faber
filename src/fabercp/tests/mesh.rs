@@ -124,7 +124,8 @@ struct MeshNode {
     wg_endpoint: Option<String>,
     /// Lease clocks for the next launch; production clocks when `None`.
     lease_timing: Option<LeaseTiming>,
-    /// `--election-min-ms` and `--election-max-ms` for the next launch.
+    /// `--election-min-ms` and `--election-max-ms` for the next launch;
+    /// [`common::steady`] when `None`.
     election_ms: Option<(u64, u64)>,
     /// `--node-name` for the next launch.
     node_name: Option<String>,
@@ -158,6 +159,7 @@ impl MeshNode {
 
     fn config(&self, boot: &Bootstrap) -> Config {
         let mut c = common::fast_config(1, &self.dir.path().join("data"));
+        common::steady(&mut c);
         c.node_id = None;
         c.state_dir = self.state_dir();
         c.manage_host = true;
@@ -1484,6 +1486,7 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     let port = n2.peer_addr().port();
     n2.stop().await;
     let (term, index) = n1.log_position();
+    let started = std::time::Instant::now();
     n2.wg_endpoint = Some(new_endpoint.into());
     n2.launch(Bootstrap::Existing, Some(port)).await;
 
@@ -1509,12 +1512,15 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     // its status when it starts and then every five seconds, so up to three
     // `ReportNode` entries may be in the window as well: the restarted
     // node's first report and one periodic report of each node. A write
-    // proposed again and again would add far more.
+    // proposed again and again would add far more. On a busy machine the
+    // window is longer and holds more periodic reports: two more for every
+    // five seconds.
     if term_after == term {
         let added = index_after.zip(index).map(|(after, before)| after - before);
+        let reports = 1 + 2 * (started.elapsed().as_secs() / 5 + 1);
         assert!(
-            matches!(added, Some(3..=6)),
-            "one RenewLease, one SetEndpoint, the barrier and a few reports expected, got {added:?}"
+            added.is_some_and(|n| (3..=3 + reports).contains(&n)),
+            "one RenewLease, one SetEndpoint, the barrier and up to {reports} reports expected,              got {added:?}"
         );
     }
 
