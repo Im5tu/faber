@@ -1517,6 +1517,21 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     assert_eq!(written, 1);
 }
 
+/// A follower that still names the leader it can no longer reach answers a
+/// forwarded write 503 `no_leader`, which a client retries, and not 502.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_forwarded_to_a_stopped_leader_is_no_leader() {
+    let (mut n1, mut n2, _) = two_nodes().await;
+    n1.stop().await;
+    match n2.client().mesh_set_lease(600).await {
+        Err(ClientError::Api { status, body }) => {
+            assert_eq!((status, body.error.as_str()), (503, "no_leader"));
+        }
+        other => panic!("expected 503 no_leader, got {other:?}"),
+    }
+    n2.stop().await;
+}
+
 /// How many `SetEndpoint` entries for node `id` with `endpoint` the log in
 /// the data directory `data` holds. The node must not be running.
 async fn set_endpoint_entries(data: &Path, id: u64, endpoint: &str) -> usize {
