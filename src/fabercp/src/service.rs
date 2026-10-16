@@ -1599,34 +1599,36 @@ impl FaberService {
             })
     }
 
-    /// Forwards `body` to the leader at `leader_addr` with [`Self::post_peer`].
+    /// Forwards `body` to the leader at `leader_addr`.
     ///
-    /// When the leader cannot be reached the follower's view may be stale,
-    /// as during a failover. The view is read again and, if another leader
-    /// is known, the request is sent there once. Otherwise the answer is
-    /// [`ServiceError::NoLeader`], which a client retries. A leader that
-    /// answers, even with an error, is passed through as `post_peer` has it.
+    /// When no connection to the leader can be made the follower's view may
+    /// be stale, as during a failover, and nothing was sent. The view is
+    /// read again and, if another leader is known, the request is sent there
+    /// once. Otherwise the answer is [`ServiceError::NoLeader`], which a
+    /// client retries. Any other failure after the request went out
+    /// (timeout, lost answer) leaves the outcome unknown: it is not retried
+    /// and stays [`ServiceError::PeerUnreachable`]. A leader that answers,
+    /// even with an error, is passed through as `post_peer` has it.
     pub(crate) async fn post_leader<B: Serialize>(
         &self,
         leader_addr: &str,
         path: &str,
         body: &B,
     ) -> ServiceResult<Vec<u8>> {
-        match self.post_peer(leader_addr, path, body, true).await {
-            Err(ServiceError::PeerUnreachable(first)) => {
-                let Some(next) = self.other_leader(leader_addr) else {
-                    tracing::debug!(%first, "no other leader to forward to");
-                    return Err(ServiceError::NoLeader);
-                };
-                match self.post_peer(&next, path, body, true).await {
-                    Err(ServiceError::PeerUnreachable(second)) => {
-                        tracing::debug!(%second, "the new leader cannot be reached either");
-                        Err(ServiceError::NoLeader)
-                    }
-                    other => other,
-                }
+        let first = match self.post_once(leader_addr, path, body, true).await {
+            Err(PostFailure::NotConnected(why)) => why,
+            other => return other.map_err(PostFailure::into_error),
+        };
+        let Some(next) = self.other_leader(leader_addr) else {
+            tracing::debug!(%first, "no other leader to forward to");
+            return Err(ServiceError::NoLeader);
+        };
+        match self.post_once(&next, path, body, true).await {
+            Err(PostFailure::NotConnected(second)) => {
+                tracing::debug!(%second, "the new leader cannot be reached either");
+                Err(ServiceError::NoLeader)
             }
-            other => other,
+            other => other.map_err(PostFailure::into_error),
         }
     }
 
@@ -1650,6 +1652,20 @@ impl FaberService {
         body: &B,
         forwarded: bool,
     ) -> ServiceResult<Vec<u8>> {
+        self.post_once(peer, path, body, forwarded)
+            .await
+            .map_err(PostFailure::into_error)
+    }
+
+    /// [`Self::post_peer`], telling a connection that was never made apart
+    /// from a failure after the request went out.
+    async fn post_once<B: Serialize>(
+        &self,
+        peer: &str,
+        path: &str,
+        body: &B,
+        forwarded: bool,
+    ) -> Result<Vec<u8>, PostFailure> {
         let timeout = if path == "/raft/cluster/join" {
             JOIN_TIMEOUT
         } else {
@@ -1664,15 +1680,18 @@ impl FaberService {
         if forwarded {
             rb = rb.header(FORWARDED_HEADER, "1");
         }
-        let resp = rb
-            .send()
-            .await
-            .map_err(|e| ServiceError::PeerUnreachable(format!("{peer}: {e}")))?;
+        let resp = rb.send().await.map_err(|e| {
+            let why = format!("{peer}: {e}");
+            if e.is_connect() {
+                PostFailure::NotConnected(why)
+            } else {
+                PostFailure::Failed(ServiceError::PeerUnreachable(why))
+            }
+        })?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ServiceError::PeerUnreachable(format!("{peer}: {e}")))?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            PostFailure::Failed(ServiceError::PeerUnreachable(format!("{peer}: {e}")))
+        })?;
         if status.is_success() {
             return Ok(bytes.to_vec());
         }
@@ -1680,10 +1699,10 @@ impl FaberService {
             ErrorBody::new(error_code::INTERNAL)
                 .with_message(String::from_utf8_lossy(&bytes).into_owned())
         });
-        Err(ServiceError::Upstream {
+        Err(PostFailure::Failed(ServiceError::Upstream {
             status: status.as_u16(),
             body,
-        })
+        }))
     }
 
     /// Proposes `req` and turns `Response::Rejected` into an error.
@@ -1777,6 +1796,23 @@ impl FaberService {
                 leader_addr,
             },
             None => ServiceError::NoLeader,
+        }
+    }
+}
+
+/// Why a POST to a peer failed.
+enum PostFailure {
+    /// No connection was made, so the peer saw nothing.
+    NotConnected(String),
+    /// Anything else, including a request that may have been applied.
+    Failed(ServiceError),
+}
+
+impl PostFailure {
+    fn into_error(self) -> ServiceError {
+        match self {
+            Self::NotConnected(why) => ServiceError::PeerUnreachable(why),
+            Self::Failed(e) => e,
         }
     }
 }
@@ -2425,6 +2461,74 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, ServiceError::NoLeader);
+        node.shutdown().await;
+    }
+
+    /// Serves `answer` (raw bytes, possibly empty) to each connection after
+    /// its request has been read, then closes it. Returns the address and a
+    /// count of the connections accepted.
+    async fn canned_peer(
+        answer: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf).await;
+                    let _ = conn.write_all(&answer).await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// A request that went out but whose answer never came back may have
+    /// been applied: it stays `peer_unreachable` and is not sent again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_whose_answer_is_lost_stays_peer_unreachable() {
+        let node = TestNode::start_initialized().await;
+        let (addr, accepted) = canned_peer(Vec::new()).await;
+        let body = PeerLeaseRequest { lease_secs: 600 };
+        let err = node
+            .service
+            .post_leader(&addr, "/raft/cluster/lease", &body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::PeerUnreachable(_)), "{err:?}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        node.shutdown().await;
+    }
+
+    /// A leader that answers with an error is passed through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_answered_with_an_error_is_upstream() {
+        let node = TestNode::start_initialized().await;
+        let json = r#"{"error":"bad_request","message":"no"}"#;
+        let answer = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+            json.len()
+        );
+        let (addr, _) = canned_peer(answer.into_bytes()).await;
+        let body = PeerLeaseRequest { lease_secs: 600 };
+        let err = node
+            .service
+            .post_leader(&addr, "/raft/cluster/lease", &body)
+            .await
+            .unwrap_err();
+        match err {
+            ServiceError::Upstream { status, body } => {
+                assert_eq!((status, body.error.as_str()), (400, "bad_request"));
+            }
+            other => panic!("{other:?}"),
+        }
         node.shutdown().await;
     }
 
