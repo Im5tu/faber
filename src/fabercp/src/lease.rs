@@ -746,6 +746,30 @@ mod tests {
         service.read_mesh().unwrap().unwrap()
     }
 
+    /// Lets `secs` seconds of the lease clock go by. The clock moves only
+    /// through committed ticks of a running leader task, so this waits for
+    /// that many ticks, and a stalled leader makes it wait longer. Use it
+    /// to look for something that must not happen, instead of a sleep.
+    async fn clock_runs(service: &FaberService, secs: u64) {
+        let until = mesh_of(service).clock + secs;
+        wait_for("the lease clock to run on", || {
+            mesh_of(service).clock >= until
+        })
+        .await;
+    }
+
+    /// The leader task, to be driven one tick at a time with `round`.
+    fn leader_task(service: &FaberService, reader: StateReader, timing: LeaseTiming) -> LeaderTask {
+        LeaderTask {
+            service: service.clone(),
+            reader,
+            timing,
+            clock: TickClock::default(),
+            mark: None,
+            joint_seen: None,
+        }
+    }
+
     struct Member {
         id: NodeId,
         handle: NodeHandle,
@@ -871,7 +895,8 @@ mod tests {
         let node = TestNode::start().await;
         let cancel = CancellationToken::new();
         let task = spawn_leader_task(node.service.clone(), node.state(), cancel.clone());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // It runs until it is told to stop.
+        tokio::task::yield_now().await;
         assert!(!task.is_finished());
         stop_task(&cancel, task).await;
         node.shutdown().await;
@@ -915,11 +940,10 @@ mod tests {
     async fn without_a_mesh_the_task_writes_nothing() {
         let node = TestNode::start_initialized().await;
         let before = node.service.raft().metrics().borrow().last_log_index;
-        let cancel = CancellationToken::new();
-        let task =
-            spawn_leader_task_with(node.service.clone(), node.state(), fast(), cancel.clone());
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        stop_task(&cancel, task).await;
+        let mut task = leader_task(&node.service, node.state(), fast());
+        for _ in 0..20 {
+            task.round().await;
+        }
         let after = node.service.raft().metrics().borrow().last_log_index;
         assert_eq!(before, after);
         node.shutdown().await;
@@ -1041,8 +1065,9 @@ mod tests {
             mesh.lease_expired(&mesh.nodes[&2])
         })
         .await;
-        // Many ticks later node 2 is still a voter and a mesh node.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A whole lease of ticks later node 2 is still a voter and a mesh
+        // node.
+        clock_runs(&leader, MIN_LEASE_SECS).await;
         assert_eq!(leader.member_ids(), set(&[1, 2, 3]));
         assert!(leader.is_voter(2));
         assert!(mesh_of(&leader).nodes.contains_key(&2));
@@ -1093,7 +1118,8 @@ mod tests {
             tokio::spawn(
                 async move { crate::hold_lease(&node_2, &reader, fast().second, &stop).await },
             );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Two lease periods of refusals.
+        clock_runs(&leader, 2 * MIN_LEASE_SECS).await;
         assert!(
             !held.is_finished(),
             "a refused renewal of an expired lease is no proof of removal"
@@ -1166,8 +1192,13 @@ mod tests {
                 _ = change => panic!("the membership change ran to its end"),
             }
         }
-        // Nothing finishes it on its own.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Nothing finishes it on its own, not even a commit that needs a
+        // majority of both its voter sets.
+        let write = Request::Set {
+            key: "k".into(),
+            value: serde_json::json!(1),
+        };
+        leader.propose(write).await.unwrap();
         assert!(is_joint(&leader));
         assert_eq!(leader.member_ids(), set(&[1, 2, 3]));
 
@@ -1200,18 +1231,20 @@ mod tests {
             write_timeout: Duration::from_millis(200),
             ..fast()
         };
-        let cancel = CancellationToken::new();
-        let state = members[0].handle.state().clone();
-        let task = spawn_leader_task_with(leader.clone(), state, timing, cancel.clone());
-
-        // Long enough for the last quorum ack to be older than the limit.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // The last quorum ack gets older than the limit.
+        wait_for("the last quorum ack to be too old", || {
+            !quorum_is_recent(leader.millis_since_quorum_ack(), timing.write_timeout)
+        })
+        .await;
         assert!(leader.is_leader());
         let before = last_log_index(&leader);
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let mut task = leader_task(&leader, members[0].handle.state().clone(), timing);
+        for _ in 0..20 {
+            task.round().await;
+        }
         assert_eq!(last_log_index(&leader), before);
 
-        stop_task(&cancel, task).await;
+        drop(task);
         drop(leader);
         for m in members {
             m.stop().await;
@@ -1357,17 +1390,14 @@ mod tests {
         let next = others.iter().find(|s| s.is_leader()).unwrap();
         assert_eq!(next.member_ids(), set(&[2, 3]));
         // The joiner's retry, as it would arrive at either node.
-        let mut done = false;
-        for _ in 0..50 {
-            match next.peer_register(register.clone(), false).await {
-                Ok(()) => {
-                    done = true;
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
+        let deadline = Instant::now() + WAIT;
+        while let Err(e) = next.peer_register(register.clone(), false).await {
+            assert!(
+                Instant::now() < deadline,
+                "the retry never succeeded: {e:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(done, "the retry never succeeded");
         let mesh = mesh_of(next);
         assert!(!mesh.nodes.contains_key(&1));
         assert_eq!(mesh.nodes[&new_id].name, "node-1");
