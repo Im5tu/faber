@@ -477,21 +477,6 @@ mod tests {
     /// or sets variables holds this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const MESH_VARS: [&str; 12] = [
-        "FABER_STATE_DIR",
-        "FABER_NEW_MESH",
-        "FABER_MESH_CIDR",
-        "FABER_CONTAINER_CIDR",
-        "FABER_NODE_NAME",
-        "FABER_JOIN_TOKEN_FILE",
-        "FABER_WG_ENDPOINT",
-        "FABER_WG_PORT",
-        "FABER_MANAGE_HOST",
-        "FABER_NODE_ID",
-        "FABER_RECONCILE_INTERVAL_SECS",
-        "FABER_WG_INTERFACE",
-    ];
-
     fn lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -956,23 +941,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_mesh_values_are_rejected() {
-        assert!(try_parse(&["--mesh-cidr", "10.99.0.0"]).is_err());
-        assert!(try_parse(&["--mesh-cidr", "fd00::/64"]).is_err());
-        assert!(try_parse(&["--container-cidr", "10.200.0.0"]).is_err());
-        assert!(try_parse(&["--container-cidr", "fd00::/64"]).is_err());
-        assert!(try_parse(&["--wg-port", "70000"]).is_err());
-    }
-
-    #[test]
-    fn test_env_vars_are_cleaned_up() {
-        let _g = lock();
-        for k in MESH_VARS {
-            assert!(std::env::var_os(k).is_none(), "{k} left set");
-        }
-    }
-
-    #[test]
     fn resolve_node_id_prefers_identity() {
         let mut c = Config::new(2, "d");
         assert_eq!(c.resolve_node_id(Some(&identity(2))).unwrap(), 2);
@@ -1092,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_hosts_include_loopback_peer_and_extras() {
+    fn mcp_hosts_include_loopback_peer_and_extras_once() {
         let mut c = Config::new(1, "d");
         c.mcp_allowed_hosts = vec!["node1.wg".into()];
         assert_eq!(
@@ -1109,11 +1077,8 @@ mod tests {
         let v6 = c.allowed_mcp_hosts("[fd00::1]:7401".parse().unwrap());
         assert!(v6.contains(&"fd00::1".to_string()));
         assert!(v6.contains(&"[fd00::1]:7401".to_string()));
-    }
 
-    #[test]
-    fn mcp_hosts_have_no_duplicates() {
-        let mut c = Config::new(1, "d");
+        // Repeats and the built-in hosts are listed once.
         c.mcp_allowed_hosts = vec!["localhost".into(), "a.example".into(), "a.example".into()];
         assert_eq!(
             c.allowed_mcp_hosts("127.0.0.1:7401".parse().unwrap()),

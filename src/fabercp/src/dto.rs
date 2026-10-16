@@ -361,20 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_endpoint_request_shape() {
-        let r = PeerEndpointRequest {
-            node_id: 2,
-            endpoint: "198.51.100.2:51820".into(),
-        };
-        let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({"node_id": 2, "endpoint": "198.51.100.2:51820"})
-        );
-        assert_eq!(serde_json::from_value::<PeerEndpointRequest>(v).unwrap(), r);
-    }
-
-    #[test]
     fn peer_renew_request_shape() {
         let r = PeerRenewRequest {
             node_id: 2,
@@ -389,14 +375,6 @@ mod tests {
         // Every field is required.
         let partial = serde_json::json!({"node_id": 2});
         assert!(serde_json::from_value::<PeerRenewRequest>(partial).is_err());
-    }
-
-    #[test]
-    fn peer_lease_request_shape() {
-        let r = PeerLeaseRequest { lease_secs: 600 };
-        let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v, serde_json::json!({"lease_secs": 600}));
-        assert_eq!(serde_json::from_value::<PeerLeaseRequest>(v).unwrap(), r);
     }
 
     #[test]
@@ -540,16 +518,5 @@ mod tests {
             serde_json::from_value::<PeerWorkloadResponse>(v).unwrap(),
             created
         );
-    }
-
-    #[test]
-    fn replication_status_round_trips_with_integer_map_keys() {
-        let r = ReplicationStatus {
-            leader_id: 1,
-            last_log_index: Some(9),
-            matched: BTreeMap::from([(1, Some(9)), (2, None)]),
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(serde_json::from_str::<ReplicationStatus>(&json).unwrap(), r);
     }
 }

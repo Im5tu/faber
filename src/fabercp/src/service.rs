@@ -3003,18 +3003,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn set_lease_without_a_leader_is_no_leader() {
-        let node = TestNode::start().await;
-        for forwarded in [false, true] {
-            assert_eq!(
-                node.service.set_lease(600, forwarded).await,
-                Err(ServiceError::NoLeader)
-            );
-        }
-        node.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_status_interval_is_set_through_raft_within_bounds() {
         let node = TestNode::start_initialized().await;
         let svc = &node.service;
@@ -3045,7 +3033,7 @@ mod tests {
     /// A follower forwards once; a request that was forwarded already is not
     /// forwarded again. With no leader there is nowhere to send either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_writes_without_a_leader_are_no_leader() {
+    async fn lease_and_status_writes_without_a_leader_are_no_leader() {
         let node = TestNode::start().await;
         let report = || ReportNode {
             node_id: 1,
@@ -3054,6 +3042,10 @@ mod tests {
             replicas: Vec::new(),
         };
         for forwarded in [false, true] {
+            assert_eq!(
+                node.service.set_lease(600, forwarded).await,
+                Err(ServiceError::NoLeader)
+            );
             assert_eq!(
                 node.service.set_status_interval(10, forwarded).await,
                 Err(ServiceError::NoLeader)

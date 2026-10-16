@@ -156,7 +156,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_mapping() {
+    async fn status_and_code_mapping() {
+        let rejected = |code: &str| ServiceError::Rejected {
+            code: code.into(),
+            message: "m".into(),
+        };
         let cases = [
             (ServiceError::NotFound, 404, error_code::NOT_FOUND),
             (
@@ -186,20 +190,6 @@ mod tests {
                 500,
                 error_code::INTERNAL,
             ),
-        ];
-        for (err, status, code) in cases {
-            let (s, body) = render(err).await;
-            assert_eq!((s, body.error.as_str()), (status, code));
-        }
-    }
-
-    #[tokio::test]
-    async fn rejection_and_forbidden_mapping() {
-        let rejected = |code: &str| ServiceError::Rejected {
-            code: code.into(),
-            message: "m".into(),
-        };
-        let cases = [
             (
                 rejected(error_code::INVITE_INVALID),
                 400,

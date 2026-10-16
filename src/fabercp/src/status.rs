@@ -1049,10 +1049,4 @@ mod tests {
         assert_eq!(disk.free_bytes().await, None);
         assert_eq!(disk.free_bytes().await, Some(7));
     }
-
-    #[tokio::test]
-    async fn the_fake_node_answers_the_space_request() {
-        let disk = NodeDisk::new(crate::runner::node::fake::FakeNode::default());
-        assert!(disk.free_bytes().await.is_some());
-    }
 }

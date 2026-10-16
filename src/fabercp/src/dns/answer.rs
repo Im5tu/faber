@@ -290,6 +290,9 @@ mod tests {
         assert_eq!(m.metadata.id, 9);
         assert_eq!(m.metadata.response_code, ResponseCode::FormErr);
         assert_eq!(answer(&[1, 2, 3], &ips()), Outcome::Drop);
+        // An unparseable response is dropped, not answered.
+        let broken = [0, 9, 0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xff];
+        assert_eq!(answer(&broken, &ips()), Outcome::Drop);
     }
 
     #[test]
@@ -308,12 +311,6 @@ mod tests {
             &ips,
         ));
         assert_eq!(m.metadata.response_code, ResponseCode::NXDomain);
-    }
-
-    #[test]
-    fn dns_unparseable_response_is_dropped() {
-        let broken = [0, 9, 0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xff];
-        assert_eq!(answer(&broken, &ips()), Outcome::Drop);
     }
 
     fn big_response(query: &[u8]) -> Vec<u8> {

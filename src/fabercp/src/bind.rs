@@ -187,17 +187,11 @@ mod tests {
     }
 
     #[test]
-    fn peer_accepts_loopback_and_wireguard_addresses() {
+    fn peer_accepts_only_loopback_and_wireguard_addresses() {
         let h = host();
-        assert_eq!(check_peer_ip("127.0.0.1".parse().unwrap(), &h), Ok(()));
-        assert_eq!(check_peer_ip("::1".parse().unwrap(), &h), Ok(()));
-        assert_eq!(check_peer_ip("10.8.0.1".parse().unwrap(), &h), Ok(()));
-        assert_eq!(check_peer_ip("fd00::1".parse().unwrap(), &h), Ok(()));
-    }
-
-    #[test]
-    fn peer_rejects_wildcard_lan_and_unknown_addresses() {
-        let h = host();
+        for ok in ["127.0.0.1", "::1", "10.8.0.1", "fd00::1"] {
+            assert_eq!(check_peer_ip(ok.parse().unwrap(), &h), Ok(()), "{ok}");
+        }
         for bad in ["0.0.0.0", "::", "192.168.1.5", "10.8.0.2"] {
             let ip: IpAddr = bad.parse().unwrap();
             assert_eq!(check_peer_ip(ip, &h), Err(BindError::PeerNotAllowed(ip)));

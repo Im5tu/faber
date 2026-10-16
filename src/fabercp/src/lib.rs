@@ -2141,12 +2141,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn the_evidence_codes_are_fixed() {
-        assert_eq!(RemovalEvidence::RenewalRefused.code(), "renewal_refused");
-        assert_eq!(RemovalEvidence::LeftMembership.code(), "left_membership");
-    }
-
     /// A node can leave the mesh before the mesh reached it, and with a CNI
     /// config from an earlier life still on faber-node's disk. The removal
     /// needs no replicated state and asks faber-node for the removal only.

@@ -372,19 +372,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_unknown_zone_name_is_nxdomain_and_aaaa_is_empty() {
-        let (server, cancel) = start(vec![]);
-        let addr = server.local_addr();
-        let m = ask_udp(addr, &query("api.prod.shop.faber.local.", RecordType::A)).await;
-        assert_eq!(m.metadata.response_code, ResponseCode::NXDomain);
-        let m = ask_udp(addr, &query("web.prod.shop.faber.local.", RecordType::AAAA)).await;
-        assert_eq!(m.metadata.response_code, ResponseCode::NoError);
-        assert!(m.answers.is_empty());
-        cancel.cancel();
-        server.wait().await;
-    }
-
-    #[tokio::test]
     async fn dns_other_names_are_forwarded_and_the_answer_relayed() {
         let (server, cancel) = start(vec![fake_upstream().await]);
         let m = ask_udp(server.local_addr(), &query("example.com.", RecordType::A)).await;

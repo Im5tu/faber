@@ -1074,8 +1074,10 @@ mod tests {
         assert_ne!(record.workloads["web"].env, sealed_once);
     }
 
+    /// The maps are defaulted, so a record stored without one still
+    /// decodes, as empty.
     #[test]
-    fn an_empty_index_is_the_default() {
+    fn records_without_their_maps_decode() {
         assert_eq!(
             serde_json::from_value::<ProjectIndex>(json!({})).unwrap(),
             ProjectIndex::default()
@@ -1084,12 +1086,6 @@ mod tests {
             serde_json::to_value(ProjectIndex::default()).unwrap(),
             json!({"projects": {}})
         );
-    }
-
-    /// The maps are defaulted, so a record stored without one still
-    /// decodes, as empty.
-    #[test]
-    fn records_without_their_maps_decode() {
         assert_eq!(
             serde_json::from_value::<ProjectRecord>(json!({"created_at": 5})).unwrap(),
             ProjectRecord {
