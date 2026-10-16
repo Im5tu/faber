@@ -397,6 +397,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connection_error_is_noted_and_tried_again() {
+        // A port that was just open and is closed now.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = FaberClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let refused = client.health().await.unwrap_err();
+        assert!(matches!(refused, ClientError::Http(_)));
+        let a = [(0, 1, "available")];
+        let got = run(
+            vec![Err(refused), Ok(view(1, &a, true))],
+            OutputFormat::Text,
+            false,
+        )
+        .await;
+        got.result.unwrap();
+        assert_eq!(got.err.lines().count(), 1, "{}", got.err);
+        assert!(got.err.ends_with("; retrying\n"), "{}", got.err);
+        assert_eq!(got.out.matches("name:").count(), 1);
+        assert_eq!(got.sleeps.len(), 1);
+    }
+
+    #[tokio::test]
     async fn an_error_in_between_keeps_the_view_and_the_opened_env() {
         let a = [(0, 1, "available")];
         let got = run(
