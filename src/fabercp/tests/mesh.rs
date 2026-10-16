@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use faber_api_types::{CreateInviteRequest, ErrorBody, FaberClient, InviteResponse, error_code};
+use faber_api_types::{
+    ClientError, CreateInviteRequest, ErrorBody, FaberClient, InviteResponse, error_code,
+};
 use faber_network_management::fake::{Call, RecordingRunner};
 use faber_network_management::{BoxFuture, CommandOutput, CommandRunner, NetworkManager};
 use fabercp::dto::{PeerJoinRequest, PeerRegisterRequest};
@@ -383,6 +385,46 @@ async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// Lets `secs` seconds of the lease clock go by on `node`, which must run
+/// [`fast_lease`] clocks. The clock moves only through committed entries and
+/// never faster than the wall clock, so a load that stalls the leader makes
+/// this wait longer, never shorter. For checks that something does not
+/// happen: a host resync (2 s in these tests) takes 2000 of them.
+async fn lease_clock_runs(node: &MeshNode, secs: u64) {
+    let until = node.mesh().clock + secs;
+    eventually("the lease clock runs on", || node.mesh().clock >= until).await;
+}
+
+/// Lease clock seconds that cover one host resync (2 s) with room to spare.
+const A_RESYNC: u64 = 2_500;
+
+/// Sets the lease through whichever of `alive` leads, so that the change is
+/// not forwarded. Followers name a node that stopped as leader until their
+/// election timers run out, and a change forwarded to it fails with
+/// `peer_unreachable`. A leader that changes during the call answers
+/// `not_leader` or `no_leader`; the same lease set again is harmless, so
+/// that is retried. Any other answer fails the test.
+async fn set_lease(alive: &[&MeshNode], secs: u64) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let leader = alive
+            .iter()
+            .find(|n| n.handle().raft().metrics().borrow().state.is_leader());
+        if let Some(leader) = leader {
+            match leader.client().mesh_set_lease(secs).await {
+                Ok(_) => return,
+                Err(ClientError::Api { status: 503, .. }) => {}
+                Err(e) => panic!("the lease was not set: {e}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "none of the running nodes took the lead"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Lease clocks for tests: a second of the lease clock takes a millisecond,
 /// so the shortest lease an admin can set (300 seconds) runs out in 300 ms.
 fn fast_lease() -> LeaseTiming {
@@ -423,9 +465,14 @@ async fn found(mut node: MeshNode) -> MeshNode {
 
 /// Founder plus node 2 joined from a token.
 async fn two_nodes() -> (MeshNode, MeshNode, InviteResponse) {
-    let n1 = founder().await;
+    two_nodes_with(founder().await, MeshNode::new()).await
+}
+
+/// [`two_nodes`] with the founder `n1` already running, and the joiner not.
+async fn two_nodes_with(n1: MeshNode, mut n2: MeshNode) -> (MeshNode, MeshNode, InviteResponse) {
     let invite = n1.invite("node-2", "198.51.100.2", None).await;
-    let n2 = MeshNode::start(Bootstrap::Token(invite.token.clone())).await;
+    n2.launch(Bootstrap::Token(invite.token.clone()), None)
+        .await;
     eventually("node 2 is a voter", || {
         let mut v = n1.voters();
         v.sort();
@@ -1118,13 +1165,11 @@ async fn node_joins_from_token_and_invites_are_single_use_and_expire() {
         n1.host.last_syncconf().contains(&pk3)
     })
     .await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    tokio::time::sleep(Duration::from_secs(
-        short.expires_at.saturating_sub(now) + 1,
-    ))
+    // The leader drops the peer when the invite runs out.
+    eventually("expired invite dropped from wg", || {
+        let conf = n1.host.last_syncconf();
+        !conf.contains(&pk3) && conf.contains(&pk2)
+    })
     .await;
     let late = register_body(
         &short_token.invite_id,
@@ -1139,11 +1184,6 @@ async fn node_joins_from_token_and_invites_are_single_use_and_expire() {
             Some(error_code::INVITE_EXPIRED.to_string())
         )
     );
-    eventually("expired invite dropped from wg", || {
-        let conf = n1.host.last_syncconf();
-        !conf.contains(&pk3) && conf.contains(&pk2)
-    })
-    .await;
 
     n2.stop().await;
     n1.stop().await;
@@ -1244,10 +1284,13 @@ async fn follower_invites_are_forwarded_and_restart_does_not_rejoin() {
 /// node and the leader carry on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_machine_with_a_used_token_never_acts_as_the_node() {
-    let (mut n1, mut n2, invite) = two_nodes().await;
+    let (mut n1, mut n2, invite) =
+        two_nodes_with(found(MeshNode::fast()).await, MeshNode::fast()).await;
     let id2 = n2.identity();
 
-    let mut twin = MeshNode::start(Bootstrap::Token(invite.token.clone())).await;
+    let mut twin = MeshNode::fast();
+    twin.launch(Bootstrap::Token(invite.token.clone()), None)
+        .await;
     let identity_file = twin.state_dir().join("identity.json");
     eventually("the twin's identity is discarded", || {
         !identity_file.exists()
@@ -1271,7 +1314,7 @@ async fn a_second_machine_with_a_used_token_never_acts_as_the_node() {
     assert!(!twin.state_dir().join("iface").exists());
     // The host loop has stopped: nothing brings the interface back, not
     // even the periodic resync (2s in these tests).
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    lease_clock_runs(&n1, A_RESYNC).await;
     assert_eq!(twin.cmdlines(), lines);
 
     // It takes no raft RPC.
@@ -1316,94 +1359,54 @@ async fn a_second_machine_with_a_used_token_never_acts_as_the_node() {
     n1.stop().await;
 }
 
-/// The leader commits a registration but the answer never reaches the
-/// joiner, which therefore has not recorded it. Its retry comes from the
-/// same machine, so the mesh accepts it and the join completes.
+/// The leader commits a registration and the joiner stops before it joins.
+/// Either the answer never reached it, so it has not recorded the
+/// registration, or it has. Started again with the token, it registers once
+/// more if it has to (the same machine, so the mesh accepts it), and the
+/// join completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joiner_registers_again_after_a_lost_answer() {
-    let mut n1 = founder().await;
-    let invite = n1.invite("node-2", "198.51.100.2", None).await;
-    let token = InviteToken::decode(&invite.token).unwrap();
+async fn a_joiner_that_registered_before_it_stopped_goes_on_to_join() {
+    for recorded in [false, true] {
+        let mut n1 = founder().await;
+        let invite = n1.invite("node-2", "198.51.100.2", None).await;
+        let token = InviteToken::decode(&invite.token).unwrap();
 
-    let mut n2 = MeshNode::new();
-    let made = make_identity(&n2, &invite.token);
-    let instance = made.instance_id.clone().expect("a joiner has one");
-    assert!(!made.pending_join.as_ref().unwrap().registered);
-    // The registration the joiner never heard back about.
-    let register_url = format!("http://{}/raft/cluster/register", n1.peer_addr());
-    let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
-    assert_eq!(
-        post_code(&register_url, &body).await,
-        (StatusCode::OK, None)
-    );
+        // The first step, as the node made it before it stopped.
+        let mut n2 = MeshNode::new();
+        let mut made = make_identity(&n2, &invite.token);
+        let instance = made.instance_id.clone().expect("a joiner has one");
+        assert!(!made.pending_join.as_ref().unwrap().registered);
+        let register_url = format!("http://{}/raft/cluster/register", n1.peer_addr());
+        let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
+        assert_eq!(
+            post_code(&register_url, &body).await,
+            (StatusCode::OK, None)
+        );
+        if recorded {
+            identity::mark_registered(&n2.state_dir(), &mut made).unwrap();
+        }
+        assert_eq!(n1.voters(), [1], "recorded: {recorded}");
 
-    n2.launch(Bootstrap::Token(invite.token.clone()), None)
+        // The token file is still in place, as install.sh leaves it until
+        // the node has joined.
+        n2.launch(Bootstrap::Token(invite.token.clone()), None)
+            .await;
+        eventually("node 2 is a voter", || n1.sorted_voters() == [1, 2]).await;
+        eventually("pending join cleared", || {
+            n2.identity().pending_join.is_none()
+        })
         .await;
-    eventually("node 2 is a voter", || {
-        let mut v = n1.voters();
-        v.sort();
-        v == [1, 2]
-    })
-    .await;
-    eventually("pending join cleared", || {
-        n2.identity().pending_join.is_none()
-    })
-    .await;
-    // Still the same machine.
-    assert_eq!(
-        n2.identity().instance_id.as_deref(),
-        Some(instance.as_str())
-    );
-    assert!(n2.state_dir().join("identity.json").is_file());
+        assert!(n2.voters().contains(&2));
+        // Still the same machine, with the same key.
+        assert_eq!(
+            n2.identity().instance_id.as_deref(),
+            Some(instance.as_str())
+        );
+        assert_eq!(n2.identity().private_key, made.private_key);
 
-    n2.stop().await;
-    n1.stop().await;
-}
-
-/// A joiner that stops after its registration was accepted and recorded,
-/// but before the join, carries on with the join when it starts again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joiner_restarted_between_register_and_join_resumes() {
-    let mut n1 = founder().await;
-    let invite = n1.invite("node-2", "198.51.100.2", None).await;
-    let token = InviteToken::decode(&invite.token).unwrap();
-
-    // Run the first step by hand, as the node would have before it stopped.
-    let mut n2 = MeshNode::new();
-    let mut made = make_identity(&n2, &invite.token);
-    let instance = made.instance_id.clone().expect("a joiner has one");
-    let register_url = format!("http://{}/raft/cluster/register", n1.peer_addr());
-    let body = register_body(&token.invite_id, 2, NODE2_ENDPOINT, &instance);
-    assert_eq!(
-        post_code(&register_url, &body).await,
-        (StatusCode::OK, None)
-    );
-    identity::mark_registered(&n2.state_dir(), &mut made).unwrap();
-    assert_eq!(n1.voters(), [1]);
-
-    // The token file is still in place, as install.sh leaves it until the
-    // node has joined.
-    n2.launch(Bootstrap::Token(invite.token.clone()), None)
-        .await;
-    eventually("node 2 is a voter", || {
-        let mut v = n1.voters();
-        v.sort();
-        v == [1, 2]
-    })
-    .await;
-    eventually("pending join cleared", || {
-        n2.identity().pending_join.is_none()
-    })
-    .await;
-    assert!(n2.voters().contains(&2));
-    assert_eq!(
-        n2.identity().instance_id.as_deref(),
-        Some(instance.as_str())
-    );
-    assert_eq!(n2.identity().private_key, made.private_key);
-
-    n2.stop().await;
-    n1.stop().await;
+        n2.stop().await;
+        n1.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1489,8 +1492,17 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     })
     .await;
     assert_eq!(n1.replicated_endpoint(2).as_deref(), Some(new_endpoint));
-    // Time for any further, unwanted write to show up.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Any further, unwanted write would be queued behind this one: commit
+    // an entry of our own, and every write sent before it is in the log.
+    // The entry is one of the few counted below.
+    let barrier = n1.invite("node-3", "198.51.100.3", None).await;
+    eventually("node 2 applies the barrier", || {
+        n2.mesh()
+            .invites
+            .values()
+            .any(|i| i.node_id == barrier.node_id)
+    })
+    .await;
     let (term_after, index_after) = n1.log_position();
     // A new term adds an entry of its own, which says nothing about this.
     // The restarted node also renews its lease, once. Every node reports
@@ -1501,8 +1513,8 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     if term_after == term {
         let added = index_after.zip(index).map(|(after, before)| after - before);
         assert!(
-            matches!(added, Some(2..=5)),
-            "one RenewLease, one SetEndpoint and a few reports expected, got {added:?}"
+            matches!(added, Some(3..=6)),
+            "one RenewLease, one SetEndpoint, the barrier and a few reports expected, got {added:?}"
         );
     }
 
@@ -1578,12 +1590,16 @@ async fn joiner_cannot_init_and_stops_while_join_is_pending() {
 }
 
 /// Startup applies the host state once; the reconcile loop starts from that
-/// and has nothing to do until something changes.
+/// and has nothing to do until something changes. The loop makes its first
+/// pass as soon as it starts, so a second apply of the startup state would
+/// show within the second of lease clock this waits for, which is inside the
+/// 2s resync of these tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_applies_the_host_state_once() {
-    let mut node = MeshNode::start(Bootstrap::NewMesh).await;
-    // Well inside the 2s resync interval of these tests.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut node = found(MeshNode::fast()).await;
+    eventually("runtime configured", || node.runtime_configured()).await;
+    node.restart().await;
+    lease_clock_runs(&node, 1_000).await;
     let lines = node.cmdlines();
     let count = |prefix: &str| lines.iter().filter(|l| l.starts_with(prefix)).count();
     assert_eq!(count("wg syncconf"), 1, "{lines:#?}");
@@ -1645,13 +1661,14 @@ async fn the_interface_is_recreated_after_a_reboot() {
 /// from nothing: a new identity, a new interface and empty raft storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_invite_discards_the_identity_and_a_new_token_joins() {
-    let mut n1 = founder().await;
+    let mut n1 = found(MeshNode::fast()).await;
     // A token for an invite the mesh does not have.
     let invite = n1.invite("node-2", "198.51.100.2", None).await;
     let mut forged = InviteToken::decode(&invite.token).unwrap();
     forged.invite_id = "0f".repeat(16);
 
-    let mut n2 = MeshNode::start(Bootstrap::Token(forged.encode())).await;
+    let mut n2 = MeshNode::fast();
+    n2.launch(Bootstrap::Token(forged.encode()), None).await;
     let identity_file = n2.state_dir().join("identity.json");
     let marker = n2.state_dir().join("join-failed");
     let bootstrap_error = n2.state_dir().join("bootstrap-error");
@@ -1673,8 +1690,9 @@ async fn a_rejected_invite_discards_the_identity_and_a_new_token_joins() {
     assert_eq!(n2.client().health().await.unwrap().node_id, 2);
     assert!(!n2.client().cluster_status().await.unwrap().joined);
     assert_eq!(n1.voters(), [1]);
-    // It stays that way; nothing recreates the identity.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // It stays that way; nothing recreates the identity, however many
+    // retries and resyncs would have had the time.
+    lease_clock_runs(&n1, A_RESYNC).await;
     assert!(!identity_file.exists());
 
     n2.stop().await;
@@ -1719,15 +1737,18 @@ async fn a_rejected_invite_discards_the_identity_and_a_new_token_joins() {
 /// different token replaces the old identity and its raft data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_token_replaces_a_pending_join_that_never_completes() {
-    let mut n1 = founder().await;
+    let mut n1 = found(MeshNode::fast()).await;
     let invite = n1.invite("node-2", "198.51.100.2", None).await;
     // Nothing answers at the only join address.
     let mut stuck = InviteToken::decode(&invite.token).unwrap();
     stuck.join_addrs = vec!["127.0.0.1:1".into()];
     let stuck = stuck.encode();
 
-    let mut n2 = MeshNode::start(Bootstrap::Token(stuck.clone())).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut n2 = MeshNode::fast();
+    n2.launch(Bootstrap::Token(stuck.clone()), None).await;
+    // Join attempts keep failing for as long as it takes the lease clock to
+    // pass a resync.
+    lease_clock_runs(&n1, A_RESYNC).await;
     let old = n2.identity();
     assert_eq!(old.node_id, invite.node_id);
     assert!(old.pending_join.is_some());
@@ -1872,7 +1893,7 @@ async fn a_stopped_node_is_removed_when_its_lease_runs_out() {
     }
 
     n3.stop().await;
-    n1.client().mesh_set_lease(SHORT_LEASE_SECS).await.unwrap();
+    set_lease(&[&n1, &n2], SHORT_LEASE_SECS).await;
 
     for node in [&n1, &n2] {
         eventually("node 3 left the raft membership", || {
@@ -1934,7 +1955,7 @@ async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
     .await;
     let port = n3.peer_addr().port();
     n3.stop().await;
-    n1.client().mesh_set_lease(SHORT_LEASE_SECS).await.unwrap();
+    set_lease(&[&n1, &n2], SHORT_LEASE_SECS).await;
     eventually("node 3 left the mesh", || {
         n1.sorted_voters() == [1, 2] && !n1.mesh().nodes.contains_key(&3)
     })
@@ -1984,8 +2005,9 @@ async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
         (s, b.error.as_str()),
         (StatusCode::SERVICE_UNAVAILABLE, error_code::NOT_READY)
     );
-    // The host loop has stopped: nothing brings the interface back.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // The host loop has stopped: nothing brings the interface back, not
+    // even the periodic resync (2s in these tests).
+    lease_clock_runs(&n1, A_RESYNC).await;
     assert_eq!(n3.cmdlines(), lines);
     assert_eq!(n1.sorted_voters(), [1, 2]);
 
@@ -2097,7 +2119,7 @@ async fn nodes_that_renew_are_never_removed_and_follow_a_shorter_lease() {
         SHORT_LEASE_SECS
     );
 
-    tokio::time::sleep(SHORT_LEASE * 7 / 2).await;
+    lease_clock_runs(&n1, SHORT_LEASE_SECS * 7 / 2).await;
 
     let mesh = n1.mesh();
     assert!(mesh.clock >= 3 * SHORT_LEASE_SECS, "clock {}", mesh.clock);
@@ -2140,6 +2162,9 @@ async fn a_node_without_a_leader_keeps_its_identity_and_the_cluster_recovers() {
     n2.stop().await;
     let commands = n3.cmdlines().len();
 
+    // The sleep is the test: with no leader there is no lease clock to
+    // count by, so this is the one wait that has to be wall time. Node 3
+    // goes without an answer for longer than its lease.
     tokio::time::sleep(SHORT_LEASE * 5 / 2).await;
     assert_eq!(n3.bootstrap_error(), None);
     assert!(n3.state_dir().join("identity.json").is_file());
