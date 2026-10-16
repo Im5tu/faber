@@ -13,7 +13,7 @@ pub const MAX_CONTAINER_SUBNET_PREFIX: u8 = 30;
 /// Ranges no container address may come from: this network, loopback,
 /// link-local, multicast and the reserved class E block, which holds the
 /// broadcast address.
-const RESERVED: [Ipv4Net; 5] = [
+pub const RESERVED: [Ipv4Net; 5] = [
     Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
     Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
     Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),

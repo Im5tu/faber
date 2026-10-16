@@ -313,6 +313,9 @@ impl Config {
         }
         let overlaps =
             |other: Ipv4Net| range.contains(&other.network()) || other.contains(&range.network());
+        if let Some(reserved) = faber_node_protocol::RESERVED.iter().find(|r| overlaps(**r)) {
+            anyhow::bail!("--service-cidr {range} overlaps the reserved range {reserved}");
+        }
         if overlaps(self.mesh_cidr) {
             anyhow::bail!(
                 "--service-cidr {range} overlaps --mesh-cidr {}",
@@ -871,6 +874,25 @@ mod tests {
         let mut joiner = founder(&["--service-cidr", "10.99.0.0/24"]);
         joiner.new_mesh = false;
         joiner.validate().unwrap();
+    }
+
+    #[test]
+    fn a_service_range_must_avoid_the_reserved_ranges() {
+        let founder = |range: &str| parse(&["--new-mesh", "--service-cidr", range]);
+        for bad in [
+            "0.0.0.0/8",
+            "127.0.0.0/24",
+            "169.254.1.0/24",
+            "224.0.0.0/4",
+            "239.1.0.0/16",
+            "240.0.0.0/4",
+            "255.255.0.0/16",
+            "128.0.0.0/1",
+        ] {
+            let err = founder(bad).validate().unwrap_err().to_string();
+            assert!(err.contains("overlaps the reserved range"), "{bad}: {err}");
+        }
+        founder("192.168.0.0/24").validate().unwrap();
     }
 
     #[test]

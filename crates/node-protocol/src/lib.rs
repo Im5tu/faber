@@ -21,7 +21,7 @@ pub use replica::{
     LABEL_CONTAINER, LABEL_ENV, LABEL_MANAGED, LABEL_PROJECT, LABEL_REPLICA, LABEL_REVISION,
     LABEL_WORKLOAD, ReplicaRef,
 };
-pub use subnet::{MAX_CONTAINER_SUBNET_PREFIX, check_container_subnet};
+pub use subnet::{MAX_CONTAINER_SUBNET_PREFIX, RESERVED, check_container_subnet};
 
 /// Name of the bridge containers attach to, the same on every node. faber-node
 /// writes it into the CNI config and fabercp names it in the firewall; no
