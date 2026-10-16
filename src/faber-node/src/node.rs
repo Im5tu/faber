@@ -102,14 +102,25 @@ impl ReplicaLocks {
 
 type UidReservations = std::sync::Mutex<HashMap<u32, (Owner, usize)>>;
 
+/// Runs `work` in its own task and waits for it. If the caller is dropped the
+/// task still runs to the end.
+async fn detached(
+    work: impl std::future::Future<Output = Result<Response, Fail>> + Send + 'static,
+) -> Result<Response, Fail> {
+    tokio::spawn(work).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "a request task failed");
+        Err(Fail::new(ErrorCode::Runtime, "the request did not finish"))
+    })
+}
+
 /// A `uid_base` reserved for its owner while a create runs. Dropped once the
 /// claim is visible (annotation or marker) or the create failed.
-struct UidReservation<'a> {
-    map: &'a UidReservations,
+struct UidReservation {
+    map: Arc<UidReservations>,
     uid_base: u32,
 }
 
-impl Drop for UidReservation<'_> {
+impl Drop for UidReservation {
     fn drop(&mut self) {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, count)) = map.get_mut(&self.uid_base) {
@@ -138,7 +149,7 @@ pub struct Node<C> {
     uid_lock: tokio::sync::Mutex<()>,
     /// Bases whose create is running, with their owner and how many of that
     /// owner's requests run: the claim is not yet visible to the check.
-    reservations: UidReservations,
+    reservations: Arc<UidReservations>,
     uid_range: UidRange,
     runtime_handler: String,
     cri: C,
@@ -147,7 +158,7 @@ pub struct Node<C> {
     runtime: RuntimeHost,
 }
 
-impl<C: CriClient + Clone> Node<C> {
+impl<C: CriClient + Clone + 'static> Node<C> {
     pub fn new(
         uid_range: UidRange,
         runtime_handler: String,
@@ -159,7 +170,7 @@ impl<C: CriClient + Clone> Node<C> {
             runtime,
             sandbox_locks: ReplicaLocks::default(),
             uid_lock: tokio::sync::Mutex::new(()),
-            reservations: UidReservations::default(),
+            reservations: Arc::default(),
             uid_range,
             runtime_handler,
             images: ImagePuller::new(cri.clone()),
@@ -210,9 +221,17 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_dns(&dns)?;
                 trust::check_ports(&ports)?;
-                let _guard = self.sandbox_locks.lock(&replica).await;
-                let _reservation = self.reserve_uid_base(&replica, uid_base).await?;
-                self.ensure_sandbox(&replica, uid_base, &dns, &ports).await
+                let guard = self.sandbox_locks.lock(&replica).await;
+                let reservation = self.reserve_uid_base(&replica, uid_base).await?;
+                let cri = self.cri.clone();
+                let handler = self.runtime_handler.clone();
+                // The task owns the locks, so a dropped request does not free
+                // the base while the sandbox is still being started.
+                detached(async move {
+                    let _held = (guard, reservation);
+                    Self::ensure_sandbox(cri, handler, replica, uid_base, dns, ports).await
+                })
+                .await
             }
             Request::CreateContainer {
                 replica,
@@ -365,16 +384,23 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_volume_size(kind, size_bytes)?;
                 let volume = VolumeRef::new(&replica, &volume_name)?;
-                let _reservation = self.reserve_uid_base(&replica, uid_base).await?;
-                self.volumes
-                    .ensure(&EnsureVolume {
-                        volume,
-                        kind,
-                        size_bytes,
-                        uid_base,
-                    })
-                    .await?;
-                Ok(Response::Done)
+                let reservation = self.reserve_uid_base(&replica, uid_base).await?;
+                let volumes = Arc::clone(&self.volumes);
+                // As for the sandbox: the mkfs and mount finish, and the
+                // reservation is held, even if the request is dropped.
+                detached(async move {
+                    let _held = reservation;
+                    volumes
+                        .ensure(&EnsureVolume {
+                            volume,
+                            kind,
+                            size_bytes,
+                            uid_base,
+                        })
+                        .await?;
+                    Ok(Response::Done)
+                })
+                .await
             }
             Request::RemoveVolume {
                 replica,
@@ -464,7 +490,7 @@ impl<C: CriClient + Clone> Node<C> {
         &self,
         replica: &ReplicaRef,
         uid_base: u32,
-    ) -> Result<UidReservation<'_>, Fail> {
+    ) -> Result<UidReservation, Fail> {
         let owner = Owner::of(replica);
         let taken = || {
             Fail::new(
@@ -517,20 +543,22 @@ impl<C: CriClient + Clone> Node<C> {
         let mut map = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(uid_base).or_insert_with(|| (owner, 0)).1 += 1;
         Ok(UidReservation {
-            map: &self.reservations,
+            map: Arc::clone(&self.reservations),
             uid_base,
         })
     }
 
+    /// Owns what it needs, so it can run in a task that outlives the request.
     async fn ensure_sandbox(
-        &self,
-        replica: &ReplicaRef,
+        cri: C,
+        runtime_handler: String,
+        replica: ReplicaRef,
         uid_base: u32,
-        dns: &faber_node_protocol::DnsConfig,
-        ports: &[faber_api_types::workload::PortSpec],
+        dns: faber_node_protocol::DnsConfig,
+        ports: Vec<faber_api_types::workload::PortSpec>,
     ) -> Result<Response, Fail> {
-        let existing = self
-            .cri
+        let replica = &replica;
+        let existing = cri
             .list_pod_sandboxes(Some(PodSandboxFilter {
                 label_selector: replica.labels().into_iter().collect(),
                 ..Default::default()
@@ -549,14 +577,11 @@ impl<C: CriClient + Clone> Node<C> {
                 });
             }
             // A sandbox that is no longer ready cannot run containers.
-            self.cri.stop_pod_sandbox(&sandbox.id).await?;
-            self.cri.remove_pod_sandbox(&sandbox.id).await?;
+            cri.stop_pod_sandbox(&sandbox.id).await?;
+            cri.remove_pod_sandbox(&sandbox.id).await?;
         }
-        let config = cri_config::sandbox_config(replica, uid_base, dns, ports);
-        let sandbox_id = self
-            .cri
-            .run_pod_sandbox(config, &self.runtime_handler)
-            .await?;
+        let config = cri_config::sandbox_config(replica, uid_base, &dns, &ports);
+        let sandbox_id = cri.run_pod_sandbox(config, &runtime_handler).await?;
         Ok(Response::Sandbox { sandbox_id })
     }
 

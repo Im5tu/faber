@@ -45,7 +45,7 @@ pub async fn serve_connection<S, C>(
 ) -> Outcome
 where
     S: AsyncRead + AsyncWrite + Unpin + PeerCredentials,
-    C: CriClient + Clone,
+    C: CriClient + Clone + 'static,
 {
     match stream.peer() {
         Ok(peer) if auth.allows(&peer) => {}

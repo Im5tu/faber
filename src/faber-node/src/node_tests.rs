@@ -1201,6 +1201,71 @@ async fn concurrent_requests_for_one_base_let_one_workload_win() {
 }
 
 #[tokio::test]
+async fn the_reservation_is_released_after_a_failure() {
+    let rig = rig();
+    rig.cri.fail_next(
+        "run_pod_sandbox",
+        faber_cri::CriError::Unavailable("down".into()),
+    );
+    let failed = rig.node.handle(sandbox_for(replica(), BASE)).await;
+    assert_eq!(error_code(&failed), Some(ErrorCode::Runtime), "{failed:?}");
+    // Nothing was created and nothing is reserved: another owner may take it.
+    let reply = rig.node.handle(sandbox_for(other_workload(), BASE)).await;
+    assert!(matches!(reply, Response::Sandbox { .. }), "{reply:?}");
+}
+
+#[tokio::test]
+async fn the_reservation_is_released_after_success() {
+    let rig = rig();
+    let id = sandbox(&rig).await;
+    // While the sandbox is ready it is the holder; once it is not, only a
+    // leaked reservation could still refuse another owner.
+    rig.cri.stop_pod_sandbox(&id).await.unwrap();
+    let reply = rig.node.handle(sandbox_for(other_workload(), BASE)).await;
+    assert!(matches!(reply, Response::Sandbox { .. }), "{reply:?}");
+}
+
+#[tokio::test]
+async fn one_owners_concurrent_requests_share_a_base() {
+    let rig = rig();
+    let mut second = replica();
+    second.replica_index = 1;
+    let (a, b, c) = tokio::join!(
+        rig.node.handle(sandbox_for(replica(), BASE)),
+        rig.node.handle(sandbox_for(second.clone(), BASE)),
+        rig.node.handle(volume_for(second, BASE)),
+    );
+    assert!(matches!(a, Response::Sandbox { .. }), "{a:?}");
+    assert!(matches!(b, Response::Sandbox { .. }), "{b:?}");
+    assert_eq!(c, Response::Done);
+}
+
+#[tokio::test]
+async fn a_cancelled_request_keeps_the_base_until_its_work_finishes() {
+    let rig = rig();
+    {
+        let mut request = std::pin::pin!(rig.node.handle(sandbox_for(replica(), BASE)));
+        // Polled once: the sandbox start is under way. Then the caller goes.
+        tokio::select! {
+            biased;
+            _ = &mut request => panic!("the request finished at once"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    // The start has not finished, and the base is still reserved.
+    assert_taken(&rig.node.handle(sandbox_for(other_workload(), BASE)).await);
+    // The work finished anyway, and now the sandbox holds the base.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let Response::Replicas { replicas } = rig.node.handle(Request::ListReplicas).await else {
+        panic!()
+    };
+    assert_eq!(replicas.len(), 1);
+    assert_taken(&rig.node.handle(sandbox_for(other_workload(), BASE)).await);
+}
+
+#[tokio::test]
 async fn a_ramdisk_volume_holds_its_uid_base() {
     let rig = rig();
     let ramdisk = Request::EnsureVolume {
