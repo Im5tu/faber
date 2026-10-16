@@ -1504,12 +1504,17 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     })
     .await;
 
-    // Count what node 2 proposed, in the leader's log, once both are shut
-    // down and the database is free.
+    // Count what node 2 proposed in the logs, once both are shut down and
+    // the databases are free. A leader change while node 2 was down puts the
+    // entry in either log, so the most either holds is the cluster's count.
+    let data = [n1.dir.path().join("data"), n2.dir.path().join("data")];
     n2.stop().await;
-    let data = n1.dir.path().join("data");
     n1.stop().await;
-    assert_eq!(set_endpoint_entries(&data, 2, new_endpoint).await, 1);
+    let mut written = 0;
+    for dir in &data {
+        written = written.max(set_endpoint_entries(dir, 2, new_endpoint).await);
+    }
+    assert_eq!(written, 1);
 }
 
 /// How many `SetEndpoint` entries for node `id` with `endpoint` the log in
