@@ -100,6 +100,27 @@ impl ReplicaLocks {
     }
 }
 
+type UidReservations = std::sync::Mutex<HashMap<u32, (Owner, usize)>>;
+
+/// A `uid_base` reserved for its owner while a create runs. Dropped once the
+/// claim is visible (annotation or marker) or the create failed.
+struct UidReservation<'a> {
+    map: &'a UidReservations,
+    uid_base: u32,
+}
+
+impl Drop for UidReservation<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, count)) = map.get_mut(&self.uid_base) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.uid_base);
+            }
+        }
+    }
+}
+
 /// What the runtime config needs of the host: where it goes, who may own
 /// the directories, and what the host's network looks like.
 pub struct RuntimeHost {
@@ -112,9 +133,12 @@ pub struct RuntimeHost {
 
 pub struct Node<C> {
     sandbox_locks: ReplicaLocks,
-    /// Held from the check that a `uid_base` is free to the create that
-    /// takes it, so two requests cannot both pass the check.
+    /// Held while a `uid_base` is checked and reserved, so two requests
+    /// cannot both pass the check. Not held across the create.
     uid_lock: tokio::sync::Mutex<()>,
+    /// Bases whose create is running, with their owner and how many of that
+    /// owner's requests run: the claim is not yet visible to the check.
+    reservations: UidReservations,
     uid_range: UidRange,
     runtime_handler: String,
     cri: C,
@@ -135,6 +159,7 @@ impl<C: CriClient + Clone> Node<C> {
             runtime,
             sandbox_locks: ReplicaLocks::default(),
             uid_lock: tokio::sync::Mutex::new(()),
+            reservations: UidReservations::default(),
             uid_range,
             runtime_handler,
             images: ImagePuller::new(cri.clone()),
@@ -186,8 +211,7 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_dns(&dns)?;
                 trust::check_ports(&ports)?;
                 let _guard = self.sandbox_locks.lock(&replica).await;
-                let _uid_guard = self.uid_lock.lock().await;
-                self.check_uid_base_free(&replica, uid_base).await?;
+                let _reservation = self.reserve_uid_base(&replica, uid_base).await?;
                 self.ensure_sandbox(&replica, uid_base, &dns, &ports).await
             }
             Request::CreateContainer {
@@ -341,8 +365,7 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_volume_size(kind, size_bytes)?;
                 let volume = VolumeRef::new(&replica, &volume_name)?;
-                let _uid_guard = self.uid_lock.lock().await;
-                self.check_uid_base_free(&replica, uid_base).await?;
+                let _reservation = self.reserve_uid_base(&replica, uid_base).await?;
                 self.volumes
                     .ensure(&EnsureVolume {
                         volume,
@@ -435,8 +458,13 @@ impl<C: CriClient + Clone> Node<C> {
 
     /// A `uid_base` belongs to one workload. It is refused when a ready
     /// sandbox faber made, or a volume marker, holds it for another. Call
-    /// with `uid_lock` held, and keep holding it until the create is done.
-    async fn check_uid_base_free(&self, replica: &ReplicaRef, uid_base: u32) -> Result<(), Fail> {
+    /// On success the base is reserved for the owner until the returned
+    /// guard drops: hold it across the create, which runs outside the lock.
+    async fn reserve_uid_base(
+        &self,
+        replica: &ReplicaRef,
+        uid_base: u32,
+    ) -> Result<UidReservation<'_>, Fail> {
         let owner = Owner::of(replica);
         let taken = || {
             Fail::new(
@@ -444,6 +472,20 @@ impl<C: CriClient + Clone> Node<C> {
                 "the uid_base is already held by another workload",
             )
         };
+        // The lock is held for the check and the reservation only. The
+        // reservations are read before the holders: a request that reserved
+        // earlier and has finished is then seen as a holder, and one still
+        // running is seen as a reservation.
+        let _lock = self.uid_lock.lock().await;
+        if self
+            .reservations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uid_base)
+            .is_some_and(|(held_by, _)| *held_by != owner)
+        {
+            return Err(taken());
+        }
         let sandboxes = self
             .cri
             .list_pod_sandboxes(Some(PodSandboxFilter {
@@ -472,7 +514,12 @@ impl<C: CriClient + Clone> Node<C> {
         {
             return Err(taken());
         }
-        Ok(())
+        let mut map = self.reservations.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(uid_base).or_insert_with(|| (owner, 0)).1 += 1;
+        Ok(UidReservation {
+            map: &self.reservations,
+            uid_base,
+        })
     }
 
     async fn ensure_sandbox(

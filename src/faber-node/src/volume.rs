@@ -961,6 +961,9 @@ pub mod fake {
     impl VolumeManager for FakeVolumes {
         fn ensure<'a>(&'a self, req: &'a EnsureVolume) -> BoxFuture<'a, Result<(), VolumeError>> {
             Box::pin(async move {
+                // A real ensure takes time (mkfs, mount); yielding lets
+                // concurrent callers interleave before the volume exists.
+                tokio::task::yield_now().await;
                 self.volumes.lock().unwrap().insert(
                     Self::key(&req.volume),
                     (req.kind, req.size_bytes, req.uid_base),
@@ -1402,6 +1405,25 @@ mod tests {
         assert!(matches!(err, VolumeError::Command { .. }));
         assert!(!h.root.join("shop/prod/redis/1/data/disk.img").exists());
         assert!(!h.root.join("shop/prod/redis/1/data/disk.img.new").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_ensure_still_holds_its_uid_base_through_the_marker() {
+        let h = harness();
+        // The mount fails after the marker is written and the image made.
+        h.runner.script(
+            "/usr/bin/mount",
+            None,
+            CommandOutput::failure(32, "no loop device"),
+        );
+        h.volumes
+            .ensure(&req(VolumeKind::Block, 8 << 20))
+            .await
+            .unwrap_err();
+        let holders = h.volumes.uid_holders().await.unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].uid_base, 131072);
+        assert_eq!(holders[0].owner, Owner::of(&replica()));
     }
 
     #[tokio::test]

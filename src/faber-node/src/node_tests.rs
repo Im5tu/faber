@@ -1199,3 +1199,17 @@ async fn concurrent_requests_for_one_base_let_one_workload_win() {
         .count();
     assert_eq!(won, 1, "{a:?} {b:?}");
 }
+
+#[tokio::test]
+async fn a_ramdisk_volume_holds_its_uid_base() {
+    let rig = rig();
+    let ramdisk = Request::EnsureVolume {
+        replica: replica(),
+        volume_name: "scratch".into(),
+        kind: VolumeKind::Ramdisk,
+        size_bytes: 8 << 20,
+        uid_base: BASE,
+    };
+    assert_eq!(rig.node.handle(ramdisk).await, Response::Done);
+    assert_taken(&rig.node.handle(sandbox_for(other_workload(), BASE)).await);
+}
