@@ -234,7 +234,8 @@ impl MeshState {
     ///
     /// When `config.service_cidr` is set, also rejects with `bad_request`
     /// when the range has host bits set, is longer than
-    /// [`MAX_SERVICE_CIDR_PREFIX`], or overlaps `config.cidr` or
+    /// [`MAX_SERVICE_CIDR_PREFIX`], overlaps a reserved range (see
+    /// `faber_node_protocol::RESERVED`), or overlaps `config.cidr` or
     /// `config.container_cidr`.
     ///
     /// The founder's container subnet is allocated here: the first subnet of
@@ -861,6 +862,14 @@ fn check_service_range(config: &MeshConfig, range: Ipv4Net) -> Result<(), Reject
         return Err(bad(format!(
             "service range {range} has host bits set; did you mean {}?",
             range.trunc()
+        )));
+    }
+    if let Some(reserved) = faber_node_protocol::RESERVED
+        .iter()
+        .find(|r| overlap(range, **r))
+    {
+        return Err(bad(format!(
+            "service range {range} overlaps the reserved range {reserved}"
         )));
     }
     if overlap(range, config.cidr) {
@@ -1560,6 +1569,11 @@ mod tests {
             ("10.200.0.0/16", "same as the containers"),
             ("10.200.5.0/24", "inside the containers"),
             ("10.192.0.0/10", "contains the containers"),
+            ("127.0.0.0/24", "loopback"),
+            ("169.254.1.0/24", "link-local"),
+            ("239.1.0.0/16", "multicast"),
+            ("240.0.0.0/4", "class E"),
+            ("0.0.0.0/8", "this network"),
         ] {
             let err =
                 MeshState::init(cfg_with_service_range(range), node(1, "10.99.0.1")).unwrap_err();

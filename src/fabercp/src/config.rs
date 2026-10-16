@@ -293,7 +293,8 @@ impl Config {
     }
 
     /// `--service-cidr` as a new mesh needs it: at least two hosts, without
-    /// host bits, and apart from `--mesh-cidr` and `--container-cidr`. The
+    /// host bits, apart from the reserved ranges, and apart from
+    /// `--mesh-cidr` and `--container-cidr`. The
     /// founder's `InitCluster` is rejected for the same reasons, so the check
     /// is made before anything starts, as for `--container-cidr`. The default
     /// is checked too: a mesh or container range that contains it needs
