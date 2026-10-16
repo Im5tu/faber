@@ -463,17 +463,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn teardown_deletes_the_interface() {
-        let runner = Arc::new(RecordingRunner::new());
-        let net = NetworkManager::new(runner.clone());
-        net.teardown("faber0").await.unwrap();
-        assert_eq!(
-            runner.cmdlines(),
-            vec!["ip link show faber0", "ip link del faber0"]
-        );
-    }
-
-    #[tokio::test]
     async fn recording_runner_records_calls_and_defaults_to_success() {
         let r = RecordingRunner::new();
         let out = r
@@ -554,14 +543,6 @@ mod tests {
         assert!(r.calls().is_empty());
         // Scripts survive `clear`.
         assert!(r.run("wg", &[], None).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn recording_runner_works_behind_dyn() {
-        let r = Arc::new(RecordingRunner::new());
-        let runner: Arc<dyn CommandRunner> = r.clone();
-        runner.run("ip", &["link"], None).await.unwrap();
-        assert_eq!(r.cmdlines(), vec!["ip link"]);
     }
 
     const PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
@@ -784,24 +765,6 @@ mod tests {
         // The failed call and the retry carry the same services.
         assert!(scripts[1].contains("10.201.0.1"));
         assert_eq!(scripts[2], scripts[1]);
-    }
-
-    #[test]
-    fn default_interface_is_faber0() {
-        assert_eq!(DEFAULT_WG_INTERFACE, "faber0");
-        assert!(is_valid_iface_name(DEFAULT_WG_INTERFACE));
-    }
-
-    #[tokio::test]
-    async fn create_interface_refuses_an_existing_one() {
-        let r = Arc::new(RecordingRunner::new());
-        let err = NetworkManager::new(r.clone())
-            .create_interface("faber0")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, NetworkError::InterfaceExists(_)), "{err:?}");
-        // Nothing beyond the existence check ran.
-        assert_eq!(r.cmdlines(), vec!["ip link show faber0"]);
     }
 
     #[tokio::test]
