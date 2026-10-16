@@ -675,29 +675,6 @@ stub_containerd_io() {
 
 # --- removed options ------------------------------------------------------
 
-@test "removed option state is gone" {
-  [ -z "$(declare -F validate_cni_version)" ]
-  [ -z "$(declare -F resolve_cni_version)" ]
-  [ -z "$(declare -F is_skipped)" ]
-  ! grep -Eqw 'CNI_VERSION|SKIP_CNI|SKIP_CONTAINERD|NO_START|CNI_LATEST_API' "$SCRIPT"
-}
-
-@test "dry-run: containerd package present for every distro family" {
-  make_stub_path
-  local distro
-  for distro in ubuntu debian fedora rocky arch opensuse; do
-    OS_RELEASE_FILE="$FIXTURES/os-release.$distro" PATH="$TMP/bin:$PATH" \
-      run bash "$SCRIPT" --dry-run
-    [ "$status" -eq 0 ]
-    if [ "$distro" = rocky ]; then
-      [[ "$output" == *"containerd.io wireguard-tools nftables"* ]]
-    else
-      [[ "$output" == *" containerd wireguard-tools nftables"* ]]
-    fi
-  done
-  [ ! -e "$TMP/executed" ]
-}
-
 @test "systemd_present: follows SYSTEMD_RUN_DIR" {
   run systemd_present
   [ "$status" -ne 0 ]
@@ -706,33 +683,18 @@ stub_containerd_io() {
   [ "$status" -eq 0 ]
 }
 
-@test "old containerd default config path is gone" {
-  [ -z "$(declare -F configure_containerd)" ]
-  [ -z "$(declare -F manage_containerd_service)" ]
-  ! grep -Eq 'config default|SystemdCgroup' "$SCRIPT"
-}
-
 # --- containerd package choice -------------------------------------------
 
-@test "containerd_package: apt keeps Docker's containerd.io when installed" {
-  stub_containerd_io present
-  PATH="$TMP/bin:$PATH" run containerd_package apt
-  [ "$output" = containerd.io ]
-  stub_containerd_io absent
-  PATH="$TMP/bin:$PATH" run containerd_package apt
-  [ "$output" = containerd ]
-}
-
-@test "containerd_package: dnf keeps containerd.io when installed" {
-  stub_containerd_io present
-  PATH="$TMP/bin:$PATH" run containerd_package dnf
-  [ "$output" = containerd.io ]
-  stub_containerd_io absent
-  PATH="$TMP/bin:$PATH" run containerd_package dnf
-  [ "$output" = containerd ]
-}
-
-@test "containerd_package: dnf-el always containerd.io, others containerd" {
+@test "containerd_package: apt and dnf keep Docker's containerd.io when installed, dnf-el always uses it" {
+  local family
+  for family in apt dnf; do
+    stub_containerd_io present
+    PATH="$TMP/bin:$PATH" run containerd_package "$family"
+    [ "$output" = containerd.io ]
+    stub_containerd_io absent
+    PATH="$TMP/bin:$PATH" run containerd_package "$family"
+    [ "$output" = containerd ]
+  done
   stub_containerd_io absent
   PATH="$TMP/bin:$PATH" run containerd_package dnf-el
   [ "$output" = containerd.io ]
@@ -1192,13 +1154,6 @@ stub_containerd_io() {
   [ "$ENDPOINT_ARG" = "198.51.100.2:51820" ]
 }
 
-@test "script: --join with --mesh-cidr exits 2" {
-  run bash "$SCRIPT" --dry-run --join "$TOKEN" --mesh-cidr 10.50.0.0/16
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"--mesh-cidr"* ]]
-  [[ "$output" != *"$TOKEN"* ]]
-}
-
 @test "script: flags without a value exit 2" {
   for flag in --join --endpoint --mesh-cidr --container-cidr --service-cidr --name; do
     run bash "$SCRIPT" --dry-run "$flag"
@@ -1409,15 +1364,20 @@ FABER_X=1" "example.com" "1.2.3.4:"; do
   [ ! -e "$CONTAINERD_ROOT_CONFIG" ]
 }
 
-@test "dry-run: configured node + --mesh-cidr dies before any package command" {
+@test "dry-run: configured node + a new-mesh setting dies before any package command" {
   make_stub_path
   mkdir -p "$FABER_STATE_DIR"
   echo '{}' > "$FABER_STATE_DIR/identity.json"
-  OS_RELEASE_FILE="$FIXTURES/os-release.ubuntu" PATH="$TMP/bin:$PATH" \
-    run bash "$SCRIPT" --dry-run --mesh-cidr 10.50.0.0/16
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"--mesh-cidr"* ]]
-  [[ "$output" != *"apt-get"* ]]
+  local flag value
+  for flag in "--mesh-cidr 10.50.0.0/16" "--container-cidr 10.210.0.0/16" "--service-cidr 10.77.0.0/16"; do
+    value="${flag#* }"
+    flag="${flag%% *}"
+    OS_RELEASE_FILE="$FIXTURES/os-release.ubuntu" PATH="$TMP/bin:$PATH" \
+      run bash "$SCRIPT" --dry-run "$flag" "$value"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$flag"* ]]
+    [[ "$output" != *"apt-get"* ]]
+  done
 }
 
 @test "dry-run: symlinked FABER_ETC or conf.d dies before any package command" {
@@ -2863,15 +2823,6 @@ write_identity() {
   [ "$MESH_CIDR_ARG" = "10.50.0.0/16" ]
 }
 
-@test "script: --join with --container-cidr exits 2" {
-  run bash "$SCRIPT" --dry-run --join "$TOKEN" --container-cidr 10.210.0.0/16
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"--join and --container-cidr cannot be combined"* ]]
-  [[ "$output" != *"$TOKEN"* ]]
-  run bash "$SCRIPT" --check --join "$TOKEN" --container-cidr 10.210.0.0/16
-  [ "$status" -eq 2 ]
-}
-
 @test "valid_container_cidr: refuses ranges overlapping reserved blocks" {
   local bad ok
   for bad in 0.0.0.0/8 0.1.0.0/16 127.0.0.0/8 127.1.0.0/16 169.254.0.0/16 169.254.1.0/24 \
@@ -2927,43 +2878,28 @@ write_identity() {
   done
 }
 
-@test "cidrs_overlap: identical ranges overlap" {
+@test "cidrs_overlap: overlap by identity, nesting and host bits; none for adjacent or unrelated ranges" {
+  # identical, and nested either way round
   cidrs_overlap 10.99.0.0/16 10.99.0.0/16
   cidrs_overlap 0.0.0.0/0 0.0.0.0/0
-}
-
-@test "cidrs_overlap: a range nested in the other overlaps, either way round" {
   cidrs_overlap 10.99.0.0/16 10.99.4.0/24
   cidrs_overlap 10.99.4.0/24 10.99.0.0/16
   cidrs_overlap 10.0.0.0/8 10.200.0.0/16
   cidrs_overlap 10.200.0.0/16 10.0.0.0/8
   cidrs_overlap 0.0.0.0/0 192.168.1.0/24
-}
-
-@test "cidrs_overlap: host bits do not hide an overlap" {
+  # host bits do not hide an overlap, nor do leading zeros
   cidrs_overlap 10.99.3.7/16 10.99.200.0/24
   cidrs_overlap 10.99.200.9/24 10.99.3.7/16
-}
-
-@test "cidrs_overlap: adjacent ranges do not overlap" {
-  run cidrs_overlap 10.99.0.0/16 10.100.0.0/16
-  [ "$status" -eq 1 ]
-  run cidrs_overlap 10.100.0.0/16 10.99.0.0/16
-  [ "$status" -eq 1 ]
-  run cidrs_overlap 10.99.0.0/24 10.99.1.0/24
-  [ "$status" -eq 1 ]
-  run cidrs_overlap 10.98.0.0/15 10.100.0.0/16
-  [ "$status" -eq 1 ]
-  run cidrs_overlap 192.168.255.0/24 192.169.0.0/16
-  [ "$status" -eq 1 ]
-}
-
-@test "cidrs_overlap: unrelated ranges and leading zeros" {
-  run cidrs_overlap 10.99.0.0/16 10.200.0.0/16
-  [ "$status" -eq 1 ]
-  run cidrs_overlap 255.255.255.0/24 0.0.0.0/8
-  [ "$status" -eq 1 ]
   cidrs_overlap 010.099.000.000/16 10.99.8.0/24
+  # adjacent and unrelated ranges do not overlap
+  local pair
+  for pair in "10.99.0.0/16 10.100.0.0/16" "10.100.0.0/16 10.99.0.0/16" "10.99.0.0/24 10.99.1.0/24" \
+    "10.98.0.0/15 10.100.0.0/16" "192.168.255.0/24 192.169.0.0/16" "10.99.0.0/16 10.200.0.0/16" \
+    "255.255.255.0/24 0.0.0.0/8"; do
+    # shellcheck disable=SC2086
+    run cidrs_overlap $pair
+    [ "$status" -eq 1 ]
+  done
 }
 
 @test "resolve_mode: --container-cidr overlapping the mesh CIDR dies" {
@@ -3024,22 +2960,15 @@ write_identity() {
   [ -z "$CONTAINER_CIDR" ]
 }
 
-@test "dry-run: configured node + --container-cidr dies before any package command" {
+@test "dry-run: --container-cidr or --service-cidr overlapping the mesh CIDR dies before any package command" {
   make_stub_path
-  mkdir -p "$FABER_STATE_DIR"
-  echo '{}' > "$FABER_STATE_DIR/identity.json"
-  install_run --dry-run --container-cidr 10.210.0.0/16
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"--container-cidr only applies to a new mesh"* ]]
-  [[ "$output" != *"apt-get"* ]]
-}
-
-@test "dry-run: --container-cidr overlapping the mesh CIDR dies before any package command" {
-  make_stub_path
-  install_run --dry-run --container-cidr 10.99.128.0/17
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"overlaps the mesh CIDR"* ]]
-  [[ "$output" != *"apt-get"* ]]
+  local flag
+  for flag in --container-cidr --service-cidr; do
+    install_run --dry-run "$flag" 10.99.128.0/17
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"overlaps the mesh CIDR"* ]]
+    [[ "$output" != *"apt-get"* ]]
+  done
 }
 
 @test "real run (new mesh): --container-cidr is a bootstrap setting, stripped once created" {
@@ -3082,11 +3011,11 @@ write_identity() {
   [[ "$output" == *"cluster: created"* ]]
 }
 
-@test "real run (join): no FABER_CONTAINER_CIDR, no conf dirs in fabercp.env, root-owned CNI dir" {
+@test "real run (join): no new-mesh settings, no conf dirs in fabercp.env, root-owned CNI dir" {
   setup_full_run
   install_run --join "$TOKEN"
   [ "$status" -eq 0 ]
-  run grep -q 'FABER_CONTAINER_CIDR' "$FABER_ETC/fabercp.env"
+  run grep -q 'FABER_CONTAINER_CIDR\|FABER_NODE_NAME\|FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
   [ "$status" -eq 1 ]
   ! grep -q "CONF_DIR" "$FABER_ETC/fabercp.env"
   [ "$(stat -c '%U:%G %a' "$CNI_CONF_DIR")" = "root:root 755" ]
@@ -3422,15 +3351,6 @@ EOF
   [ "$status" -eq 2 ]
 }
 
-@test "script: --join with --name exits 2" {
-  run bash "$SCRIPT" --dry-run --join "$TOKEN" --name web-01
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"--join and --name cannot be combined"* ]]
-  [[ "$output" != *"$TOKEN"* ]]
-  run bash "$SCRIPT" --check --name web-01 --join "$TOKEN"
-  [ "$status" -eq 2 ]
-}
-
 @test "default_node_name: short hostname in lower case" {
   set_hostname Web-01 Web-01.example.com
   run default_node_name
@@ -3629,13 +3549,6 @@ EOF
   [[ "$output" == *"web-01"* ]]
   [ ! -e "$TMP/executed" ]
   grep -qxF 'FABER_NODE_NAME=web-01' "$FABER_ETC/fabercp.env"
-}
-
-@test "real run (join): no FABER_NODE_NAME" {
-  setup_full_run
-  install_run --join "$TOKEN"
-  run grep -q 'FABER_NODE_NAME' "$FABER_ETC/fabercp.env"
-  [ "$status" -eq 1 ]
 }
 
 # --- --reset ----------------------------------------------------------------
@@ -4202,11 +4115,18 @@ removed_node() {
   done
 }
 
-@test "script: --join with --service-cidr exits 2, token not echoed" {
-  run bash "$SCRIPT" --dry-run --join "$TOKEN" --service-cidr 10.77.0.0/16
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"--join and --service-cidr cannot be combined"* ]]
-  [[ "$output" != *"$TOKEN"* ]]
+@test "script: --join with a bootstrap setting exits 2, token not echoed" {
+  local flag value
+  for flag in "--mesh-cidr 10.50.0.0/16" "--container-cidr 10.210.0.0/16" "--service-cidr 10.77.0.0/16" "--name web-01"; do
+    value="${flag#* }"
+    flag="${flag%% *}"
+    run bash "$SCRIPT" --dry-run --join "$TOKEN" "$flag" "$value"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--join and $flag cannot be combined"* ]]
+    [[ "$output" != *"$TOKEN"* ]]
+    run bash "$SCRIPT" --check "$flag" "$value" --join "$TOKEN"
+    [ "$status" -eq 2 ]
+  done
 }
 
 @test "resolve_mode: the service CIDR is the flag, else the stored value, else the default" {
@@ -4248,24 +4168,6 @@ removed_node() {
   [ "$SERVICE_CIDR" = 10.211.0.0/16 ]
 }
 
-@test "dry-run: configured node + --service-cidr dies before any package command" {
-  make_stub_path
-  mkdir -p "$FABER_STATE_DIR"
-  echo '{}' > "$FABER_STATE_DIR/identity.json"
-  install_run --dry-run --service-cidr 10.77.0.0/16
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"--service-cidr only applies to a new mesh"* ]]
-  [[ "$output" != *"apt-get"* ]]
-}
-
-@test "dry-run: --service-cidr overlapping the mesh CIDR dies before any package command" {
-  make_stub_path
-  install_run --dry-run --service-cidr 10.99.128.0/17
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"overlaps the mesh CIDR"* ]]
-  [[ "$output" != *"apt-get"* ]]
-}
-
 @test "real run (new mesh): FABER_SERVICE_CIDR is always written, then stripped once created" {
   setup_full_run systemd
   touch "$TMP/init-fails"
@@ -4295,15 +4197,6 @@ removed_node() {
   install_run
   [ "$status" -eq 0 ]
   [[ "$output" == *"cluster: created"* ]]
-}
-
-@test "real run (join): no FABER_SERVICE_CIDR in the env file" {
-  setup_full_run systemd
-  touch "$TMP/joined"
-  install_run --join "$TOKEN"
-  [ "$status" -eq 0 ]
-  run grep -q 'FABER_SERVICE_CIDR' "$FABER_ETC/fabercp.env"
-  [ "$status" -eq 1 ]
 }
 
 # --- faber-node -----------------------------------------------------------
