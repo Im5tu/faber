@@ -369,7 +369,7 @@ impl FaberService {
         };
 
         let bytes = self
-            .post_peer(&leader_addr, "/raft/cluster/workloads", &req, true)
+            .post_leader(&leader_addr, "/raft/cluster/workloads", &req)
             .await?;
         let resp: PeerWorkloadResponse = serde_json::from_slice(&bytes).map_err(|e| {
             ServiceError::Internal(format!("bad workload response from {leader_addr}: {e}"))

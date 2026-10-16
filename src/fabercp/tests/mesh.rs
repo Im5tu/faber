@@ -1532,6 +1532,36 @@ async fn a_write_forwarded_to_a_stopped_leader_is_no_leader() {
     n2.stop().await;
 }
 
+/// A workload write goes the same way: a deploy forwarded to a stopped
+/// leader is 503 `no_leader`, not 502.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workload_write_forwarded_to_a_stopped_leader_is_no_leader() {
+    use faber_api_types::workload::{CreateProjectRequest, DeployRequest, WorkloadSpec};
+
+    let (mut n1, mut n2, _) = two_nodes().await;
+    let project = CreateProjectRequest {
+        name: "shop".into(),
+        environments: None,
+    };
+    n2.client().project_create(&project).await.unwrap();
+    n1.stop().await;
+    let web: WorkloadSpec = serde_json::from_value(
+        serde_json::json!({"containers": [{"name": "main", "image": "nginx:1.27"}]}),
+    )
+    .unwrap();
+    let req = DeployRequest {
+        workloads: [("web".to_string(), web)].into(),
+        prune: false,
+    };
+    match n2.client().deploy("shop", "staging", &req).await {
+        Err(ClientError::Api { status, body }) => {
+            assert_eq!((status, body.error.as_str()), (503, "no_leader"));
+        }
+        other => panic!("expected 503 no_leader, got {other:?}"),
+    }
+    n2.stop().await;
+}
+
 /// How many `SetEndpoint` entries for node `id` with `endpoint` the log in
 /// the data directory `data` holds. The node must not be running.
 async fn set_endpoint_entries(data: &Path, id: u64, endpoint: &str) -> usize {
