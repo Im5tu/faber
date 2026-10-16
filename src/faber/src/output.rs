@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use clap::ValueEnum;
+use zeroize::Zeroizing;
 use faber_api_types::workload::{
     ContainerSpec, DeployResponse, Exposure, HttpScheme, MountSpec, PortSpec, Probe, ProbeAction,
     ProjectListResponse, ProjectResponse, Protocol, Resources, RestartPolicy, Scale, Strategy,
@@ -292,11 +293,28 @@ pub fn status_interval(format: OutputFormat, i: &StatusIntervalResponse) -> Resu
 
 /// `cluster key export`: the key alone in text, so `$(faber cluster key
 /// export)` captures it.
-pub fn cluster_key(format: OutputFormat, key: &str) -> Result<String> {
+///
+/// The output is built in one zeroizing buffer sized up front, so no plain
+/// copy of the key is made or left behind by a regrow. Canonical base64 has
+/// nothing to escape in JSON.
+pub fn cluster_key(format: OutputFormat, key: &str) -> Result<Zeroizing<String>> {
+    const JSON_HEAD: &str = "{\n  \"cluster_key\": \"";
+    const JSON_TAIL: &str = "\"\n}\n";
+    let mut out = Zeroizing::new(String::with_capacity(
+        JSON_HEAD.len() + key.len() + JSON_TAIL.len(),
+    ));
     match format {
-        OutputFormat::Json => pretty(&serde_json::json!({"cluster_key": key})),
-        OutputFormat::Text => Ok(format!("{key}\n")),
+        OutputFormat::Json => {
+            out.push_str(JSON_HEAD);
+            out.push_str(key);
+            out.push_str(JSON_TAIL);
+        }
+        OutputFormat::Text => {
+            out.push_str(key);
+            out.push('\n');
+        }
     }
+    Ok(out)
 }
 
 /// Names from the API separated by commas, or `-` for none.
@@ -786,6 +804,14 @@ pub fn dry_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_key_output_is_zeroized_and_keeps_its_shape() {
+        let text: zeroize::Zeroizing<String> = cluster_key(OutputFormat::Text, "abc=").unwrap();
+        assert_eq!(*text, "abc=\n");
+        let json: zeroize::Zeroizing<String> = cluster_key(OutputFormat::Json, "abc=").unwrap();
+        assert_eq!(*json, "{\n  \"cluster_key\": \"abc=\"\n}\n");
+    }
 
     #[test]
     fn esc_replaces_control_characters_and_nothing_else() {

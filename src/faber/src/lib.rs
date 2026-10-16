@@ -526,7 +526,8 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 /// The key in `path` as canonical base64. The path must be a regular file
 /// and not a symlink, at most [`MAX_KEY_FILE_BYTES`] long, and hold the
 /// base64 of a whole key. No error here carries any of the file's content.
-async fn read_key(path: &std::path::Path) -> anyhow::Result<String> {
+/// The key stays in zeroizing buffers from the read on.
+async fn read_key(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
     use tokio::io::AsyncReadExt;
 
     let shown = output::esc(&path.display().to_string());
@@ -549,16 +550,19 @@ async fn read_key(path: &std::path::Path) -> anyhow::Result<String> {
     if !opened.is_file() || !same_file(&meta, &opened) {
         bail!("the cluster key file {shown} is not a regular file");
     }
-    let mut bytes = Vec::new();
+    // Sized for the longest read, so the buffer never regrows and leaves a
+    // plain copy of the key behind.
+    let cap = MAX_KEY_FILE_BYTES + 1;
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(cap as usize));
     // One byte over the cap tells a long file from one of exactly the cap.
-    file.take(MAX_KEY_FILE_BYTES + 1)
+    file.take(cap)
         .read_to_end(&mut bytes)
         .await
         .map_err(unreadable)?;
     if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
         bail!("the cluster key file {shown} is too large (over {MAX_KEY_FILE_BYTES} bytes)");
     }
-    let text = std::str::from_utf8(&bytes)
+    let text = std::str::from_utf8(&bytes[..])
         .map_err(|_| anyhow!("the cluster key file {shown} does not hold a valid cluster key"))?
         .trim();
     if text.is_empty() {
@@ -566,7 +570,7 @@ async fn read_key(path: &std::path::Path) -> anyhow::Result<String> {
     }
     let key = faber_crypto::ClusterKey::from_base64(text)
         .map_err(|_| anyhow!("the cluster key file {shown} does not hold a valid cluster key"))?;
-    Ok(key.to_base64().to_string())
+    Ok(key.to_base64())
 }
 
 /// Turns a client error into a message a person can act on.
