@@ -27,6 +27,7 @@ impl fmt::Debug for RegistryCredentials {
     }
 }
 
+/// The generated [`AuthConfig`] is plain prost and is not zeroized, nor is the request that carries it.
 impl From<RegistryCredentials> for AuthConfig {
     fn from(mut c: RegistryCredentials) -> Self {
         // Taken, not moved: the type zeroizes on drop, so the emptied fields

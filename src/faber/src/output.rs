@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use clap::ValueEnum;
-use zeroize::Zeroizing;
 use faber_api_types::workload::{
     ContainerSpec, DeployResponse, Exposure, HttpScheme, MountSpec, PortSpec, Probe, ProbeAction,
     ProjectListResponse, ProjectResponse, Protocol, Resources, RestartPolicy, Scale, Strategy,
@@ -16,6 +15,7 @@ use faber_api_types::{
     ClusterStatus, HealthResponse, InviteResponse, LeaseResponse, StatusIntervalResponse,
 };
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::deploy::Diagnostic;
 

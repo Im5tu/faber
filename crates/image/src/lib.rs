@@ -87,7 +87,11 @@ impl Drop for InFlight<'_> {
         // Callers clone the Arc under the map lock, so a count of 2 (map and
         // ours) means no one else holds or waits on the entry.
         let mut entries = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if Arc::strong_count(&self.lock) == 2 {
+        if Arc::strong_count(&self.lock) == 2
+            && entries
+                .get(self.image)
+                .is_some_and(|e| Arc::ptr_eq(e, &self.lock))
+        {
             entries.remove(self.image);
         }
     }
