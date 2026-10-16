@@ -1356,8 +1356,18 @@ mesh_intact_checks() {
   out="$(dx "$NODE_A" "curl -sS --max-time 5 http://$MESH_B:$PEER_PORT/api/v1/health")"
   assert_has "$t: $MESH_B:$PEER_PORT answers as node 2" "$out" '"node_id":2'
   # A write: an invite that expires at once (token discarded).
-  docker exec "$NODE_A" faber mesh invite --name e2e-probe --wg-endpoint 198.51.100.77 --ttl 3s >/dev/null 2>&1
-  rc=$?
+  # A leader election may still be settling (a write then answers 503
+  # no_leader and the CLI does not retry), so try for up to 30 s, with a
+  # new name per attempt.
+  local deadline=$((SECONDS + 30)) n=0
+  while :; do
+    n=$((n + 1))
+    out="$(docker exec "$NODE_A" faber mesh invite --name "e2e-probe-$n" --wg-endpoint 198.51.100.77 --ttl 3s 2>&1 >/dev/null)"
+    rc=$?
+    ((rc == 0 || SECONDS >= deadline)) && break
+    sleep 1
+  done
+  ((rc == 0)) || evidence "$out"
   assert_ok "$t: writes still work (another 'faber mesh invite' succeeds)" "$rc"
   out="$(dx "$NODE_A" 'faber health')"
   assert_has "$t: faber health on $NODE_A is ok" "$out" '^status: +ok$'
