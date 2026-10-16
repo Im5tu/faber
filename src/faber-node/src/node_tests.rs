@@ -1064,3 +1064,138 @@ async fn a_loose_plugin_file_stops_every_write() {
     // Nothing new was written: only the drop-in from the first call.
     assert_eq!(rig.files(), [format!("conf.d/{DROP_IN_FILE}")]);
 }
+
+fn other_workload() -> ReplicaRef {
+    ReplicaRef {
+        workload: "web".into(),
+        ..replica()
+    }
+}
+
+fn sandbox_for(replica: ReplicaRef, uid_base: u32) -> Request {
+    Request::EnsureSandbox {
+        replica,
+        uid_base,
+        dns: dns(),
+        ports: vec![],
+    }
+}
+
+fn volume_for(replica: ReplicaRef, uid_base: u32) -> Request {
+    Request::EnsureVolume {
+        replica,
+        volume_name: "data".into(),
+        kind: VolumeKind::Block,
+        size_bytes: 8 << 20,
+        uid_base,
+    }
+}
+
+const TAKEN: &str = "the uid_base is already held by another workload";
+
+fn assert_taken(r: &Response) {
+    assert!(
+        matches!(r, Response::Error { code: ErrorCode::Forbidden, message } if message == TAKEN),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_uid_base_held_by_a_sandbox_is_refused_to_another_workload() {
+    let rig = rig();
+    sandbox(&rig).await;
+    assert_taken(&rig.node.handle(sandbox_for(other_workload(), BASE)).await);
+    assert_taken(&rig.node.handle(volume_for(other_workload(), BASE)).await);
+    // Another env is another owner too.
+    let mut other_env = replica();
+    other_env.env = "dev".into();
+    assert_taken(&rig.node.handle(sandbox_for(other_env, BASE)).await);
+    // A different base is free.
+    let free = rig
+        .node
+        .handle(sandbox_for(other_workload(), BASE + 65536))
+        .await;
+    assert!(matches!(free, Response::Sandbox { .. }), "{free:?}");
+    assert!(rig.volumes.ensured().is_empty());
+}
+
+#[tokio::test]
+async fn a_uid_base_held_by_a_volume_marker_is_refused_to_another_workload() {
+    let rig = rig();
+    assert_eq!(
+        rig.node.handle(volume_for(replica(), BASE)).await,
+        Response::Done
+    );
+    assert_taken(&rig.node.handle(sandbox_for(other_workload(), BASE)).await);
+    assert_taken(&rig.node.handle(volume_for(other_workload(), BASE)).await);
+    // Removing the volume frees the base.
+    let removed = rig
+        .node
+        .handle(Request::RemoveVolume {
+            replica: replica(),
+            volume_name: "data".into(),
+        })
+        .await;
+    assert_eq!(removed, Response::Done);
+    let reply = rig.node.handle(sandbox_for(other_workload(), BASE)).await;
+    assert!(matches!(reply, Response::Sandbox { .. }), "{reply:?}");
+}
+
+#[tokio::test]
+async fn revisions_and_replicas_of_one_workload_share_a_uid_base() {
+    let rig = rig();
+    sandbox(&rig).await;
+    let mut next = replica();
+    next.revision = "ffffffff".into();
+    next.replica_index = 1;
+    let reply = rig.node.handle(sandbox_for(next.clone(), BASE)).await;
+    assert!(matches!(reply, Response::Sandbox { .. }), "{reply:?}");
+    assert_eq!(
+        rig.node.handle(volume_for(next, BASE)).await,
+        Response::Done
+    );
+    assert_eq!(
+        rig.node.handle(volume_for(replica(), BASE)).await,
+        Response::Done
+    );
+}
+
+#[tokio::test]
+async fn a_sandbox_that_is_not_ready_holds_nothing() {
+    let rig = rig();
+    let id = sandbox(&rig).await;
+    rig.cri.stop_pod_sandbox(&id).await.unwrap();
+    let reply = rig.node.handle(sandbox_for(other_workload(), BASE)).await;
+    assert!(matches!(reply, Response::Sandbox { .. }), "{reply:?}");
+}
+
+#[tokio::test]
+async fn concurrent_requests_for_one_base_let_one_workload_win() {
+    let rig = rig();
+    let (a, b) = tokio::join!(
+        rig.node.handle(sandbox_for(replica(), BASE)),
+        rig.node.handle(sandbox_for(other_workload(), BASE)),
+    );
+    let won = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Response::Sandbox { .. }))
+        .count();
+    assert_eq!(won, 1, "{a:?} {b:?}");
+    assert_taken(if matches!(a, Response::Sandbox { .. }) {
+        &b
+    } else {
+        &a
+    });
+
+    // A volume racing a sandbox of another workload on a fresh base.
+    let base = BASE + 65536;
+    let (a, b) = tokio::join!(
+        rig.node.handle(volume_for(replica(), base)),
+        rig.node.handle(sandbox_for(other_workload(), base)),
+    );
+    let won = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Response::Done | Response::Sandbox { .. }))
+        .count();
+    assert_eq!(won, 1, "{a:?} {b:?}");
+}

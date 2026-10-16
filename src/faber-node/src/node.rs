@@ -22,7 +22,7 @@ use crate::cri_config::{self, ANNOTATION_SPEC_HASH, ANNOTATION_UID_BASE, Resolve
 use crate::dirs::DirPolicy;
 use crate::host_net::{HostNetworks, check_subnet_free};
 use crate::trust;
-use crate::volume::{EnsureVolume, VolumeError, VolumeManager, VolumeRef};
+use crate::volume::{EnsureVolume, Owner, VolumeError, VolumeManager, VolumeRef};
 
 /// A failed request, ready to be sent as an error response. A local type so
 /// the runtime and volume errors convert with `?`.
@@ -112,6 +112,9 @@ pub struct RuntimeHost {
 
 pub struct Node<C> {
     sandbox_locks: ReplicaLocks,
+    /// Held from the check that a `uid_base` is free to the create that
+    /// takes it, so two requests cannot both pass the check.
+    uid_lock: tokio::sync::Mutex<()>,
     uid_range: UidRange,
     runtime_handler: String,
     cri: C,
@@ -131,6 +134,7 @@ impl<C: CriClient + Clone> Node<C> {
         Self {
             runtime,
             sandbox_locks: ReplicaLocks::default(),
+            uid_lock: tokio::sync::Mutex::new(()),
             uid_range,
             runtime_handler,
             images: ImagePuller::new(cri.clone()),
@@ -182,6 +186,8 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_dns(&dns)?;
                 trust::check_ports(&ports)?;
                 let _guard = self.sandbox_locks.lock(&replica).await;
+                let _uid_guard = self.uid_lock.lock().await;
+                self.check_uid_base_free(&replica, uid_base).await?;
                 self.ensure_sandbox(&replica, uid_base, &dns, &ports).await
             }
             Request::CreateContainer {
@@ -335,6 +341,8 @@ impl<C: CriClient + Clone> Node<C> {
                 trust::check_uid_base(&self.uid_range, uid_base)?;
                 trust::check_volume_size(kind, size_bytes)?;
                 let volume = VolumeRef::new(&replica, &volume_name)?;
+                let _uid_guard = self.uid_lock.lock().await;
+                self.check_uid_base_free(&replica, uid_base).await?;
                 self.volumes
                     .ensure(&EnsureVolume {
                         volume,
@@ -423,6 +431,48 @@ impl<C: CriClient + Clone> Node<C> {
                 "the subnet is not allowed on this host",
             )
         })
+    }
+
+    /// A `uid_base` belongs to one workload. It is refused when a ready
+    /// sandbox faber made, or a volume marker, holds it for another. Call
+    /// with `uid_lock` held, and keep holding it until the create is done.
+    async fn check_uid_base_free(&self, replica: &ReplicaRef, uid_base: u32) -> Result<(), Fail> {
+        let owner = Owner::of(replica);
+        let taken = || {
+            Fail::new(
+                ErrorCode::Forbidden,
+                "the uid_base is already held by another workload",
+            )
+        };
+        let sandboxes = self
+            .cri
+            .list_pod_sandboxes(Some(PodSandboxFilter {
+                label_selector: managed_selector(),
+                ..Default::default()
+            }))
+            .await?;
+        let base = uid_base.to_string();
+        for sandbox in sandboxes {
+            if sandbox.state != PodSandboxState::SandboxReady as i32
+                || sandbox.annotations.get(ANNOTATION_UID_BASE) != Some(&base)
+            {
+                continue;
+            }
+            // A managed sandbox whose labels do not name a replica holds the
+            // base for nobody we can match: refuse.
+            let holder = ReplicaRef::from_labels(&sandbox.labels).map(|r| Owner::of(&r));
+            if holder.as_ref() != Some(&owner) {
+                return Err(taken());
+            }
+        }
+        let holders = self.volumes.uid_holders().await?;
+        if holders
+            .iter()
+            .any(|h| h.uid_base == uid_base && h.owner != owner)
+        {
+            return Err(taken());
+        }
+        Ok(())
     }
 
     async fn ensure_sandbox(
