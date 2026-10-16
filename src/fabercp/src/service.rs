@@ -542,7 +542,7 @@ impl FaberService {
             None => self.invite_as_leader(req).await,
             Some(leader_addr) => {
                 let bytes = self
-                    .post_peer(&leader_addr, "/raft/cluster/invites", &req, true)
+                    .post_leader(&leader_addr, "/raft/cluster/invites", &req)
                     .await?;
                 serde_json::from_slice(&bytes).map_err(|e| {
                     ServiceError::Internal(format!("bad invite response from {leader_addr}: {e}"))
@@ -627,7 +627,7 @@ impl FaberService {
             Some(leader_addr) => {
                 let req = PeerLeaseRequest { lease_secs: secs };
                 let bytes = self
-                    .post_peer(&leader_addr, "/raft/cluster/lease", &req, true)
+                    .post_leader(&leader_addr, "/raft/cluster/lease", &req)
                     .await?;
                 serde_json::from_slice(&bytes).map_err(|e| {
                     ServiceError::Internal(format!("bad lease response from {leader_addr}: {e}"))
@@ -736,7 +736,7 @@ impl FaberService {
                 self.propose(renew).await.map(drop)
             }
             Some(leader_addr) => self
-                .post_peer(&leader_addr, "/raft/cluster/renew", &req, true)
+                .post_leader(&leader_addr, "/raft/cluster/renew", &req)
                 .await
                 .map(drop),
         }
@@ -776,7 +776,7 @@ impl FaberService {
                     interval_secs: secs,
                 };
                 let bytes = self
-                    .post_peer(&leader_addr, "/raft/cluster/status-interval", &req, true)
+                    .post_leader(&leader_addr, "/raft/cluster/status-interval", &req)
                     .await?;
                 serde_json::from_slice(&bytes).map_err(|e| {
                     ServiceError::Internal(format!(
@@ -822,7 +822,7 @@ impl FaberService {
         match self.forward_target(forwarded)? {
             None => self.propose(Request::ReportNode(report)).await.map(drop),
             Some(leader_addr) => self
-                .post_peer(&leader_addr, "/raft/cluster/status", &report, true)
+                .post_leader(&leader_addr, "/raft/cluster/status", &report)
                 .await
                 .map(drop),
         }
@@ -1230,7 +1230,7 @@ impl FaberService {
                 self.propose(set).await.map(drop)
             }
             Some(leader_addr) => self
-                .post_peer(&leader_addr, "/raft/cluster/endpoint", &req, true)
+                .post_leader(&leader_addr, "/raft/cluster/endpoint", &req)
                 .await
                 .map(drop),
         }
@@ -1378,7 +1378,7 @@ impl FaberService {
         match self.forward_target(forwarded)? {
             None => self.join_as_leader(&req).await,
             Some(leader_addr) => self
-                .post_peer(&leader_addr, "/raft/cluster/join", &req, true)
+                .post_leader(&leader_addr, "/raft/cluster/join", &req)
                 .await
                 .map(drop),
         }
@@ -1423,7 +1423,7 @@ impl FaberService {
                 .map(drop)
             }
             Some(leader_addr) => self
-                .post_peer(&leader_addr, "/raft/cluster/register", &req, true)
+                .post_leader(&leader_addr, "/raft/cluster/register", &req)
                 .await
                 .map(drop),
         }
@@ -1597,6 +1597,48 @@ impl FaberService {
                     "node {id} is a learner that has not caught up with the log; retry the join"
                 ))
             })
+    }
+
+    /// Forwards `body` to the leader at `leader_addr` with [`Self::post_peer`].
+    ///
+    /// When the leader cannot be reached the follower's view may be stale,
+    /// as during a failover. The view is read again and, if another leader
+    /// is known, the request is sent there once. Otherwise the answer is
+    /// [`ServiceError::NoLeader`], which a client retries. A leader that
+    /// answers, even with an error, is passed through as `post_peer` has it.
+    pub(crate) async fn post_leader<B: Serialize>(
+        &self,
+        leader_addr: &str,
+        path: &str,
+        body: &B,
+    ) -> ServiceResult<Vec<u8>> {
+        match self.post_peer(leader_addr, path, body, true).await {
+            Err(ServiceError::PeerUnreachable(first)) => {
+                let Some(next) = self.other_leader(leader_addr) else {
+                    tracing::debug!(%first, "no other leader to forward to");
+                    return Err(ServiceError::NoLeader);
+                };
+                match self.post_peer(&next, path, body, true).await {
+                    Err(ServiceError::PeerUnreachable(second)) => {
+                        tracing::debug!(%second, "the new leader cannot be reached either");
+                        Err(ServiceError::NoLeader)
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// The peer address of a leader other than this node and `failed`, from
+    /// the current raft metrics.
+    fn other_leader(&self, failed: &str) -> Option<String> {
+        match self.not_leader(&self.metrics()) {
+            ServiceError::NotLeader { leader_addr, .. } if leader_addr != failed => {
+                Some(leader_addr)
+            }
+            _ => None,
+        }
     }
 
     /// POSTs `body` as JSON to `http://{peer}{path}` and returns the body of
@@ -2352,6 +2394,37 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, ServiceError::AlreadyJoined);
+        node.shutdown().await;
+    }
+
+    /// A join names a seed, not the leader, so a seed that cannot be reached
+    /// stays `peer_unreachable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_to_an_unreachable_seed_is_peer_unreachable() {
+        let node = TestNode::start().await;
+        let err = node
+            .service
+            .join(JoinRequest {
+                peer: "127.0.0.1:1".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::PeerUnreachable(_)), "{err:?}");
+        node.shutdown().await;
+    }
+
+    /// A forward whose leader cannot be reached is `no_leader` when no other
+    /// leader is known, and so is a leader that is this node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_to_an_unreachable_leader_is_no_leader() {
+        let node = TestNode::start_initialized().await;
+        let body = PeerLeaseRequest { lease_secs: 600 };
+        let err = node
+            .service
+            .post_leader("127.0.0.1:1", "/raft/cluster/lease", &body)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ServiceError::NoLeader);
         node.shutdown().await;
     }
 
