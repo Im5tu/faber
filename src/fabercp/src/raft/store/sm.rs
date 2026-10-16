@@ -1440,8 +1440,6 @@ mod tests {
             ("keys/data/cluster", json!({})),
             ("status/1", json!({})),
             (status::KEY_INTERVAL, json!(1)),
-            ("services/ips", json!({})),
-            ("services/other", json!(1)),
         ];
         let entries: Vec<_> = (1..)
             .zip(&reserved)
@@ -1453,6 +1451,20 @@ mod tests {
         assert!(dump(&s).is_empty());
         assert_eq!(last_index(&mut s).await, Some(reserved.len() as u64));
         drop(s);
+
+        // The service address record, on a cluster that holds one.
+        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
+        let before = dump(&s);
+        let replies = s
+            .state_machine
+            .apply([
+                set(1, 4, "services/ips", json!({})),
+                set(1, 5, "services/other", json!(1)),
+            ])
+            .await
+            .unwrap();
+        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
+        assert_eq!(dump(&s), before);
     }
 
     #[tokio::test]

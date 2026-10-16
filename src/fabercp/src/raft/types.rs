@@ -308,6 +308,24 @@ mod tests {
                 mesh: MeshConfig::default(),
                 founder,
             },
+            Request::InitCluster {
+                mesh: MeshConfig {
+                    container_cidr: Some("10.200.0.0/16".parse().unwrap()),
+                    container_subnet_prefix: 26,
+                    ..MeshConfig::default()
+                },
+                founder: NodeRecord {
+                    node_id: 1,
+                    public_key: "pk1".into(),
+                    mesh_ip: "10.99.0.1".parse().unwrap(),
+                    endpoint: None,
+                    invite_id: None,
+                    instance_id: None,
+                    container_subnet: Some("10.200.0.0/26".parse().unwrap()),
+                    name: String::new(),
+                    lease_renewed_at: 0,
+                },
+            },
             Request::CreateInvite {
                 invite_id: "ab".repeat(16),
                 public_key: "pk2".into(),
@@ -714,5 +732,23 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(debug.contains("API_KEY"), "{debug}");
         assert!(!debug.contains("hunter2"), "{debug}");
+    }
+
+    #[test]
+    fn entry_round_trips_through_json() {
+        let entry = Entry {
+            log_id: openraft::testing::log_id(3, 1, 7),
+            payload: openraft::EntryPayload::Normal(Request::Set {
+                key: "k".into(),
+                value: json!(1),
+            }),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let back: Entry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.log_id, entry.log_id);
+        assert!(matches!(
+            back.payload,
+            openraft::EntryPayload::Normal(Request::Set { .. })
+        ));
     }
 }
