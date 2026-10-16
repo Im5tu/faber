@@ -702,6 +702,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -741,6 +742,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower",
+ "zeroize",
 ]
 
 [[package]]
