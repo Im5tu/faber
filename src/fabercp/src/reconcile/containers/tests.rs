@@ -711,6 +711,8 @@ fn the_gate_is_judged_from_placement_and_staleness() {
     // Index 0 is never gated, whatever the others do.
     let first = rolling(&c, 9, &[Some(NODE), Some(2)], 100, None);
     assert!(!waiting(&first).contains(&web(9, 0)));
+    // Index 1 sits behind index 0, which has no status, so it waits.
+    assert!(waiting(&first).contains(&web(9, 1)));
 }
 
 #[test]
@@ -830,14 +832,56 @@ async fn an_index_moved_to_another_node_keeps_the_roll_gate() {
     );
 }
 
-#[test]
-fn without_a_mesh_the_roll_gate_is_skipped() {
-    let c = Cluster::new();
-    let step = c.step(&FakeNode::default(), &Arc::default());
+#[tokio::test]
+async fn without_a_mesh_the_roll_gate_is_skipped() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, _sup) = serving_old_replica(&c, &node, &state).await;
     // No lease clock to judge staleness by, and replica 0 has no status.
     let view = c.view(9, &[2, NODE]);
     assert!(view.placement.as_ref().unwrap().mesh.is_none());
+    run(&step, &view).await;
     assert!(step.plan(&view).desired.waiting.is_empty());
+    // Fail open: the old replica is replaced although replica 0 is not up.
+    assert_eq!(
+        state.entry(&web(7, 1)).unwrap().stop,
+        Some(StopReason::Replaced)
+    );
+}
+
+#[tokio::test]
+async fn a_dead_old_pod_the_runner_does_not_know_is_kept_until_its_gate_opens() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, _sup) = serving_old_replica(&c, &node, &state).await;
+    // As after a restart of fabercp: the pod is listed, the runner has no entry.
+    state.forget(&web(7, 1));
+    node.exit(&web(7, 1), "app", 0);
+    let at = |state_of_zero| {
+        rolling(
+            &c,
+            9,
+            &[Some(2), Some(NODE)],
+            100,
+            Some((100, vec![report(9, 0, state_of_zero)])),
+        )
+    };
+    run(&step, &at(ReplicaState::Deploying)).await;
+    assert!(
+        state.entry(&web(7, 1)).is_none_or(|e| e.stop.is_none()),
+        "kept while the gate is closed"
+    );
+    run(&step, &at(ReplicaState::Available)).await;
+    assert_eq!(
+        state.entry(&web(7, 1)).unwrap().stop,
+        Some(StopReason::Replaced)
+    );
 }
 
 #[tokio::test]

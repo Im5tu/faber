@@ -235,7 +235,8 @@ impl<C: NodeClient> ContainersStep<C> {
     /// Whether the old pod `key` has nothing left to serve: every container
     /// has exited and its own restart policy (not the newer revision's) will
     /// not bring it back. A pod the runner does not know has no policy to
-    /// judge by and is kept.
+    /// judge by and is kept. That is the intended roll hold: it goes when its
+    /// gate opens.
     fn is_dead_for_good(&self, key: &ReplicaRef, pod: Option<&ReplicaInfo>) -> bool {
         let Some(pod) = pod.filter(|p| !p.containers.is_empty()) else {
             return false;
