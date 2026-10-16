@@ -137,7 +137,9 @@ impl FakeCri {
     pub fn exit_container(&self, id: &str, exit_code: i32) {
         let mut s = self.lock();
         let now = s.tick();
-        if let Some((container, status)) = s.containers.get_mut(id) {
+        if let Some((container, status)) = s.containers.get_mut(id)
+            && container.state != ContainerState::ContainerExited as i32
+        {
             finish(container, status, exit_code, now);
         }
     }
@@ -521,7 +523,10 @@ mod tests {
         let auth = RegistryCredentials {
             username: "user-secret".to_owned(),
             password: "pw-secret".to_owned(),
-            ..Default::default()
+            server_address: String::new(),
+            auth: String::new(),
+            identity_token: String::new(),
+            registry_token: String::new(),
         };
         cri.pull_image("a/b", Some(auth)).await.unwrap();
         assert!(!format!("{:?}", cri.calls()).contains("secret"));
@@ -703,6 +708,11 @@ mod tests {
         // A later stop does not overwrite the exit code.
         cri.stop_container(&d, 5).await.unwrap();
         assert_eq!(cri.container_status(&d).await.unwrap().exit_code, 3);
+        // Nor does a second exit: the first code and time stay.
+        cri.exit_container(&d, 9);
+        let again = cri.container_status(&d).await.unwrap();
+        assert_eq!(again.exit_code, 3);
+        assert_eq!(again.finished_at, exited.finished_at);
     }
 
     #[tokio::test]
