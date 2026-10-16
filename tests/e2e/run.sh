@@ -1874,13 +1874,30 @@ m_roll_gap() {
 }
 
 # m_roll_old_down_samples FILE REV: the number of samples in which every
-# replica ran a revision other than REV (the new one) and none was available.
+# replica index was down on the old revision: it had a row for a revision
+# other than REV (the new one) and no row of any revision that was available.
+# An index can have a row per revision, so each index is judged on its own.
 m_roll_old_down_samples() {
   awk -v r="$2" '
-    function flush() { if (cur != "" && n > 0 && old == n && up == 0) bad++; n = 0; old = 0; up = 0 }
+    function flush(  i, n, all) {
+      n = 0; all = 1
+      for (i in seen) { n++; if (!(old[i] && !up[i])) all = 0 }
+      if (n > 0 && all) bad++
+      delete seen; delete old; delete up
+    }
     $1 != cur { flush(); cur = $1 }
-    { n++; if ($3 != r) old++; if ($4 == "available") up++ }
+    { seen[$2] = 1; if ($3 != r) old[$2] = 1; if ($4 == "available") up[$2] = 1 }
     END { flush(); print bad + 0 }' "$1"
+}
+
+# m_roll_both_revisions_samples FILE OLD NEW: the number of samples that list
+# a row of revision OLD and a row of revision NEW.
+m_roll_both_revisions_samples() {
+  awk -v o="$2" -v n="$3" '
+    function flush() { if (cur != "" && hasold && hasnew) both++; hasold = 0; hasnew = 0 }
+    $1 != cur { flush(); cur = $1 }
+    { if ($3 == o) hasold = 1; if ($3 == n) hasnew = 1 }
+    END { flush(); print both + 0 }' "$1"
 }
 
 phase_m() {
@@ -2030,6 +2047,7 @@ phase_m() {
   fi
   assert_eq "M rolling: the two replicas were never both on the old revision and down" "$(m_roll_old_down_samples "$LOG_DIR/m-roll-samples.log" "$rev2")" "0"
   assert_ne "M rolling: the samples saw replicas on the old revision" "$(awk -v r="$rev1" '$3 == r' "$LOG_DIR/m-roll-samples.log" | wc -l)" "0"
+  assert_ne "M rolling: app show listed the old and the new revision in one sample" "$(m_roll_both_revisions_samples "$LOG_DIR/m-roll-samples.log" "$rev1" "$rev2")" "0"
   assert_has "M the new revision has GREETING=two" "$(m_show "$NODE_A")" 'GREETING=two'
   vip2="$(m_vip "$NODE_A")"
   assert_eq "M the virtual IP did not change on $NODE_A" "$vip2" "$vip1"
