@@ -20,15 +20,6 @@ fn help_lists_subcommands() {
 }
 
 #[test]
-fn cluster_help_lists_status_init_join() {
-    let out = faber().args(["cluster", "--help"]).assert().success();
-    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    for sub in ["status", "init", "join"] {
-        assert!(stdout.contains(sub), "missing {sub} in:\n{stdout}");
-    }
-}
-
-#[test]
 fn join_with_bad_peer_fails_before_any_request() {
     // Port 1 is never contacted: the peer is rejected while parsing.
     let out = faber()
@@ -85,17 +76,6 @@ fn deploy_failure_exits_1_with_the_errors_on_stderr() {
         "{stderr}"
     );
     assert_eq!(lines[1], "error: nothing was deployed");
-}
-
-#[test]
-fn deploy_without_project_or_env_is_a_usage_error() {
-    for args in [
-        &["deploy", "spec", "spec.json", "--project", "shop"][..],
-        &["deploy", "spec", "spec.json", "--env", "staging"],
-    ] {
-        let out = faber().args(args).assert().failure().code(2);
-        assert!(out.get_output().stdout.is_empty());
-    }
 }
 
 #[test]

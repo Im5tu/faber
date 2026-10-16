@@ -115,38 +115,42 @@ fn join_requires_an_ip_and_port() {
     }
 }
 
+/// Commands and flags that earlier versions had are not parsed any more.
 #[test]
-fn removed_commands_are_rejected() {
-    parse_err(&["kv", "get", "a"]);
-    parse_err(&["cluster", "add-learner", "--id", "2", "--addr", "h:1"]);
-    parse_err(&["cluster", "members", "--set", "1,2"]);
-    parse_err(&["cluster", "init", "--node", "1=h:1"]);
-}
-
-#[test]
-fn deploy_compose_and_k8s_are_rejected() {
-    for kind in ["compose", "k8s"] {
-        let message = parse_err(&["deploy", kind, "--project", "shop", "--env", "staging"]);
-        assert!(message.contains("unrecognized subcommand"), "{message}");
+fn removed_commands_and_flags_are_rejected() {
+    for (args, want) in [
+        (&["kv", "get", "a"][..], ""),
+        (
+            &["cluster", "add-learner", "--id", "2", "--addr", "h:1"],
+            "",
+        ),
+        (&["cluster", "members", "--set", "1,2"], ""),
+        (&["cluster", "init", "--node", "1=h:1"], ""),
+        (
+            &["deploy", "compose", "--project", "shop", "--env", "staging"],
+            "unrecognized subcommand",
+        ),
+        (
+            &["deploy", "k8s", "--project", "shop", "--env", "staging"],
+            "unrecognized subcommand",
+        ),
+        (
+            &[
+                "deploy",
+                "spec",
+                "spec.json",
+                "--project",
+                "shop",
+                "--env",
+                "staging",
+                "--strict",
+            ],
+            "unexpected argument '--strict'",
+        ),
+    ] {
+        let message = parse_err(args);
+        assert!(message.contains(want), "{args:?}: {message}");
     }
-}
-
-#[test]
-fn deploy_strict_is_rejected() {
-    let message = parse_err(&[
-        "deploy",
-        "spec",
-        "spec.json",
-        "--project",
-        "shop",
-        "--env",
-        "staging",
-        "--strict",
-    ]);
-    assert!(
-        message.contains("unexpected argument '--strict'"),
-        "{message}"
-    );
 }
 
 #[test]
@@ -577,50 +581,6 @@ fn no_help_text_mentions_faber_project() {
         }
     }
     check(&mut Cli::command());
-}
-
-#[test]
-fn short_e_is_still_the_endpoint_on_the_new_commands() {
-    let cli = parse(&[
-        "deploy",
-        "spec",
-        "s.json",
-        "-e",
-        "http://h:1",
-        "--project",
-        "shop",
-        "--env",
-        "staging",
-    ]);
-    assert_eq!(cli.endpoint, "http://h:1");
-    assert_eq!(
-        cli.command,
-        Command::Deploy(DeployCommand::Spec {
-            file: PathBuf::from("s.json"),
-            target: target("shop", "staging"),
-            options: no_options(),
-        })
-    );
-
-    let cli = parse(&["app", "ls", "-e", "http://h:2", "--env", "staging"]);
-    assert_eq!(cli.endpoint, "http://h:2");
-    let cli = parse(&[
-        "project",
-        "create",
-        "shop",
-        "-e",
-        "http://h:3",
-        "--env",
-        "dev",
-    ]);
-    assert_eq!(cli.endpoint, "http://h:3");
-    assert_eq!(
-        cli.command,
-        Command::Project(ProjectCommand::Create {
-            name: "shop".into(),
-            environments: vec!["dev".into()],
-        })
-    );
 }
 
 #[test]

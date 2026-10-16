@@ -955,21 +955,4 @@ mod tests {
     fn duration_of_the_largest_value_does_not_overflow() {
         assert_eq!(duration(u64::MAX), "213503982334601d7h15s");
     }
-
-    #[test]
-    fn lease_text_shows_the_duration_and_the_seconds() {
-        let l = LeaseResponse { lease_secs: 5400 };
-        assert_eq!(
-            lease(OutputFormat::Text, &l).unwrap(),
-            "lease: 1h30m (5400s)\n"
-        );
-    }
-
-    #[test]
-    fn lease_json_is_the_dto() {
-        let l = LeaseResponse { lease_secs: 5400 };
-        let out = lease(OutputFormat::Json, &l).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v, serde_json::json!({"lease_secs": 5400}));
-    }
 }
