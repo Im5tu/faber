@@ -77,9 +77,16 @@ pub struct ContainersDesired {
     /// left as they are.
     pub held: BTreeSet<WorkloadKey>,
     /// Replicas of block-volume workloads whose turn in the roll has not come:
-    /// they do not replace their older replica yet (see [`roll`]). A status
-    /// report that moves no gate leaves this value as it was.
+    /// they do not replace their older replica yet (see [`roll`]). It covers
+    /// every index of the workload, also those placed on another node, because
+    /// an older pod here may belong to an index that moved. A status report
+    /// that moves no gate leaves this value as it was.
     pub waiting: HashSet<ReplicaRef>,
+    /// The newest revision of every placed workload, from the workload record,
+    /// whether or not a replica of it is placed here.
+    pub newest: BTreeMap<WorkloadKey, u64>,
+    /// The placed workloads that have a block volume, from the workload record.
+    pub with_block: BTreeSet<WorkloadKey>,
     /// This node's container subnet, the only pod addresses probed.
     pub subnet: Option<Ipv4Net>,
 }
@@ -128,18 +135,6 @@ impl<C: NodeClient> ContainersStep<C> {
         let pods: HashMap<&ReplicaRef, &ReplicaInfo> =
             listed.iter().map(|p| (&p.replica, p)).collect();
         let wanted: HashSet<&ReplicaRef> = desired.replicas.iter().map(|d| &d.replica).collect();
-        let mut newest: BTreeMap<WorkloadKey, u64> = BTreeMap::new();
-        let mut with_block: BTreeSet<WorkloadKey> = BTreeSet::new();
-        for d in &desired.replicas {
-            if let Some(revision) = parse_revision(&d.replica.revision) {
-                let entry = newest.entry(workload_of(&d.replica)).or_insert(revision);
-                *entry = (*entry).max(revision);
-            }
-            if d.has_block_volume() {
-                with_block.insert(workload_of(&d.replica));
-            }
-        }
-
         let waiting_slots: HashSet<(WorkloadKey, u32)> = desired
             .waiting
             .iter()
@@ -156,10 +151,10 @@ impl<C: NodeClient> ContainersStep<C> {
                 continue;
             }
             let older = matches!(
-                (newest.get(&workload), parse_revision(&key.revision)),
+                (desired.newest.get(&workload), parse_revision(&key.revision)),
                 (Some(newest), Some(this)) if this < *newest
             );
-            match (older, with_block.contains(&workload)) {
+            match (older, desired.with_block.contains(&workload)) {
                 // The newer revision needs the volume the older one has. It
                 // is this replica's turn only when the lower indices are
                 // available; until then the older one keeps serving.
@@ -374,20 +369,20 @@ impl<C: NodeClient> ReconcileStep for ContainersStep<C> {
         let Some(placed) = view.placement.as_ref() else {
             return Planned { desired, warnings };
         };
-        let tick = placed
-            .mesh
-            .as_ref()
-            .map_or(0, |m| self.lease_timing.tick_clock_secs(m.lease_secs));
-        let mut statuses = placed.statuses.clone();
-        if let Some(mesh) = placed.mesh.as_ref() {
+        // Without a mesh there is no lease clock to judge a node's report by,
+        // so the roll gate is skipped. This fails open on purpose: the
+        // stop-before-start rule of a slot still holds, and placement needs a
+        // mesh to place anything, so this only happens before it has one.
+        let status = placed.mesh.as_ref().map(|mesh| {
+            let mut statuses = placed.statuses.clone();
             statuses.retain(|id, _| mesh.nodes.contains_key(id));
-        }
-        let status = StatusView::new(
-            statuses,
-            view.status_interval_secs,
-            placed.mesh.as_ref().map_or(0, |m| m.clock),
-            tick,
-        );
+            StatusView::new(
+                statuses,
+                view.status_interval_secs,
+                mesh.clock,
+                self.lease_timing.tick_clock_secs(mesh.lease_secs),
+            )
+        });
         for (project, environment, record) in &placed.environments {
             let Some(plan) = placed.records.get(&(project.clone(), environment.clone())) else {
                 continue;
@@ -398,10 +393,42 @@ impl<C: NodeClient> ReconcileStep for ContainersStep<C> {
                     .iter()
                     .filter(|r| r.node == Some(self.node_id))
                     .collect();
-                let Some(workload) = record.workloads.get(name).filter(|_| !mine.is_empty()) else {
+                let Some(workload) = record.workloads.get(name) else {
                     continue;
                 };
                 let key = (project.clone(), environment.clone(), name.clone());
+                // Judged for every index, not only those placed here: an older
+                // pod here may belong to an index that moved to another node.
+                desired.newest.insert(key.clone(), workload.revision);
+                if workload
+                    .spec
+                    .volumes
+                    .values()
+                    .any(|v| matches!(v, VolumeSource::Block { .. }))
+                {
+                    desired.with_block.insert(key.clone());
+                    if let Some(status) = status.as_ref() {
+                        let closed = roll::closed_gates(&status.workload(
+                            project,
+                            environment,
+                            name,
+                            workload.revision,
+                            &placement.replicas,
+                        ));
+                        desired
+                            .waiting
+                            .extend(closed.into_iter().map(|replica_index| ReplicaRef {
+                                project: project.clone(),
+                                env: environment.clone(),
+                                workload: name.clone(),
+                                revision: revision_string(workload.revision),
+                                replica_index,
+                            }));
+                    }
+                }
+                if mine.is_empty() {
+                    continue;
+                }
                 match self.check_env(view, project, environment, workload) {
                     Ok(()) => {
                         let built = Self::desired_replicas(
@@ -412,21 +439,6 @@ impl<C: NodeClient> ReconcileStep for ContainersStep<C> {
                             &workload.spec,
                             &mine,
                         );
-                        if built.iter().any(DesiredReplica::has_block_volume) {
-                            let closed = roll::closed_gates(&status.workload(
-                                project,
-                                environment,
-                                name,
-                                workload.revision,
-                                &placement.replicas,
-                            ));
-                            desired.waiting.extend(
-                                built
-                                    .iter()
-                                    .filter(|d| closed.contains(&d.replica.replica_index))
-                                    .map(|d| d.replica.clone()),
-                            );
-                        }
                         desired.replicas.extend(built);
                     }
                     Err(why) => {

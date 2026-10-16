@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use faber_api_types::workload::{ReplicaState, WorkloadSpec};
+use faber_api_types::workload::{ReplicaState, RestartPolicy, WorkloadSpec};
 use faber_crypto::{ClusterKey, DataKey, key_id, wrap};
 use faber_node_protocol::VolumeKind;
 
@@ -21,7 +21,7 @@ use crate::status::ReplicaSource;
 
 const NODE: u64 = 1;
 
-fn spec(block: bool) -> WorkloadSpec {
+fn spec(block: bool, restart: RestartPolicy) -> WorkloadSpec {
     let mut volumes = serde_json::json!({
         "scratch": {"type": "ramdisk", "size_bytes": 1048576},
     });
@@ -35,7 +35,7 @@ fn spec(block: bool) -> WorkloadSpec {
             "env": {"PASSWORD": SECRET},
         }],
         "volumes": volumes,
-        "restart": "never",
+        "restart": restart,
     }))
     .unwrap()
 }
@@ -44,6 +44,7 @@ struct Cluster {
     cluster: ClusterKey,
     data: DataKey,
     block: bool,
+    restart: RestartPolicy,
 }
 
 impl Cluster {
@@ -52,6 +53,7 @@ impl Cluster {
             cluster: ClusterKey::generate().unwrap(),
             data: DataKey::generate().unwrap(),
             block: true,
+            restart: RestartPolicy::Never,
         }
     }
 
@@ -62,9 +64,20 @@ impl Cluster {
         }
     }
 
+    fn restarting(self, restart: RestartPolicy) -> Self {
+        Self { restart, ..self }
+    }
+
     fn record(&self, revision: u64) -> WorkloadRecord {
-        let stored =
-            seal_workload(&self.data, "shop", "prod", "web", &spec(self.block), None).unwrap();
+        let stored = seal_workload(
+            &self.data,
+            "shop",
+            "prod",
+            "web",
+            &spec(self.block, self.restart),
+            None,
+        )
+        .unwrap();
         WorkloadRecord {
             revision,
             spec: stored.spec,
@@ -697,7 +710,7 @@ fn the_gate_is_judged_from_placement_and_staleness() {
     assert!(waiting(&lost).is_empty());
     // Index 0 is never gated, whatever the others do.
     let first = rolling(&c, 9, &[Some(NODE), Some(2)], 100, None);
-    assert!(waiting(&first).is_empty());
+    assert!(!waiting(&first).contains(&web(9, 0)));
 }
 
 #[test]
@@ -774,4 +787,55 @@ async fn a_gate_that_closes_after_the_old_replica_was_stopped_does_not_hold_the_
     sup.step(DRAIN_PERIOD).await;
     sup.step(Duration::ZERO).await;
     assert!(state.entry(&web(9, 1)).unwrap().launched);
+}
+
+#[tokio::test]
+async fn an_index_moved_to_another_node_keeps_the_roll_gate() {
+    let (c, node, state) = (
+        Cluster::new(),
+        FakeNode::default(),
+        Arc::<RunnerState>::default(),
+    );
+    let (step, mut sup) = serving_old_replica(&c, &node, &state).await;
+
+    // Replica 1 moved to node 3 and nothing of revision 9 is placed here.
+    // Replica 0 is still deploying: the old pod here keeps serving.
+    let stuck = rolling(
+        &c,
+        9,
+        &[Some(2), Some(3)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Deploying)])),
+    );
+    let planned = step.plan(&stuck);
+    assert!(planned.desired.replicas.is_empty());
+    assert_eq!(planned.desired.waiting, HashSet::from([web(9, 1)]));
+    step.apply(&planned.desired).await.unwrap();
+    sup.step(DRAIN_PERIOD * 2).await;
+    assert_eq!(state.entry(&web(7, 1)).unwrap().stop, None);
+    assert_eq!(state.replicas()[0].state, ReplicaState::Available);
+
+    // Replica 0 is available: the old pod is replaced.
+    let open = rolling(
+        &c,
+        9,
+        &[Some(2), Some(3)],
+        100,
+        Some((100, vec![report(9, 0, ReplicaState::Available)])),
+    );
+    run(&step, &open).await;
+    assert_eq!(
+        state.entry(&web(7, 1)).unwrap().stop,
+        Some(StopReason::Replaced)
+    );
+}
+
+#[test]
+fn without_a_mesh_the_roll_gate_is_skipped() {
+    let c = Cluster::new();
+    let step = c.step(&FakeNode::default(), &Arc::default());
+    // No lease clock to judge staleness by, and replica 0 has no status.
+    let view = c.view(9, &[2, NODE]);
+    assert!(view.placement.as_ref().unwrap().mesh.is_none());
+    assert!(step.plan(&view).desired.waiting.is_empty());
 }
