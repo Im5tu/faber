@@ -1517,7 +1517,8 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     // five seconds.
     if term_after == term {
         let added = index_after.zip(index).map(|(after, before)| after - before);
-        let reports = 1 + 2 * (started.elapsed().as_secs() / 5 + 1);
+        // Reports also follow changes in what a node reports, so allow a few more.
+        let reports = 4 + 2 * (started.elapsed().as_secs() / 5 + 1);
         assert!(
             added.is_some_and(|n| (3..=3 + reports).contains(&n)),
             "one RenewLease, one SetEndpoint, the barrier and up to {reports} reports expected,              got {added:?}"
