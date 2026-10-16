@@ -225,10 +225,12 @@ impl CriClient for FakeCri {
         runtime_handler: &'a str,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let mut s = self.lock();
-            s.begin(Call::RunPodSandbox {
+            self.lock().begin(Call::RunPodSandbox {
                 runtime_handler: runtime_handler.to_owned(),
             })?;
+            // A real start takes time; yielding lets concurrent callers interleave.
+            tokio::task::yield_now().await;
+            let mut s = self.lock();
             let id = s.new_id("sandbox");
             let created_at = s.tick();
             s.sandboxes.insert(

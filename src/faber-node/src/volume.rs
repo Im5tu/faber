@@ -148,6 +148,35 @@ pub trait VolumeManager: Send + Sync {
     /// Bytes free for unprivileged use on the file system that holds the
     /// root: what the images of block volumes can grow into.
     fn free_bytes(&self) -> BoxFuture<'_, Result<u64, VolumeError>>;
+
+    /// The owner and `uid_base` recorded for every volume, from the markers.
+    fn uid_holders(&self) -> BoxFuture<'_, Result<Vec<UidHolder>, VolumeError>>;
+}
+
+/// Who a `uid_base` belongs to: a workload. Its revisions and replicas share
+/// one base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    pub project: String,
+    pub env: String,
+    pub workload: String,
+}
+
+impl Owner {
+    pub fn of(replica: &ReplicaRef) -> Self {
+        Self {
+            project: replica.project.clone(),
+            env: replica.env.clone(),
+            workload: replica.workload.clone(),
+        }
+    }
+}
+
+/// One owner's claim on a `uid_base`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UidHolder {
+    pub owner: Owner,
+    pub uid_base: u32,
 }
 
 /// Host mounts. Every one is `nosuid,nodev`.
@@ -369,6 +398,49 @@ fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
+/// `create_dir_all`, tried again once if a parent vanished meanwhile: a
+/// concurrent remove prunes empty parents.
+fn create_dirs(path: &Path) -> io::Result<()> {
+    create_dirs_with(path, |p| std::fs::create_dir_all(p))
+}
+
+fn create_dirs_with(path: &Path, mut make: impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
+    match make(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => make(path),
+        other => other,
+    }
+}
+
+/// Removes the empty directories above the removed volume `dir`: index,
+/// workload, env, project. Stops at the first one that is not empty, and
+/// never touches `root` or anything above it. If any level is a symlink,
+/// nothing is pruned: the path would lead out of the tree.
+fn prune_empty_parents(root: &Path, dir: &Path) -> io::Result<()> {
+    let parents: Vec<&Path> = dir
+        .ancestors()
+        .skip(1)
+        .take(4)
+        .take_while(|p| *p != root && p.starts_with(root))
+        .collect();
+    for parent in &parents {
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    for parent in parents {
+        match std::fs::remove_dir(parent) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// The names in `dir` that are directories of their own, not symlinks, and
 /// whose name `accept`s. Sorted. A missing `dir` has none.
 fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> io::Result<Vec<(String, PathBuf)>> {
@@ -417,6 +489,14 @@ fn is_label(name: &str) -> bool {
 
 /// Walks `root/<project>/<env>/<workload>/<index>/<volume>/`.
 fn scan_volumes(root: &Path) -> io::Result<Vec<VolumeInfo>> {
+    Ok(scan_markers(root)?
+        .into_iter()
+        .map(|(info, _)| info)
+        .collect())
+}
+
+/// [`scan_volumes`], with each volume's marker.
+fn scan_markers(root: &Path) -> io::Result<Vec<(VolumeInfo, Marker)>> {
     let mut out = Vec::new();
     for (project, p) in child_dirs(root, is_label)? {
         for (env, e) in child_dirs(&p, is_label)? {
@@ -426,20 +506,21 @@ fn scan_volumes(root: &Path) -> io::Result<Vec<VolumeInfo>> {
                         let Some(marker) = plain_marker(&v.join("volume")) else {
                             continue;
                         };
-                        out.push(VolumeInfo {
+                        let info = VolumeInfo {
                             project: project.clone(),
                             env: env.clone(),
                             workload: workload.clone(),
                             replica_index: index.parse().unwrap_or_default(),
                             volume,
                             kind: marker.kind,
-                        });
+                        };
+                        out.push((info, marker));
                     }
                 }
             }
         }
     }
-    out.sort_by(|a, b| {
+    out.sort_by(|(a, _), (b, _)| {
         (&a.project, &a.env, &a.workload, a.replica_index, &a.volume).cmp(&(
             &b.project,
             &b.env,
@@ -665,7 +746,7 @@ impl VolumeManager for HostVolumes {
             let (mount, marker_path) = (paths.mount.clone(), paths.marker.clone());
             let (image, staging) = (paths.image.clone(), paths.staging.clone());
             let (existing, has_files) = blocking("creating the volume directory", move || {
-                std::fs::create_dir_all(&mount)?;
+                create_dirs(&mount)?;
                 Ok((
                     read_marker(&marker_path)?,
                     image.exists() || staging.exists(),
@@ -720,9 +801,14 @@ impl VolumeManager for HostVolumes {
             let paths = volume.paths(&self.root);
             let guard = self.lock(&paths.dir).await;
             let result = async {
-                let dir = paths.dir.clone();
+                let (root, dir) = (self.root.clone(), paths.dir.clone());
                 if !blocking("checking the volume", move || Ok(dir.exists())).await? {
-                    return Ok(());
+                    // Parents an earlier remove left behind go too.
+                    let dir = paths.dir.clone();
+                    return blocking("removing the empty parents", move || {
+                        prune_empty_parents(&root, &dir)
+                    })
+                    .await;
                 }
                 if self.mounter.is_mounted(&paths.mount).await? {
                     self.mounter.unmount(&paths.mount).await?;
@@ -736,6 +822,7 @@ impl VolumeManager for HostVolumes {
                 // unexpectedly unmounted `mnt` makes `remove_dir` fail instead
                 // of being deleted.
                 let marker_tmp = paths.marker.with_extension("tmp");
+                let root = self.root.clone();
                 blocking("removing the volume", move || {
                     for file in [&paths.image, &paths.staging, &paths.marker, &marker_tmp] {
                         ignore_missing(std::fs::remove_file(file))?;
@@ -743,7 +830,7 @@ impl VolumeManager for HostVolumes {
                     for dir in [&paths.mount, &paths.dir] {
                         ignore_missing(std::fs::remove_dir(dir))?;
                     }
-                    Ok(())
+                    prune_empty_parents(&root, &paths.dir)
                 })
                 .await
             }
@@ -772,6 +859,24 @@ impl VolumeManager for HostVolumes {
         Box::pin(async move {
             let root = self.root.clone();
             blocking("listing the volumes", move || scan_volumes(&root)).await
+        })
+    }
+
+    fn uid_holders(&self) -> BoxFuture<'_, Result<Vec<UidHolder>, VolumeError>> {
+        Box::pin(async move {
+            let root = self.root.clone();
+            let found = blocking("reading the volume markers", move || scan_markers(&root)).await?;
+            Ok(found
+                .into_iter()
+                .map(|(info, marker)| UidHolder {
+                    owner: Owner {
+                        project: info.project,
+                        env: info.env,
+                        workload: info.workload,
+                    },
+                    uid_base: marker.uid_base,
+                })
+                .collect())
         })
     }
 
@@ -891,6 +996,27 @@ pub mod fake {
                             replica_index: index.parse().ok()?,
                             volume: (*volume).to_owned(),
                             kind: *kind,
+                        })
+                    })
+                    .collect())
+            })
+        }
+
+        fn uid_holders(&self) -> BoxFuture<'_, Result<Vec<UidHolder>, VolumeError>> {
+            Box::pin(async move {
+                let found = self.volumes.lock().unwrap();
+                Ok(found
+                    .iter()
+                    .filter_map(|(dir, (_, _, uid))| {
+                        let dir = dir.replace('\\', "/");
+                        let mut parts = dir.split('/').filter(|p| !p.is_empty());
+                        Some(UidHolder {
+                            owner: Owner {
+                                project: parts.next()?.to_owned(),
+                                env: parts.next()?.to_owned(),
+                                workload: parts.next()?.to_owned(),
+                            },
+                            uid_base: *uid,
                         })
                     })
                     .collect())
@@ -1527,5 +1653,173 @@ mod tests {
         let got = h.volumes.list().await.unwrap();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].volume, "real");
+    }
+
+    #[tokio::test]
+    async fn uid_holders_come_from_the_markers() {
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/0/data",
+            Some("kind=block\nuid_base=65536\n"),
+        );
+        write_volume(
+            &h.root,
+            "blog/dev/web/2/tmp",
+            Some("kind=ramdisk\nuid_base=131072\n"),
+        );
+        write_volume(&h.root, "blog/dev/web/2/nomarker", None);
+        let owner = |p: &str, e: &str, w: &str| Owner {
+            project: p.into(),
+            env: e.into(),
+            workload: w.into(),
+        };
+        assert_eq!(
+            h.volumes.uid_holders().await.unwrap(),
+            [
+                UidHolder {
+                    owner: owner("blog", "dev", "web"),
+                    uid_base: 131072
+                },
+                UidHolder {
+                    owner: owner("shop", "prod", "redis"),
+                    uid_base: 65536
+                },
+            ]
+        );
+    }
+
+    fn remove_ref(rel: &str) -> VolumeRef {
+        let mut parts = rel.split('/');
+        let mut r = replica();
+        r.project = parts.next().unwrap().into();
+        r.env = parts.next().unwrap().into();
+        r.workload = parts.next().unwrap().into();
+        r.replica_index = parts.next().unwrap().parse().unwrap();
+        VolumeRef::new(&r, parts.next().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn remove_prunes_empty_parents_up_to_the_root() {
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/1/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        h.volumes
+            .remove(&remove_ref("shop/prod/redis/1/data"))
+            .await
+            .unwrap();
+        assert!(h.root.exists());
+        assert_eq!(std::fs::read_dir(&h.root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn remove_keeps_a_parent_that_still_holds_something() {
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/1/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        write_volume(
+            &h.root,
+            "shop/prod/redis/2/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        write_volume(
+            &h.root,
+            "shop/dev/redis/0/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        h.volumes
+            .remove(&remove_ref("shop/prod/redis/1/data"))
+            .await
+            .unwrap();
+        assert!(!h.root.join("shop/prod/redis/1").exists());
+        assert!(h.root.join("shop/prod/redis/2/data/volume").exists());
+        // The sibling env is intact, and so is the project above both.
+        assert!(h.root.join("shop/dev/redis/0/data/volume").exists());
+    }
+
+    #[tokio::test]
+    async fn removing_an_absent_volume_prunes_parents_left_behind() {
+        let h = harness();
+        std::fs::create_dir_all(h.root.join("shop/prod/redis/1")).unwrap();
+        h.volumes
+            .remove(&remove_ref("shop/prod/redis/1/data"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&h.root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pruning_never_follows_a_symlink_out_of_the_root() {
+        let h = harness();
+        write_volume(
+            &h.root,
+            "shop/prod/redis/1/data",
+            Some("kind=block\nuid_base=1\n"),
+        );
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("redis/1")).unwrap();
+        // The workload level is a symlink to an outside tree.
+        std::fs::remove_dir_all(h.root.join("shop/prod/redis")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("redis"), h.root.join("shop/prod/redis"))
+            .unwrap();
+        let _ = h
+            .volumes
+            .remove(&remove_ref("shop/prod/redis/1/data"))
+            .await;
+        assert!(outside.path().join("redis/1").exists());
+    }
+
+    #[test]
+    fn prune_stops_at_the_root_whatever_the_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vol");
+        // The volume directory `a/b/c/d/e` is already removed.
+        std::fs::create_dir_all(root.join("a/b/c/d")).unwrap();
+        prune_empty_parents(&root, &root.join("a/b/c/d/e")).unwrap();
+        // Four levels above the volume are pruned; the root itself is not.
+        assert!(root.exists());
+        assert!(!root.join("a").exists());
+        // A path outside the root is left alone.
+        std::fs::create_dir_all(tmp.path().join("x/y")).unwrap();
+        prune_empty_parents(&root, &tmp.path().join("x/y/z")).unwrap();
+        assert!(tmp.path().join("x/y").exists());
+    }
+
+    #[test]
+    fn a_lost_race_on_mkdir_is_retried_once() {
+        let mut calls = 0;
+        let ok = create_dirs_with(Path::new("/x"), |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::ErrorKind::NotFound.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(ok.is_ok());
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let err = create_dirs_with(Path::new("/x"), |_| {
+            calls += 1;
+            Err(io::ErrorKind::NotFound.into())
+        });
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let err = create_dirs_with(Path::new("/x"), |_| {
+            calls += 1;
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
     }
 }
