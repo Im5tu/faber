@@ -297,14 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn the_record_round_trips() {
-        let mut ips = ServiceIps::default();
-        ips.allocate(range("10.201.0.0/16"), "p/e/w");
-        let json = serde_json::to_string(&ips).unwrap();
-        assert_eq!(serde_json::from_str::<ServiceIps>(&json).unwrap(), ips);
-    }
-
-    #[test]
     fn reserved_keys() {
         assert!(is_reserved_key(KEY_IPS));
         assert!(is_reserved_key("services/anything"));

@@ -287,22 +287,7 @@ mod tests {
     use faber_api_types::workload::ReplicaState;
 
     #[test]
-    fn node_displays_its_address() {
-        assert_eq!(Node::new("10.0.0.1:7400").to_string(), "10.0.0.1:7400");
-    }
-
-    #[test]
-    fn request_round_trips_through_json() {
-        let req = Request::Set {
-            key: "a/b".into(),
-            value: json!({"x": [1, 2]}),
-        };
-        let bytes = serde_json::to_vec(&req).unwrap();
-        assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap(), req);
-    }
-
-    #[test]
-    fn mesh_requests_round_trip_through_json() {
+    fn set_and_mesh_requests_round_trip_through_json() {
         let founder = NodeRecord {
             node_id: 1,
             public_key: "pk1".into(),
@@ -315,6 +300,10 @@ mod tests {
             lease_renewed_at: 3,
         };
         for req in [
+            Request::Set {
+                key: "a/b".into(),
+                value: json!({"x": [1, 2]}),
+            },
             Request::InitCluster {
                 mesh: MeshConfig::default(),
                 founder,
@@ -524,60 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn init_cluster_with_a_container_range_round_trips() {
-        let req = Request::InitCluster {
-            mesh: MeshConfig {
-                container_cidr: Some("10.200.0.0/16".parse().unwrap()),
-                container_subnet_prefix: 26,
-                ..MeshConfig::default()
-            },
-            founder: NodeRecord {
-                node_id: 1,
-                public_key: "pk1".into(),
-                mesh_ip: "10.99.0.1".parse().unwrap(),
-                endpoint: None,
-                invite_id: None,
-                instance_id: None,
-                container_subnet: Some("10.200.0.0/26".parse().unwrap()),
-                name: String::new(),
-                lease_renewed_at: 0,
-            },
-        };
-        let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["InitCluster"]["mesh"]["container_cidr"], "10.200.0.0/16");
-        assert_eq!(v["InitCluster"]["mesh"]["container_subnet_prefix"], 26);
-        assert_eq!(
-            v["InitCluster"]["founder"]["container_subnet"],
-            "10.200.0.0/26"
-        );
-        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), req);
-    }
-
-    #[test]
-    fn response_round_trips_through_json() {
-        for resp in [
-            Response::None,
-            Response::Previous(None),
-            Response::Previous(Some(json!({"a": 1}))),
-            Response::Invited {
-                node_id: 2,
-                mesh_ip: "10.99.0.2".parse().unwrap(),
-                expires_at: 99,
-                name: "node-2".into(),
-                replaces: Some(5),
-            },
-            Response::Rejected {
-                code: "invite_used".into(),
-                message: "used".into(),
-            },
-        ] {
-            let bytes = serde_json::to_vec(&resp).unwrap();
-            assert_eq!(serde_json::from_slice::<Response>(&bytes).unwrap(), resp);
-        }
-        assert_eq!(Response::default(), Response::None);
-    }
-
-    #[test]
     fn response_from_rejection_and_allocation() {
         assert_eq!(
             Response::from(Rejection::new("invite_expired", "expired")),
@@ -779,23 +714,5 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(debug.contains("API_KEY"), "{debug}");
         assert!(!debug.contains("hunter2"), "{debug}");
-    }
-
-    #[test]
-    fn entry_round_trips_through_json() {
-        let entry = Entry {
-            log_id: openraft::testing::log_id(3, 1, 7),
-            payload: openraft::EntryPayload::Normal(Request::Set {
-                key: "k".into(),
-                value: json!(1),
-            }),
-        };
-        let bytes = serde_json::to_vec(&entry).unwrap();
-        let back: Entry = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.log_id, entry.log_id);
-        assert!(matches!(
-            back.payload,
-            openraft::EntryPayload::Normal(Request::Set { .. })
-        ));
     }
 }

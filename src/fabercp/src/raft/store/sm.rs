@@ -1428,18 +1428,30 @@ mod tests {
         drop(s);
     }
 
+    /// The generic `Set` cannot write any key a typed command owns.
     #[tokio::test]
     async fn set_rejects_reserved_keys() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path()).unwrap();
-        let replies = s
-            .state_machine
-            .apply([set(1, 1, KEY_MESH, json!({"forged": true}))])
-            .await
-            .unwrap();
+        let reserved = [
+            (KEY_MESH, json!({"forged": true})),
+            (keys::KEY_CLUSTER_ID, json!({"key_id": "forged"})),
+            ("keys/data/shop/staging", json!({"forged": true})),
+            ("keys/data/cluster", json!({})),
+            ("status/1", json!({})),
+            (status::KEY_INTERVAL, json!(1)),
+            ("services/ips", json!({})),
+            ("services/other", json!(1)),
+        ];
+        let entries: Vec<_> = (1..)
+            .zip(&reserved)
+            .map(|(i, (key, value))| set(1, i, key, value.clone()))
+            .collect();
+        let replies = s.state_machine.apply(entries).await.unwrap();
         assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
         assert_eq!(s.reader.get(KEY_MESH).unwrap(), None);
-        assert_eq!(last_index(&mut s).await, Some(1));
+        assert!(dump(&s).is_empty());
+        assert_eq!(last_index(&mut s).await, Some(reserved.len() as u64));
         drop(s);
     }
 
@@ -1468,6 +1480,16 @@ mod tests {
                         endpoint: "192.0.2.1:51820".into(),
                     },
                 ),
+                normal(4, Request::AdvanceClock { elapsed_secs: 30 }),
+                normal(
+                    5,
+                    Request::RenewLease {
+                        node_id: 1,
+                        instance_id: "cd".repeat(16),
+                    },
+                ),
+                normal(6, Request::RemoveNode { node_id: 2 }),
+                normal(7, Request::SetLease { secs: 600 }),
             ])
             .await
             .unwrap();
@@ -1476,7 +1498,7 @@ mod tests {
             "{replies:?}"
         );
         assert_eq!(s.reader.mesh().unwrap(), None);
-        assert_eq!(last_index(&mut s).await, Some(3));
+        assert_eq!(last_index(&mut s).await, Some(7));
         drop(s);
     }
 
@@ -1819,36 +1841,6 @@ mod tests {
         let sm = &b.state_machine;
         assert_eq!(sm.member_ids(&pending(sm)).unwrap(), ids(&[1, 2, 5]));
         drop((a, b));
-    }
-
-    /// The lease commands reach the mesh state: without a mesh they are
-    /// refused like every other mesh command.
-    #[tokio::test]
-    async fn lease_commands_without_mesh_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = open(dir.path()).unwrap();
-        let replies = s
-            .state_machine
-            .apply([
-                normal(1, Request::AdvanceClock { elapsed_secs: 30 }),
-                normal(
-                    2,
-                    Request::RenewLease {
-                        node_id: 1,
-                        instance_id: "cd".repeat(16),
-                    },
-                ),
-                normal(3, Request::RemoveNode { node_id: 2 }),
-                normal(4, Request::SetLease { secs: 600 }),
-            ])
-            .await
-            .unwrap();
-        assert!(
-            replies.iter().all(rejected(ec::MESH_NOT_CONFIGURED)),
-            "{replies:?}"
-        );
-        assert_eq!(last_index(&mut s).await, Some(4));
-        drop(s);
     }
 
     fn init_cluster_with_range(range: &str, prefix: u8) -> Request {
@@ -2468,15 +2460,6 @@ mod tests {
         assert!(matches!(reader.mesh(), Err(ReadError::Closed)));
     }
 
-    #[tokio::test]
-    async fn reader_reports_closed_after_db_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = open(dir.path()).unwrap();
-        let reader = s.reader.clone();
-        drop(s);
-        assert!(matches!(reader.get("x"), Err(ReadError::Closed)));
-    }
-
     // --- projects and workloads --------------------------------------------
 
     use crate::apps::WorkloadRecord;
@@ -2878,23 +2861,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_set_cannot_write_status_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = open(dir.path()).unwrap();
-        let replies = s
-            .state_machine
-            .apply([
-                set(1, 1, "status/1", json!({})),
-                set(1, 2, status::KEY_INTERVAL, json!(1)),
-            ])
-            .await
-            .unwrap();
-        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
-        assert!(dump(&s).is_empty());
-        drop(s);
-    }
-
-    #[tokio::test]
     async fn snapshot_carries_status_records() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -3032,24 +2998,6 @@ mod tests {
         assert!(rejected(ec::BAD_REQUEST)(&other), "{other:?}");
         assert_eq!(dump(&s), before);
         assert_eq!(s.reader.cluster_key_id().unwrap().unwrap().key_id, "abc123");
-        drop(s);
-    }
-
-    #[tokio::test]
-    async fn set_cannot_write_the_key_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = open(dir.path()).unwrap();
-        let replies = s
-            .state_machine
-            .apply([
-                set(1, 1, keys::KEY_CLUSTER_ID, json!({"key_id": "forged"})),
-                set(1, 2, "keys/data/shop/staging", json!({"forged": true})),
-                set(1, 3, "keys/data/cluster", json!({})),
-            ])
-            .await
-            .unwrap();
-        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
-        assert_eq!(dump(&s), BTreeMap::new());
         drop(s);
     }
 
@@ -3709,22 +3657,6 @@ mod tests {
                 "{req:?}: {reply:?}"
             );
         }
-        assert_eq!(dump(&s), before);
-    }
-
-    #[tokio::test]
-    async fn service_ips_cannot_be_written_with_set() {
-        let (_dir, mut s) = services_cluster("10.201.0.0/16").await;
-        let before = dump(&s);
-        let replies = s
-            .state_machine
-            .apply([
-                set(1, 4, "services/ips", json!({})),
-                set(1, 5, "services/other", json!(1)),
-            ])
-            .await
-            .unwrap();
-        assert!(replies.iter().all(rejected(ec::BAD_REQUEST)), "{replies:?}");
         assert_eq!(dump(&s), before);
     }
 

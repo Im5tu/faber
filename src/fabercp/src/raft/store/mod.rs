@@ -115,7 +115,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn index_encoding_sorts_numerically() {
+    fn index_encoding_sorts_numerically_and_round_trips() {
+        for v in [0u64, 42, u64::MAX] {
+            assert_eq!(decode_index(&encode_index(v)), Some(v));
+        }
+        assert_eq!(decode_index(b"short"), None);
         let values = [0u64, 1, 9, 10, 255, 256, 65_535, 65_536, u64::MAX - 1];
         for pair in values.windows(2) {
             assert!(encode_index(pair[0]) < encode_index(pair[1]), "{pair:?}");
@@ -179,13 +183,5 @@ mod tests {
         drop(db);
         assert!(knows_member(&mut s, 2).await.unwrap());
         assert!(!knows_member(&mut s, 3).await.unwrap());
-    }
-
-    #[test]
-    fn index_encoding_round_trips() {
-        for v in [0u64, 42, u64::MAX] {
-            assert_eq!(decode_index(&encode_index(v)), Some(v));
-        }
-        assert_eq!(decode_index(b"short"), None);
     }
 }
