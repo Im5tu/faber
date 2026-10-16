@@ -2,8 +2,9 @@
 
 pub mod deploy;
 mod output;
+mod watch;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -177,6 +178,20 @@ pub enum AppCommand {
         workload: String,
         #[command(flatten)]
         target: Target,
+        /// Keep polling and show the workload again whenever it changes,
+        /// until interrupted. With --output json, one compact JSON object
+        /// per line.
+        #[arg(long)]
+        watch: bool,
+        /// How often --watch polls: seconds, or a number with s, m, h or d.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "2s",
+            value_parser = parse_ttl,
+            requires = "watch"
+        )]
+        interval: u64,
     },
     /// Remove workloads, one after the other, stopping at the first failure.
     Rm {
@@ -468,7 +483,36 @@ pub async fn run_with_inputs(
             let list = client.workload_list(&query, false).await.map_err(api)?;
             output::workloads(format, &list)?
         }
-        Command::App(AppCommand::Show { workload, target }) => {
+        Command::App(AppCommand::Show {
+            workload,
+            target,
+            watch: true,
+            interval,
+        }) => {
+            let source = watch::ClientSource {
+                client: &client,
+                project: &target.project,
+                environment: &target.environment,
+                workload: &workload,
+            };
+            let opts = watch::Options {
+                interval: std::time::Duration::from_secs(interval),
+                format,
+                clear: format == OutputFormat::Text && std::io::stdout().is_terminal(),
+                describe: &api,
+            };
+            // A failed signal handler cannot stop a watch from being stopped
+            // some other way, so it never ends it.
+            let interrupted = async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            return watch::watch(&source, &watch::TokioSleeper, &opts, interrupted, out, err).await;
+        }
+        Command::App(AppCommand::Show {
+            workload, target, ..
+        }) => {
             // Env values are always shown, so they are always asked for.
             let found = client
                 .workload_get(&target.project, &target.environment, &workload, true)

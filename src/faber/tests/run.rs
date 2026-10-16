@@ -1494,6 +1494,25 @@ async fn app_show_of_an_unknown_workload_is_readable() {
     assert_eq!(out, "");
 }
 
+/// A 4xx ends the watch with that error, and nothing was drawn.
+#[tokio::test]
+async fn app_show_watch_of_an_unknown_workload_is_the_error() {
+    let server = MockServer::start().await;
+    let body = json!({"error": "not_found", "message": "no workload named web"});
+    Mock::given(method("GET"))
+        .and(path(WORKLOAD_ROUTE))
+        .and(query_param("reveal", "true"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let args = with_target(&["app", "show", "web", "--watch"], &[]);
+    let (err, out) = run_err(&server, &args).await;
+    assert_eq!(err, "not_found: no workload named web");
+    assert_eq!(out, "");
+}
+
 // ---- control characters ----
 
 /// Whatever is in cluster state, text output cannot carry a terminal

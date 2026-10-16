@@ -476,6 +476,8 @@ fn app_subcommands_parse() {
         Command::App(AppCommand::Show {
             workload: "web".into(),
             target: target("shop", "staging"),
+            watch: false,
+            interval: 2,
         })
     );
     assert_eq!(
@@ -495,6 +497,37 @@ fn app_subcommands_parse() {
             target: target("shop", "staging"),
         })
     );
+}
+
+#[test]
+fn app_show_watch_takes_an_interval_of_a_second_or_more() {
+    let base = [
+        "app",
+        "show",
+        "web",
+        "--project",
+        "shop",
+        "--env",
+        "staging",
+    ];
+    let show = |extra: &[&str]| parse(&[&base[..], extra].concat()).command;
+    let want = |watch, interval| {
+        Command::App(AppCommand::Show {
+            workload: "web".into(),
+            target: target("shop", "staging"),
+            watch,
+            interval,
+        })
+    };
+    assert_eq!(show(&["--watch"]), want(true, 2));
+    assert_eq!(show(&["--watch", "--interval", "5"]), want(true, 5));
+    assert_eq!(show(&["--watch", "--interval", "1s"]), want(true, 1));
+    assert_eq!(show(&["--watch", "--interval", "2m"]), want(true, 120));
+    // Less than a second is no interval.
+    parse_err(&[&base[..], &["--watch", "--interval", "0"]].concat());
+    parse_err(&[&base[..], &["--watch", "--interval", "500ms"]].concat());
+    // The interval means nothing without --watch.
+    parse_err(&[&base[..], &["--interval", "5"]].concat());
 }
 
 #[test]
