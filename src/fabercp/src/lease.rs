@@ -897,12 +897,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_leader_task_stops_when_cancelled() {
-        let node = TestNode::start().await;
+        let node = TestNode::start_initialized().await;
+        seed_mesh(&node.service).await;
         let cancel = CancellationToken::new();
         let task = spawn_leader_task(node.service.clone(), node.state(), cancel.clone());
-        // It runs until it is told to stop.
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished());
+        // With the production clocks the task sleeps at least five seconds
+        // between ticks, so it ends within `stop_task`'s five seconds only
+        // by acting on the cancellation: a task that ignored it would run
+        // on, and the wait there would fail.
         stop_task(&cancel, task).await;
         node.shutdown().await;
     }

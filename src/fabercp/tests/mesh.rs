@@ -467,14 +467,9 @@ async fn found(mut node: MeshNode) -> MeshNode {
 
 /// Founder plus node 2 joined from a token.
 async fn two_nodes() -> (MeshNode, MeshNode, InviteResponse) {
-    two_nodes_with(founder().await, MeshNode::new()).await
-}
-
-/// [`two_nodes`] with the founder `n1` already running, and the joiner not.
-async fn two_nodes_with(n1: MeshNode, mut n2: MeshNode) -> (MeshNode, MeshNode, InviteResponse) {
+    let n1 = founder().await;
     let invite = n1.invite("node-2", "198.51.100.2", None).await;
-    n2.launch(Bootstrap::Token(invite.token.clone()), None)
-        .await;
+    let n2 = MeshNode::start(Bootstrap::Token(invite.token.clone())).await;
     eventually("node 2 is a voter", || {
         let mut v = n1.voters();
         v.sort();
@@ -1159,15 +1154,22 @@ async fn node_joins_from_token_and_invites_are_single_use_and_expire() {
         )
     );
 
-    // A short-lived invite is a wg peer until it expires.
+    // A short-lived invite is a wg peer until it expires. Under load the
+    // peer may come and go before this test looks, so it does not wait for
+    // the peer to appear (`a_live_invite_gets_no_way_to_the_containers`
+    // does): it waits for the invite's time to pass, then for the leader to
+    // have dropped the peer.
     let short = n1.invite("node-3", "198.51.100.3:51000", Some(3)).await;
     let short_token = InviteToken::decode(&short.token).unwrap();
     let pk3 = public_key_of(&short_token.private_key).unwrap();
-    eventually("invite peer added", || {
-        n1.host.last_syncconf().contains(&pk3)
+    eventually("the invite's time has passed", || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now >= short.expires_at
     })
     .await;
-    // The leader drops the peer when the invite runs out.
     eventually("expired invite dropped from wg", || {
         let conf = n1.host.last_syncconf();
         !conf.contains(&pk3) && conf.contains(&pk2)
@@ -1286,13 +1288,10 @@ async fn follower_invites_are_forwarded_and_restart_does_not_rejoin() {
 /// node and the leader carry on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_machine_with_a_used_token_never_acts_as_the_node() {
-    let (mut n1, mut n2, invite) =
-        two_nodes_with(found(MeshNode::fast()).await, MeshNode::fast()).await;
+    let (mut n1, mut n2, invite) = two_nodes().await;
     let id2 = n2.identity();
 
-    let mut twin = MeshNode::fast();
-    twin.launch(Bootstrap::Token(invite.token.clone()), None)
-        .await;
+    let mut twin = MeshNode::start(Bootstrap::Token(invite.token.clone())).await;
     let identity_file = twin.state_dir().join("identity.json");
     eventually("the twin's identity is discarded", || {
         !identity_file.exists()
@@ -1314,9 +1313,9 @@ async fn a_second_machine_with_a_used_token_never_acts_as_the_node() {
     );
     assert!(!twin.host.link_up.load(Ordering::SeqCst));
     assert!(!twin.state_dir().join("iface").exists());
-    // The host loop has stopped: nothing brings the interface back, not
-    // even the periodic resync (2s in these tests).
-    lease_clock_runs(&n1, A_RESYNC).await;
+    // The host loop has stopped: teardown joins it before it removes the
+    // interface, and `ip link del` is the last command, so nothing is left
+    // that could bring the interface back, the periodic resync included.
     assert_eq!(twin.cmdlines(), lines);
 
     // It takes no raft RPC.
@@ -1405,6 +1404,7 @@ async fn a_joiner_that_registered_before_it_stopped_goes_on_to_join() {
             Some(instance.as_str())
         );
         assert_eq!(n2.identity().private_key, made.private_key);
+        assert!(n2.state_dir().join("identity.json").is_file());
 
         n2.stop().await;
         n1.stop().await;
@@ -1485,8 +1485,6 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
 
     let port = n2.peer_addr().port();
     n2.stop().await;
-    let (term, index) = n1.log_position();
-    let started = std::time::Instant::now();
     n2.wg_endpoint = Some(new_endpoint.into());
     n2.launch(Bootstrap::Existing, Some(port)).await;
 
@@ -1495,9 +1493,8 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
     })
     .await;
     assert_eq!(n1.replicated_endpoint(2).as_deref(), Some(new_endpoint));
-    // Any further, unwanted write would be queued behind this one: commit
-    // an entry of our own, and every write sent before it is in the log.
-    // The entry is one of the few counted below.
+    // Let anything node 2 proposed again reach the log: an entry of our own
+    // is committed behind it, and node 2 has applied that too.
     let barrier = n1.invite("node-3", "198.51.100.3", None).await;
     eventually("node 2 applies the barrier", || {
         n2.mesh()
@@ -1506,27 +1503,35 @@ async fn a_follower_replicates_its_new_endpoint_with_one_write() {
             .any(|i| i.node_id == barrier.node_id)
     })
     .await;
-    let (term_after, index_after) = n1.log_position();
-    // A new term adds an entry of its own, which says nothing about this.
-    // The restarted node also renews its lease, once. Every node reports
-    // its status when it starts and then every five seconds, so up to three
-    // `ReportNode` entries may be in the window as well: the restarted
-    // node's first report and one periodic report of each node. A write
-    // proposed again and again would add far more. On a busy machine the
-    // window is longer and holds more periodic reports: two more for every
-    // five seconds.
-    if term_after == term {
-        let added = index_after.zip(index).map(|(after, before)| after - before);
-        // Reports also follow changes in what a node reports, so allow a few more.
-        let reports = 4 + 2 * (started.elapsed().as_secs() / 5 + 1);
-        assert!(
-            added.is_some_and(|n| (3..=3 + reports).contains(&n)),
-            "one RenewLease, one SetEndpoint, the barrier and up to {reports} reports expected,              got {added:?}"
-        );
-    }
 
+    // Count what node 2 proposed, in the leader's log, once both are shut
+    // down and the database is free.
     n2.stop().await;
+    let data = n1.dir.path().join("data");
     n1.stop().await;
+    assert_eq!(set_endpoint_entries(&data, 2, new_endpoint).await, 1);
+}
+
+/// How many `SetEndpoint` entries for node `id` with `endpoint` the log in
+/// the data directory `data` holds. The node must not be running.
+async fn set_endpoint_entries(data: &Path, id: u64, endpoint: &str) -> usize {
+    use fabercp::raft::store;
+    use fabercp::raft::types::Request;
+    use openraft::EntryPayload;
+    use openraft::storage::RaftLogReader;
+
+    let mut log = store::open(data).unwrap().log_store;
+    let entries = log.try_get_log_entries(..).await.unwrap();
+    entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.payload,
+                EntryPayload::Normal(Request::SetEndpoint { node_id, endpoint: ep })
+                    if *node_id == id && ep == endpoint
+            )
+        })
+        .count()
 }
 
 /// Raft was initialised but the process stopped before `InitCluster`: a
@@ -2012,9 +2017,9 @@ async fn a_node_removed_while_stopped_gives_up_its_identity_when_it_returns() {
         (s, b.error.as_str()),
         (StatusCode::SERVICE_UNAVAILABLE, error_code::NOT_READY)
     );
-    // The host loop has stopped: nothing brings the interface back, not
-    // even the periodic resync (2s in these tests).
-    lease_clock_runs(&n1, A_RESYNC).await;
+    // The host loop has stopped: teardown joins it before it removes the
+    // interface, and `ip link del` is the last command, so nothing is left
+    // that could bring the interface back, the periodic resync included.
     assert_eq!(n3.cmdlines(), lines);
     assert_eq!(n1.sorted_voters(), [1, 2]);
 
