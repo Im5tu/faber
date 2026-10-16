@@ -277,9 +277,13 @@ impl FaberService {
             .placement(project, environment)
             .map_err(|e| ServiceError::Internal(format!("placement: {e}")))?;
         let placed = placement.as_ref().map_or(&[][..], |p| p.replicas(workload));
-        let replicas =
-            self.status_view()?
-                .workload(project, environment, workload, stored.revision, placed);
+        let replicas = self.status_view()?.replicas_shown(
+            project,
+            environment,
+            workload,
+            stored.revision,
+            placed,
+        );
         Ok(WorkloadResponse {
             project: project.to_string(),
             environment: environment.to_string(),

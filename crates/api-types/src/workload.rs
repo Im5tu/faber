@@ -1410,10 +1410,13 @@ pub struct WorkloadResponse {
     /// The generation of the environment the workload was read from.
     pub generation: u64,
     pub spec: WorkloadSpec,
-    /// Each replica the leader has placed, sorted by replica index, with what
-    /// its node last reported. Empty until the leader has placed the workload.
-    /// A replica whose node has not reported for three report intervals reads
-    /// `unavailable`.
+    /// The pods of each replica the leader has placed, with what its node last
+    /// reported, sorted by replica index and then newest revision first. Each
+    /// row carries the revision that pod runs, which can be older than
+    /// `revision` during a roll. A replica with no report at `revision` also
+    /// has a `deploying` row at `revision`. Empty until the leader has placed
+    /// the workload. A replica whose node has not reported for three report
+    /// intervals reads `unavailable`.
     #[serde(default)]
     pub replicas: Vec<ReplicaStatus>,
 }

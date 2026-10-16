@@ -475,6 +475,79 @@ impl StatusView {
             })
             .collect()
     }
+
+    /// What `app show` lists: every pod the placed node reports for the
+    /// workload, at any revision up to `revision`, each with its own revision
+    /// and state, so a roll shows the old pods beside the new ones.
+    ///
+    /// As in [`Self::workload`], only the report of the node a replica is
+    /// placed on counts. Reports of a revision above `revision` are dropped.
+    /// A placed replica with no report at `revision` also gets a `deploying`
+    /// row (`unavailable` when its node is stale) at `revision`. An unplaced
+    /// replica is `unavailable` with the reason it has no node. Rows are
+    /// sorted by replica index, then newest revision first.
+    pub fn replicas_shown(
+        &self,
+        project: &str,
+        environment: &str,
+        workload: &str,
+        revision: u64,
+        placed: &[ReplicaPlacement],
+    ) -> Vec<ReplicaStatus> {
+        let mut rows = Vec::with_capacity(placed.len());
+        for p in placed {
+            let Some(node) = p.node else {
+                rows.push(ReplicaStatus {
+                    node: None,
+                    replica_index: p.index,
+                    revision,
+                    state: ReplicaState::Unavailable,
+                    pod_ip: None,
+                    reason: p.reason.clone(),
+                });
+                continue;
+            };
+            let first = rows.len();
+            for (_, r) in self.replicas.iter().filter(|(n, r)| {
+                *n == node
+                    && r.project == project
+                    && r.environment == environment
+                    && r.workload == workload
+                    && r.replica_index == p.index
+                    && r.revision <= revision
+            }) {
+                // One row per revision, should a node report one twice.
+                if rows[first..].iter().any(|row| row.revision == r.revision) {
+                    continue;
+                }
+                rows.push(ReplicaStatus {
+                    node: Some(node),
+                    replica_index: p.index,
+                    revision: r.revision,
+                    state: r.state,
+                    pod_ip: r.pod_ip,
+                    reason: None,
+                });
+            }
+            if !rows[first..].iter().any(|row| row.revision == revision) {
+                let state = if self.nodes.get(&node).is_some_and(|n| n.stale) {
+                    ReplicaState::Unavailable
+                } else {
+                    ReplicaState::Deploying
+                };
+                rows.push(ReplicaStatus {
+                    node: Some(node),
+                    replica_index: p.index,
+                    revision,
+                    state,
+                    pod_ip: None,
+                    reason: None,
+                });
+            }
+        }
+        rows.sort_by_key(|row| (row.replica_index, std::cmp::Reverse(row.revision)));
+        rows
+    }
 }
 
 /// The reports in `state` as of the lease clock of `mesh`, for nodes that
@@ -726,6 +799,130 @@ mod tests {
         let got = fresh.workload("shop", "staging", "web", 3, &placed(&[(0, 1)]));
         assert_eq!(got[0].state, ReplicaState::Deploying);
         assert_eq!(got[0].revision, 3);
+    }
+
+    fn replica_at(index: u32, revision: u64, state: ReplicaState) -> ReplicaReport {
+        ReplicaReport {
+            revision,
+            ..replica("web", index, state)
+        }
+    }
+
+    #[test]
+    fn replicas_shown_lists_each_revision_a_node_reports_newest_first() {
+        let statuses = BTreeMap::from([
+            (
+                1,
+                record(
+                    0,
+                    vec![
+                        replica_at(0, 1, ReplicaState::Available),
+                        replica_at(0, 2, ReplicaState::Deploying),
+                    ],
+                ),
+            ),
+            (
+                2,
+                record(0, vec![replica_at(1, 1, ReplicaState::Available)]),
+            ),
+        ]);
+        let view = StatusView::new(statuses, 5, 0, 0);
+        let got = view.replicas_shown("shop", "staging", "web", 2, &placed(&[(1, 2), (0, 1)]));
+        assert_eq!(
+            got.iter()
+                .map(|r| (r.replica_index, r.revision, r.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2, ReplicaState::Deploying),
+                (0, 1, ReplicaState::Available),
+                // Index 1 has nothing at 2 yet: a deploying row beside the old pod.
+                (1, 2, ReplicaState::Deploying),
+                (1, 1, ReplicaState::Available),
+            ]
+        );
+        assert_eq!(got[3].pod_ip, Some("10.200.1.2".parse().unwrap()));
+        assert_eq!(got[2].pod_ip, None);
+    }
+
+    #[test]
+    fn replicas_shown_ignores_other_nodes_and_future_revisions() {
+        let statuses = BTreeMap::from([
+            (
+                1,
+                record(
+                    0,
+                    vec![
+                        replica_at(0, 2, ReplicaState::Available),
+                        replica_at(0, 3, ReplicaState::Available),
+                    ],
+                ),
+            ),
+            (
+                2,
+                record(0, vec![replica_at(0, 1, ReplicaState::Available)]),
+            ),
+        ]);
+        let view = StatusView::new(statuses, 5, 0, 0);
+        let got = view.replicas_shown("shop", "staging", "web", 2, &placed(&[(0, 1)]));
+        assert_eq!(
+            got.iter().map(|r| (r.node, r.revision)).collect::<Vec<_>>(),
+            vec![(Some(1), 2)]
+        );
+        // Nothing placed shows nothing.
+        assert!(
+            view.replicas_shown("shop", "staging", "web", 2, &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replicas_shown_marks_unplaced_and_stale_replicas() {
+        let statuses = BTreeMap::from([(
+            1,
+            record(0, vec![replica_at(0, 1, ReplicaState::Available)]),
+        )]);
+        let mut all = placed(&[(0, 1), (1, 1)]);
+        all.push(ReplicaPlacement::unplaced(2, "insufficient_capacity"));
+        let fresh = StatusView::new(statuses.clone(), 5, 0, 0);
+        let got = fresh.replicas_shown("shop", "staging", "web", 2, &all);
+        assert_eq!(
+            got.iter()
+                .map(|r| (r.replica_index, r.revision, r.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2, ReplicaState::Deploying),
+                (0, 1, ReplicaState::Available),
+                (1, 2, ReplicaState::Deploying),
+                (2, 2, ReplicaState::Unavailable),
+            ]
+        );
+        assert_eq!(got[3].node, None);
+        assert_eq!(got[3].reason.as_deref(), Some("insufficient_capacity"));
+        // A quiet node: its old pod and the missing new one are unavailable.
+        let stale = StatusView::new(statuses, 5, 1000, 0);
+        let got = stale.replicas_shown("shop", "staging", "web", 2, &all);
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|r| r.state == ReplicaState::Unavailable));
+    }
+
+    #[test]
+    fn replicas_shown_matches_workload_when_every_report_is_current() {
+        let statuses = BTreeMap::from([
+            (
+                1,
+                record(0, vec![replica("web", 0, ReplicaState::Available)]),
+            ),
+            (
+                2,
+                record(0, vec![replica("web", 1, ReplicaState::Deploying)]),
+            ),
+        ]);
+        let view = StatusView::new(statuses, 5, 0, 0);
+        let p = placed(&[(0, 1), (1, 2), (2, 2)]);
+        assert_eq!(
+            view.replicas_shown("shop", "staging", "web", 2, &p),
+            view.workload("shop", "staging", "web", 2, &p)
+        );
     }
 
     #[test]
