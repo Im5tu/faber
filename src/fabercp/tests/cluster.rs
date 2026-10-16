@@ -261,10 +261,12 @@ async fn a_learner_does_not_count_as_joined() {
 async fn a_learner_is_promoted_only_once_it_has_caught_up() {
     let mut n1 = common::single_node().await;
 
-    // Node 2's peer address, with nothing listening on it yet.
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Node 2's peer address, with nothing listening on it yet. The port is
+    // held bound, so no other test can take it, and connections to it are
+    // refused until the socket listens.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr2 = reserved.local_addr().unwrap();
-    drop(reserved);
     n1.handle()
         .raft()
         .add_learner(2, Node::new(addr2.to_string()), false)
@@ -302,7 +304,7 @@ async fn a_learner_is_promoted_only_once_it_has_caught_up() {
     // Node 2 comes up at that address and catches up; the retry succeeds.
     let dir2 = tempfile::tempdir().unwrap();
     let api2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let peer2 = TcpListener::bind(addr2).await.unwrap();
+    let peer2 = reserved.listen(1024).unwrap();
     let n2 = fabercp::start(common::fast_config(2, dir2.path()), api2, peer2)
         .await
         .unwrap();
