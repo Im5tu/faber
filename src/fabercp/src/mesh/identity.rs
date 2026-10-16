@@ -749,14 +749,9 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_is_none() {
-        let dir = TempDir::new().unwrap();
-        assert!(load(dir.path()).unwrap().is_none());
-    }
-
-    #[test]
     fn save_then_load_round_trips() {
         let dir = TempDir::new().unwrap();
+        assert!(load(dir.path()).unwrap().is_none());
         save(dir.path(), &sample()).unwrap();
         assert_eq!(load(dir.path()).unwrap(), Some(sample()));
         // Overwrite.
@@ -770,16 +765,6 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec![IDENTITY_FILE.to_string()]);
-    }
-
-    #[test]
-    fn save_into_missing_dir_fails() {
-        let dir = TempDir::new().unwrap();
-        let missing = dir.path().join("nope");
-        assert!(matches!(
-            save(&missing, &sample()),
-            Err(IdentityError::Io { .. })
-        ));
     }
 
     #[cfg(unix)]

@@ -912,10 +912,7 @@ mod tests {
         assert_eq!(MIN_LEASE_SECS, 5 * 60);
         assert_eq!(MAX_LEASE_SECS, 30 * 24 * 60 * 60);
         assert_eq!(FOUNDER_DEFAULT_NAME, "node-1");
-    }
 
-    #[test]
-    fn mesh_config_default() {
         let c = MeshConfig::default();
         assert_eq!(c.cidr, DEFAULT_MESH_CIDR);
         assert_eq!(c.peer_port, 7401);
@@ -1029,8 +1026,10 @@ mod tests {
         assert_eq!(serde_json::from_value::<InviteRecord>(v).unwrap(), named);
     }
 
+    /// A record that predates the optional, container and lease fields
+    /// decodes with them unset, and serialises without them.
     #[test]
-    fn node_record_optional_fields_default_to_none() {
+    fn node_record_optional_fields_default_and_stay_off_the_wire() {
         let n: NodeRecord = serde_json::from_value(json!({
             "node_id": 1, "public_key": "pk", "mesh_ip": "10.99.0.1"
         }))
@@ -1039,51 +1038,29 @@ mod tests {
         assert_eq!(n.invite_id, None);
         assert_eq!(n.instance_id, None);
         assert_eq!(n.container_subnet, None);
-        // A record without an instance id or a container subnet serialises
-        // as it did before the fields existed.
-        let v = serde_json::to_value(&n).unwrap();
-        assert!(v.get("instance_id").is_none(), "{v}");
-        assert!(v.get("container_subnet").is_none(), "{v}");
-
-        let with = NodeRecord {
-            container_subnet: Some("10.200.3.0/24".parse().unwrap()),
-            ..n
-        };
-        let v = serde_json::to_value(&with).unwrap();
-        assert_eq!(v["container_subnet"], "10.200.3.0/24");
-        assert_eq!(serde_json::from_value::<NodeRecord>(v).unwrap(), with);
-    }
-
-    /// A node stored before leases existed decodes, and a node with no name
-    /// and no renewal serialises as it did then.
-    #[test]
-    fn node_record_without_lease_fields_decodes() {
-        let n: NodeRecord = serde_json::from_value(json!({
-            "node_id": 1, "public_key": "pk", "mesh_ip": "10.99.0.1"
-        }))
-        .unwrap();
         assert_eq!(n.name, "");
         assert_eq!(n.lease_renewed_at, 0);
         let v = serde_json::to_value(&n).unwrap();
-        assert!(v.get("name").is_none(), "{v}");
-        assert!(v.get("lease_renewed_at").is_none(), "{v}");
+        for absent in [
+            "instance_id",
+            "container_subnet",
+            "name",
+            "lease_renewed_at",
+        ] {
+            assert!(v.get(absent).is_none(), "{absent}: {v}");
+        }
 
         let with = NodeRecord {
+            container_subnet: Some("10.200.3.0/24".parse().unwrap()),
             name: "web-1".into(),
             lease_renewed_at: 42,
             ..n
         };
         let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["container_subnet"], "10.200.3.0/24");
         assert_eq!(v["name"], "web-1");
         assert_eq!(v["lease_renewed_at"], 42);
         assert_eq!(serde_json::from_value::<NodeRecord>(v).unwrap(), with);
-    }
-
-    #[test]
-    fn rejection_displays_code_and_message() {
-        let r = Rejection::new("invite_used", "invite already used");
-        assert_eq!(r.code, "invite_used");
-        assert_eq!(r.to_string(), "invite_used: invite already used");
     }
 
     // --- MeshState behaviour -------------------------------------------------

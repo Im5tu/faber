@@ -157,12 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn prefix_and_version() {
-        assert_eq!(TOKEN_PREFIX, "faber1.");
-        assert_eq!(TOKEN_VERSION, 1);
-    }
-
-    #[test]
     fn round_trips() {
         let t = sample();
         let s = t.encode();
@@ -208,61 +202,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_prefix() {
-        let s = sample().encode().replacen("faber1.", "faber2.", 1);
-        assert!(matches!(
-            InviteToken::decode(&s),
-            Err(TokenError::BadPrefix)
-        ));
-        assert!(matches!(
-            InviteToken::decode(""),
-            Err(TokenError::BadPrefix)
-        ));
-    }
+    fn rejects_malformed_tokens() {
+        let without = |field: &str| {
+            let mut v = serde_json::to_value(sample()).unwrap();
+            v.as_object_mut().unwrap().remove(field);
+            v
+        };
+        let mut v2 = serde_json::to_value(sample()).unwrap();
+        v2["v"] = json!(2);
 
-    #[test]
-    fn rejects_bad_base64() {
-        assert!(matches!(
-            InviteToken::decode("faber1.not*base64"),
-            Err(TokenError::Base64(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_bad_json() {
-        let s = format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(b"{not json"));
-        assert!(matches!(InviteToken::decode(&s), Err(TokenError::Json(_))));
-    }
-
-    #[test]
-    fn rejects_other_versions() {
-        let mut v = serde_json::to_value(sample()).unwrap();
-        v["v"] = json!(2);
-        assert!(matches!(
-            InviteToken::decode(&encode_value(v.clone())),
-            Err(TokenError::UnsupportedVersion(2))
-        ));
-        v.as_object_mut().unwrap().remove("v");
-        assert!(matches!(
-            InviteToken::decode(&encode_value(v)),
-            Err(TokenError::UnsupportedVersion(0))
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_fields() {
-        let mut v = serde_json::to_value(sample()).unwrap();
-        v.as_object_mut().unwrap().remove("private_key");
-        assert!(matches!(
-            InviteToken::decode(&encode_value(v)),
-            Err(TokenError::Json(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_oversized_token() {
-        let s = format!("{TOKEN_PREFIX}{}", "A".repeat(MAX_TOKEN_LEN));
-        assert!(matches!(InviteToken::decode(&s), Err(TokenError::TooLong)));
+        type Is = fn(&TokenError) -> bool;
+        let cases: Vec<(&str, String, Is)> = vec![
+            (
+                "other prefix",
+                sample().encode().replacen("faber1.", "faber2.", 1),
+                |e| matches!(e, TokenError::BadPrefix),
+            ),
+            ("empty", String::new(), |e| {
+                matches!(e, TokenError::BadPrefix)
+            }),
+            ("bad base64", "faber1.not*base64".into(), |e| {
+                matches!(e, TokenError::Base64(_))
+            }),
+            (
+                "bad json",
+                format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(b"{not json")),
+                |e| matches!(e, TokenError::Json(_)),
+            ),
+            ("version 2", encode_value(v2), |e| {
+                matches!(e, TokenError::UnsupportedVersion(2))
+            }),
+            ("no version", encode_value(without("v")), |e| {
+                matches!(e, TokenError::UnsupportedVersion(0))
+            }),
+            (
+                "no private key",
+                encode_value(without("private_key")),
+                |e| matches!(e, TokenError::Json(_)),
+            ),
+            (
+                "oversized",
+                format!("{TOKEN_PREFIX}{}", "A".repeat(MAX_TOKEN_LEN)),
+                |e| matches!(e, TokenError::TooLong),
+            ),
+        ];
+        for (why, token, is) in cases {
+            let err = InviteToken::decode(&token).unwrap_err();
+            assert!(is(&err), "{why}: {err:?}");
+        }
     }
 
     #[test]

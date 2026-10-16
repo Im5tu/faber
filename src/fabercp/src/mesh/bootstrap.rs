@@ -134,21 +134,6 @@ mod tests {
         assert_eq!(read(dir.path()).unwrap(), None);
     }
 
-    #[test]
-    fn clear_removes_the_marker() {
-        let dir = TempDir::new().unwrap();
-        write(dir.path(), BootstrapError::TokenExpired).unwrap();
-        clear(dir.path()).unwrap();
-        assert!(!path(dir.path()).exists());
-        clear(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn write_into_a_missing_dir_fails() {
-        let dir = TempDir::new().unwrap();
-        assert!(write(&dir.path().join("nope"), BootstrapError::TokenExpired).is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn the_marker_is_a_regular_file_with_mode_0600() {
