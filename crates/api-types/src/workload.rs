@@ -202,6 +202,12 @@ pub struct WorkloadSpec {
     /// Who may resolve and reach the workload. Stored, not enforced yet.
     #[serde(default)]
     pub expose: Exposure,
+    /// Lets the pods open connections to addresses outside the container,
+    /// service and mesh ranges and outside `169.254.0.0/16`, masqueraded to
+    /// the node address on its default route. IPv4 only. Not part of the pod
+    /// template.
+    #[serde(default)]
+    pub egress: bool,
     #[serde(default)]
     pub placement: Placement,
     /// Seconds between the stop signal and the kill. The runner's default
@@ -1506,7 +1512,7 @@ pub struct WorkloadSummary {
     pub scale: Scale,
     pub expose: Exposure,
     /// Moves when the pod template changes: everything in the spec except
-    /// `scale`, `placement` and `expose`.
+    /// `scale`, `placement`, `expose` and `egress`.
     pub revision: u64,
     /// Replicas whose state is `available`.
     pub available: u32,
@@ -1610,6 +1616,7 @@ mod tests {
         );
         assert_eq!(spec.restart, RestartPolicy::Always);
         assert_eq!(spec.expose, Exposure::Environment);
+        assert!(!spec.egress);
         assert_eq!(spec.containers, vec![ContainerSpec::new("web", "nginx")]);
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -1617,6 +1624,7 @@ mod tests {
                 "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                 "restart": "always",
                 "expose": "environment",
+                "egress": false,
                 "placement": {"nodes": []},
                 "volumes": {},
                 "containers": [{
@@ -1677,6 +1685,7 @@ mod tests {
             },
             restart: RestartPolicy::OnFailure,
             expose: Exposure::Cluster,
+            egress: true,
             placement: Placement {
                 nodes: vec!["node-1".into(), "node-2".into()],
             },
@@ -1701,6 +1710,7 @@ mod tests {
             "scale": {"replicas": {"count": 3, "strategy": "pack"}},
             "restart": "on_failure",
             "expose": "cluster",
+            "egress": true,
             "placement": {"nodes": ["node-1", "node-2"]},
             "stop_grace_secs": 30,
             "volumes": {
@@ -1857,6 +1867,7 @@ mod tests {
             scale: Scale::default(),
             restart: RestartPolicy::default(),
             expose: Exposure::default(),
+            egress: false,
             placement: Placement::default(),
             stop_grace_secs: None,
             volumes: BTreeMap::new(),
@@ -1920,6 +1931,7 @@ mod tests {
             scale: Scale::default(),
             restart: RestartPolicy::default(),
             expose: Exposure::default(),
+            egress: false,
             placement: Placement::default(),
             stop_grace_secs: None,
             volumes: BTreeMap::new(),

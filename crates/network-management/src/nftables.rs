@@ -16,7 +16,20 @@
 //! With [`FirewallSpec::containers`] set, the forward chain lets container
 //! traffic through the tunnel and nothing else. `<bridge>` is the container
 //! bridge, `<cidr>` the cluster-wide container range, `<local>` this node's
-//! subnet of it:
+//! subnet of it. With a subnet there are two rules in front of the list,
+//! for the pods in `@egress_pods` (see [`SET_EGRESS_PODS`]), which are the
+//! pods of workloads that opted in to egress:
+//! - E1: `iifname <bridge> oifname != { <iface>, <bridge> } ip saddr
+//!   @egress_pods ip daddr != { <cidr>, <mesh>, <service>, 169.254.0.0/16,
+//!   0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept`. The service range is left out of the list when there is none.
+//!   There is no `ct` match: every packet of a flow passes this chain, and a
+//!   later packet would meet rule 1.
+//! - E2: `oifname <bridge> iifname != { <iface>, <bridge> } ip daddr
+//!   @egress_pods ct state established,related accept`: the replies. Nothing
+//!   outside can open a connection to a pod, because a new packet meets rule
+//!   2.
+//!
+//! The rules, in order after those:
 //! 1. `iifname <bridge> oifname != { <iface>, <bridge> } drop` and
 //!    `oifname <bridge> iifname != { <iface>, <bridge> } drop`: the bridge
 //!    exchanges packets with itself and the tunnel only. These rules match
@@ -32,11 +45,12 @@
 //!    while the bridge does not exist yet.
 //! 3. Established/related accepted in both directions of `iface`.
 //! 4. `ip saddr <local> ip daddr != <cidr> drop`: a container opens no
-//!    connection to anything outside the container range, on any interface.
-//!    Container egress is off by default and there is no NAT. This comes
-//!    after rule 3, or it would drop a container's replies to a node. For
-//!    packets from the bridge, rules 1 and 7 already do this; the rule stays
-//!    for a container attached to some other interface.
+//!    connection to anything outside the container range, on any interface,
+//!    unless E1 accepted the packet first. Egress is off for every pod that
+//!    has not opted in. This comes after rule 3, or it would drop a
+//!    container's replies to a node. For packets from the bridge, rules 1 and
+//!    7 already do this; the rule stays for a container attached to some
+//!    other interface.
 //! 5. New traffic from `iface` to `<bridge>` for `<local>`, from
 //!    `@node_mesh_ips` (registered nodes only, so the holder of an unused
 //!    invite gets no way in) and from `<cidr>`. These are two rules because
@@ -50,8 +64,8 @@
 //!    must not get in.
 //! 7. Everything else into or out of `iface` is dropped, as before.
 //!
-//! Until the node has a subnet, the rules that name `<local>` (4, 5 and 6)
-//! are left out. Traffic between two containers on the bridge has the bridge
+//! Until the node has a subnet, E1, E2 and the rules that name `<local>` (4, 5
+//! and 6) are left out. Traffic between two containers on the bridge has the bridge
 //! as both interfaces (it only passes this chain with `br_netfilter` loaded)
 //! and matches no rule. The input chain is the same with and without
 //! containers, so a container reaches no other node's mesh IP.
@@ -69,6 +83,9 @@
 //!   `numgen random mod N` over the backends that serve that port. A port
 //!   with no backend gets no rule (`mod 0` is invalid). The port number is
 //!   not changed.
+//! - A pod in `@egress_pods` is masqueraded when it leaves by any interface
+//!   other than the tunnel and the bridge, so it uses the address of the
+//!   node's default route. Present only with a subnet.
 //! - A pod that reaches its own service and is sent back to itself would see
 //!   its own address as the source. `postrouting` masquerades exactly that
 //!   case, for every backend that is on `<local>`.
@@ -114,6 +131,14 @@ pub const DNS_REDIRECT_PORT: u16 = 5300;
 /// Set of registered nodes' mesh IPs (`type ipv4_addr`). Only in the table
 /// when [`FirewallSpec::containers`] is set.
 pub const SET_NODE_MESH_IPS: &str = "node_mesh_ips";
+/// Set of the local pod IPs whose workload has `egress` on (`type
+/// ipv4_addr`). Only in the table when [`FirewallSpec::containers`] is set.
+pub const SET_EGRESS_PODS: &str = "egress_pods";
+/// Destinations an opted-in pod never reaches, besides the container, mesh
+/// and service ranges: this-network, loopback, link-local (which holds the
+/// metadata address of most clouds) and multicast with everything above it.
+const NOT_UNICAST_OUTSIDE: [&str; 4] =
+    ["169.254.0.0/16", "0.0.0.0/8", "127.0.0.0/8", "224.0.0.0/3"];
 
 /// Everything the table is rendered from, apart from the WireGuard interface
 /// name (`NetworkSpec::interface`).
@@ -138,6 +163,8 @@ pub struct FirewallSpec {
 pub struct ContainerFirewall {
     /// Cluster-wide container range.
     pub cidr: Ipv4Net,
+    /// The mesh range. An opted-in pod gets no egress to it.
+    pub mesh_cidr: Ipv4Net,
     /// This node's container subnet, once raft has allocated one.
     pub local_subnet: Option<Ipv4Net>,
     /// Mesh IPs of registered nodes other than this one. Excludes invites.
@@ -197,8 +224,14 @@ pub struct ServiceNat {
 /// [`crate::is_valid_iface_name`].
 ///
 /// `services` add the nat rules to the nat chains, which exist only when
-/// [`FirewallSpec::containers`] is set.
-pub fn render_with_services(iface: &str, spec: &FirewallSpec, services: &[ServiceNat]) -> String {
+/// [`FirewallSpec::containers`] is set. `egress_pods` are the elements of
+/// the [`SET_EGRESS_PODS`] set.
+pub fn render_with_services(
+    iface: &str,
+    spec: &FirewallSpec,
+    services: &[ServiceNat],
+    egress_pods: &BTreeSet<Ipv4Addr>,
+) -> String {
     let v4: Vec<String> = spec
         .peer_endpoint_ips
         .iter()
@@ -230,6 +263,8 @@ pub fn render_with_services(iface: &str, spec: &FirewallSpec, services: &[Servic
             .map(Ipv4Addr::to_string)
             .collect();
         write_set(&mut out, SET_NODE_MESH_IPS, "ipv4_addr", &nodes);
+        let pods: Vec<String> = egress_pods.iter().map(Ipv4Addr::to_string).collect();
+        write_set(&mut out, SET_EGRESS_PODS, "ipv4_addr", &pods);
     }
 
     let wg = spec.wg_port;
@@ -341,6 +376,12 @@ fn nat_chains(
                 "oifname \"{bridge}\" ip saddr {ip} ip daddr {ip} ct status dnat masquerade"
             ));
         }
+        // An opted-in pod leaves with the address of the interface it goes
+        // out of. Not towards the tunnel or the bridge: those keep the pod
+        // address.
+        post.push(format!(
+            "ip saddr @{SET_EGRESS_PODS} oifname != {{ \"{iface}\", \"{bridge}\" }} masquerade"
+        ));
     }
     pre.extend(
         dnat.iter()
@@ -394,7 +435,32 @@ fn forward_rules(iface: &str, containers: Option<&ContainerFirewall>) -> Vec<Str
     };
     let cidr = containers.cidr;
     let bridge = &containers.bridge;
-    let mut rules = vec![
+    let mut rules = Vec::new();
+    if containers.local_subnet.is_some() {
+        // Egress for an opted-in pod. Before the two rules below, which drop
+        // everything between the bridge and other interfaces. The excluded
+        // destinations fall through to them (or to the egress drop). No `ct`
+        // match on the outbound accept: every packet of a flow passes this
+        // chain, and a later one would meet the drop. Replies are accepted
+        // for an established flow only, so nothing outside opens one.
+        let mut excluded = vec![cidr.trunc(), containers.mesh_cidr.trunc()];
+        excluded.extend(containers.service_cidr.map(|range| range.trunc()));
+        let excluded = excluded
+            .iter()
+            .map(Ipv4Net::to_string)
+            .chain(NOT_UNICAST_OUTSIDE.map(String::from))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.extend([
+            format!(
+                "iifname \"{bridge}\" oifname != {{ \"{iface}\", \"{bridge}\" }} ip saddr @{SET_EGRESS_PODS} ip daddr != {{ {excluded} }} accept"
+            ),
+            format!(
+                "oifname \"{bridge}\" iifname != {{ \"{iface}\", \"{bridge}\" }} ip daddr @{SET_EGRESS_PODS} ct state established,related accept"
+            ),
+        ]);
+    }
+    rules.extend([
         // The bridge exchanges packets with itself and the tunnel only.
         // These match no address, so they hold for IPv6, for a forged
         // source, and while the tunnel interface does not exist.
@@ -403,7 +469,7 @@ fn forward_rules(iface: &str, containers: Option<&ContainerFirewall>) -> Vec<Str
         format!("iifname \"{iface}\" oifname \"{iface}\" drop"),
         format!("iifname \"{iface}\" ct state established,related accept"),
         format!("oifname \"{iface}\" ct state established,related accept"),
-    ];
+    ]);
     if let Some(local) = containers.local_subnet {
         rules.extend([
             // Egress default-deny. After the established accepts, so that a
@@ -444,6 +510,7 @@ pub async fn apply(
     iface: &str,
     spec: &FirewallSpec,
     services: &[ServiceNat],
+    egress_pods: &BTreeSet<Ipv4Addr>,
 ) -> Result<(), NetworkError> {
     check_iface_name(iface)?;
     if let Some(containers) = &spec.containers {
@@ -458,7 +525,7 @@ pub async fn apply(
         runner,
         "nft",
         &["-f", "-"],
-        Some(render_with_services(iface, spec, services).into_bytes()),
+        Some(render_with_services(iface, spec, services, egress_pods).into_bytes()),
     )
     .await?;
     Ok(())
@@ -474,10 +541,10 @@ pub fn endpoint_ip(endpoint: &str) -> Option<IpAddr> {
         .map(|sa| sa.ip().to_canonical())
 }
 
-/// [`render_with_services`] without services.
+/// [`render_with_services`] without services or egress pods.
 #[cfg(test)]
 pub(crate) fn render(iface: &str, spec: &FirewallSpec) -> String {
-    render_with_services(iface, spec, &[])
+    render_with_services(iface, spec, &[], &BTreeSet::new())
 }
 
 #[cfg(test)]
@@ -586,6 +653,7 @@ table inet faber {
         FirewallSpec {
             containers: Some(ContainerFirewall {
                 cidr: "10.200.0.0/16".parse().unwrap(),
+                mesh_cidr: "10.99.0.0/16".parse().unwrap(),
                 local_subnet: local_subnet.map(|s| s.parse().unwrap()),
                 node_mesh_ips: node_mesh_ips.iter().map(|ip| ip.parse().unwrap()).collect(),
                 bridge: "faberbr0".into(),
@@ -614,7 +682,10 @@ table inet faber {{
 		type ipv4_addr
 		elements = {{ 10.99.0.1, 10.99.0.3 }}
 	}}
-{node_mesh_ips_set}	chain input {{
+{node_mesh_ips_set}	set egress_pods {{
+		type ipv4_addr
+	}}
+	chain input {{
 		type filter hook input priority filter - 10; policy accept;
 		iifname != "faber0" udp dport 51820 ip saddr @peer_endpoints accept
 		iifname != "faber0" udp dport 51820 ip6 saddr @peer_endpoints6 accept
@@ -682,6 +753,9 @@ table inet faber {
 		type ipv4_addr
 		elements = { 10.99.0.1, 10.99.0.4 }
 	}
+	set egress_pods {
+		type ipv4_addr
+	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
 		iifname != "faber0" udp dport 51820 ip saddr @peer_endpoints accept
@@ -694,6 +768,8 @@ table inet faber {
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
+		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
 		iifname "faber0" oifname "faber0" drop
@@ -717,6 +793,7 @@ table inet faber {
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
+		ip saddr @egress_pods oifname != { "faber0", "faberbr0" } masquerade
 	}
 }
 "#;
@@ -729,6 +806,8 @@ table inet faber {
         let head = container_head("\tset node_mesh_ips {\n\t\ttype ipv4_addr\n\t}\n");
         let forward = r#"	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
+		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
 		iifname "faber0" oifname "faber0" drop
@@ -752,6 +831,7 @@ table inet faber {
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
+		ip saddr @egress_pods oifname != { "faber0", "faberbr0" } masquerade
 	}
 }
 "#;
@@ -820,10 +900,11 @@ table inet faber {
 		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
 		oifname "faberbr0" ip saddr 10.200.1.2 ip daddr 10.200.1.2 ct status dnat masquerade
 		oifname "faberbr0" ip saddr 10.200.1.4 ip daddr 10.200.1.4 ct status dnat masquerade
+		ip saddr @egress_pods oifname != { "faber0", "faberbr0" } masquerade
 	}
 }
 "#;
-        let script = render_with_services("faber0", &s, &services);
+        let script = render_with_services("faber0", &s, &services, &BTreeSet::new());
         assert_eq!(&script[script.find(NAT_START).unwrap()..], expected);
         // Above the nat chains the table is the one without services.
         let plain = render("faber0", &s);
@@ -850,15 +931,20 @@ table inet faber {
         a_rev.backends.reverse();
         let s = container_spec(Some("10.200.1.0/24"), &[]);
         assert_eq!(
-            render_with_services("faber0", &s, &[a.clone(), b.clone()]),
-            render_with_services("faber0", &s, &[b, a_rev])
+            render_with_services("faber0", &s, &[a.clone(), b.clone()], &BTreeSet::new()),
+            render_with_services("faber0", &s, &[b, a_rev], &BTreeSet::new())
         );
     }
 
     #[test]
     fn a_service_without_backends_has_no_rule() {
         let s = container_spec(Some("10.200.1.0/24"), &[]);
-        let script = render_with_services("faber0", &s, &[service("10.201.0.1", vec![])]);
+        let script = render_with_services(
+            "faber0",
+            &s,
+            &[service("10.201.0.1", vec![])],
+            &BTreeSet::new(),
+        );
         assert!(!script.contains("mod 0"), "{script}");
         assert_eq!(script, render("faber0", &s));
     }
@@ -870,7 +956,7 @@ table inet faber {
             vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
         )];
         assert_eq!(
-            render_with_services("faber0", &spec(), &services),
+            render_with_services("faber0", &spec(), &services, &BTreeSet::new()),
             render("faber0", &spec())
         );
     }
@@ -884,7 +970,7 @@ table inet faber {
             vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
         )];
         let s = container_spec(Some("10.200.1.0/24"), &[]);
-        let script = render_with_services("faber0", &s, &services);
+        let script = render_with_services("faber0", &s, &services, &BTreeSet::new());
         let dnat: Vec<&str> = script
             .lines()
             .filter(|l| l.contains("dnat ip to"))
@@ -913,7 +999,7 @@ table inet faber {
             "10.201.0.1",
             vec![backend("10.200.1.2", 80, NatProtocol::Tcp)],
         )];
-        let script = render_with_services("faber0", &s, &services);
+        let script = render_with_services("faber0", &s, &services, &BTreeSet::new());
         let expected = r#"	chain service_reject_prerouting {
 		type filter hook prerouting priority filter; policy accept;
 		iifname "faberbr0" ip daddr 10.201.0.0/16 reject
@@ -931,7 +1017,12 @@ table inet faber {
         assert!(first_reject > script.find("dnat ip to").unwrap());
         assert_eq!(script.matches("reject").count(), 4);
         // Without the range there is no reject.
-        let plain = render_with_services("faber0", &container_spec(None, &[]), &services);
+        let plain = render_with_services(
+            "faber0",
+            &container_spec(None, &[]),
+            &services,
+            &BTreeSet::new(),
+        );
         assert!(!plain.contains("reject"));
     }
 
@@ -1007,7 +1098,16 @@ table inet faber {
     /// Knows only the expressions the forward chain uses and panics on any
     /// other, so a new kind of rule has to be taught here first.
     fn forward_verdict(spec: &FirewallSpec, packet: &Packet) -> &'static str {
-        let script = render("faber0", spec);
+        forward_verdict_with(spec, &BTreeSet::new(), packet)
+    }
+
+    /// [`forward_verdict`] with `egress` as the elements of `@egress_pods`.
+    fn forward_verdict_with(
+        spec: &FirewallSpec,
+        egress: &BTreeSet<Ipv4Addr>,
+        packet: &Packet,
+    ) -> &'static str {
+        let script = render_with_services("faber0", spec, &[], egress);
         let chain = script.split_once("\tchain forward {\n").unwrap().1;
         let nodes = &spec.containers.as_ref().unwrap().node_mesh_ips;
         let name = |t: &str| t.trim_matches(|c| c == '"' || c == ',').to_string();
@@ -1040,6 +1140,14 @@ table inet faber {
                         let field = tokens.next().unwrap();
                         let not = negated(&mut tokens);
                         let value = tokens.next().unwrap();
+                        // An anonymous list of prefixes.
+                        let prefixes: Option<Vec<Ipv4Net>> = (value == "{").then(|| {
+                            tokens
+                                .by_ref()
+                                .take_while(|t| *t != "}")
+                                .map(|t| t.trim_end_matches(',').parse().unwrap())
+                                .collect()
+                        });
                         let Some((src, dst)) = packet.v4 else {
                             // An `ip` match never holds for an IPv6 packet.
                             matches = false;
@@ -1050,10 +1158,12 @@ table inet faber {
                             "daddr" => dst.parse().unwrap(),
                             other => panic!("unknown ip field {other} in {rule}"),
                         };
-                        let hit = match value.strip_prefix('@') {
-                            Some(SET_NODE_MESH_IPS) => nodes.contains(&addr),
-                            Some(other) => panic!("unknown set {other} in {rule}"),
-                            None => value.parse::<Ipv4Net>().unwrap().contains(&addr),
+                        let hit = match (&prefixes, value.strip_prefix('@')) {
+                            (Some(list), _) => list.iter().any(|net| net.contains(&addr)),
+                            (None, Some(SET_NODE_MESH_IPS)) => nodes.contains(&addr),
+                            (None, Some(SET_EGRESS_PODS)) => egress.contains(&addr),
+                            (None, Some(other)) => panic!("unknown set {other} in {rule}"),
+                            (None, None) => value.parse::<Ipv4Net>().unwrap().contains(&addr),
                         };
                         matches &= hit != not;
                     }
@@ -1227,12 +1337,171 @@ table inet faber {
         }
     }
 
+    fn pods(ips: &[&str]) -> BTreeSet<Ipv4Addr> {
+        ips.iter().map(|ip| ip.parse().unwrap()).collect()
+    }
+
+    /// The opt-in render: a service range, two pods listed out of order.
+    #[test]
+    fn render_egress_golden() {
+        let mut s = container_spec(Some("10.200.1.0/24"), &["10.99.0.4", "10.99.0.1"]);
+        s.containers.as_mut().unwrap().service_cidr = Some("10.201.0.0/16".parse().unwrap());
+        let script = render_with_services("faber0", &s, &[], &pods(&["10.200.1.9", "10.200.1.5"]));
+        let expected = r#"table inet faber {}
+delete table inet faber
+table inet faber {
+	set peer_endpoints {
+		type ipv4_addr
+		elements = { 198.51.100.7, 203.0.113.1 }
+	}
+	set peer_endpoints6 {
+		type ipv6_addr
+		elements = { 2001:db8::1 }
+	}
+	set peer_mesh_ips {
+		type ipv4_addr
+		elements = { 10.99.0.1, 10.99.0.3 }
+	}
+	set node_mesh_ips {
+		type ipv4_addr
+		elements = { 10.99.0.1, 10.99.0.4 }
+	}
+	set egress_pods {
+		type ipv4_addr
+		elements = { 10.200.1.5, 10.200.1.9 }
+	}
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		iifname != "faber0" udp dport 51820 ip saddr @peer_endpoints accept
+		iifname != "faber0" udp dport 51820 ip6 saddr @peer_endpoints6 accept
+		iifname != "faber0" udp dport 51820 drop
+		iifname "faber0" ct state established,related accept
+		iifname "faber0" ip saddr @peer_mesh_ips accept
+		iifname "faber0" drop
+		iifname != { "lo", "faber0" } tcp dport 7401 drop
+	}
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
+		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
+		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
+		iifname "faber0" oifname "faber0" drop
+		iifname "faber0" ct state established,related accept
+		oifname "faber0" ct state established,related accept
+		ip saddr 10.200.1.0/24 ip daddr != 10.200.0.0/16 drop
+		iifname "faber0" oifname "faberbr0" ip saddr @node_mesh_ips ip daddr 10.200.1.0/24 accept
+		iifname "faber0" oifname "faberbr0" ip saddr 10.200.0.0/16 ip daddr 10.200.1.0/24 accept
+		iifname "faberbr0" oifname "faber0" ip saddr 10.200.1.0/24 ip daddr 10.200.0.0/16 accept
+		oifname "faber0" drop
+		iifname "faber0" drop
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "faberbr0" ip daddr 10.200.1.1 udp dport 53 redirect to :5300
+		iifname "faberbr0" ip daddr 10.200.1.1 tcp dport 53 redirect to :5300
+	}
+	chain output {
+		type nat hook output priority -100; policy accept;
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
+		ip saddr @egress_pods oifname != { "faber0", "faberbr0" } masquerade
+	}
+	chain service_reject_prerouting {
+		type filter hook prerouting priority filter; policy accept;
+		iifname "faberbr0" ip daddr 10.201.0.0/16 reject
+	}
+	chain service_reject_output {
+		type filter hook output priority filter; policy accept;
+		ip daddr 10.201.0.0/16 reject
+	}
+}
+"#;
+        assert_eq!(script, expected);
+    }
+
+    #[test]
+    fn egress_pods_reach_the_outside_and_nothing_else() {
+        let mut spec = with_subnet();
+        spec.containers.as_mut().unwrap().service_cidr = Some("10.201.0.0/16".parse().unwrap());
+        let egress = pods(&["10.200.1.5"]);
+        let verdict = |packet: Packet| forward_verdict_with(&spec, &egress, &packet);
+
+        assert_eq!(
+            verdict(new_v4("faberbr0", "eth0", "10.200.1.5", "192.0.2.9")),
+            "accept"
+        );
+        // A later packet of the same flow.
+        assert_eq!(
+            verdict(reply_v4("faberbr0", "eth0", "10.200.1.5", "192.0.2.9")),
+            "accept"
+        );
+        assert_eq!(
+            verdict(reply_v4("eth0", "faberbr0", "192.0.2.9", "10.200.1.5")),
+            "accept"
+        );
+        // Nobody outside opens a connection to the pod.
+        assert_eq!(
+            verdict(new_v4("eth0", "faberbr0", "192.0.2.9", "10.200.1.5")),
+            "drop"
+        );
+        // A pod that did not opt in gets neither the way out nor the reply.
+        assert_eq!(
+            verdict(new_v4("faberbr0", "eth0", "10.200.1.7", "192.0.2.9")),
+            "drop"
+        );
+        assert_eq!(
+            verdict(reply_v4("eth0", "faberbr0", "192.0.2.9", "10.200.1.7")),
+            "drop"
+        );
+        // Metadata, mesh and service addresses stay out of reach, also
+        // when the tunnel is gone and the default route takes the packet.
+        for (oif, dst) in [
+            ("eth0", "169.254.169.254"),
+            ("eth0", "10.99.0.1"),
+            ("faber0", "10.99.0.1"),
+            ("eth0", "10.201.0.5"),
+            ("eth0", "10.200.2.7"),
+            ("eth0", "127.0.0.1"),
+            ("eth0", "0.1.2.3"),
+            ("eth0", "224.0.0.251"),
+            ("eth0", "255.255.255.255"),
+        ] {
+            assert_eq!(
+                verdict(new_v4("faberbr0", oif, "10.200.1.5", dst)),
+                "drop",
+                "{oif} {dst}"
+            );
+        }
+        // Container to container is the same as for any pod.
+        assert_eq!(
+            verdict(new_v4("faberbr0", "faber0", "10.200.1.5", "10.200.2.7")),
+            "accept"
+        );
+        assert_eq!(verdict(new_v6("faberbr0", "eth0")), "drop");
+    }
+
+    /// Without a subnet E1 is not rendered, so a listed pod gets nothing.
+    #[test]
+    fn egress_pods_get_nothing_before_the_node_has_a_subnet() {
+        let egress = pods(&["10.200.1.5"]);
+        let packet = new_v4("faberbr0", "eth0", "10.200.1.5", "192.0.2.9");
+        assert_eq!(
+            forward_verdict_with(&without_subnet(), &egress, &packet),
+            "drop"
+        );
+    }
+
     #[tokio::test]
     async fn apply_rejects_a_bridge_named_like_the_mesh_interface() {
         let r = RecordingRunner::new();
         let mut s = with_subnet();
         s.containers.as_mut().unwrap().bridge = "faber0".into();
-        let err = apply(&r, "faber0", &s, &[]).await.unwrap_err();
+        let err = apply(&r, "faber0", &s, &[], &BTreeSet::new())
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, NetworkError::BridgeIsMeshInterface(n) if n == "faber0"),
             "{err:?}"
@@ -1243,7 +1512,9 @@ table inet faber {
         );
         assert!(r.calls().is_empty());
         // A bridge with another name is fine.
-        apply(&r, "faber0", &with_subnet(), &[]).await.unwrap();
+        apply(&r, "faber0", &with_subnet(), &[], &BTreeSet::new())
+            .await
+            .unwrap();
         assert_eq!(r.cmdlines(), vec!["nft -f -"]);
     }
 
@@ -1252,7 +1523,9 @@ table inet faber {
         let r = RecordingRunner::new();
         let mut s = with_subnet();
         s.containers.as_mut().unwrap().bridge = "br0\" accept".into();
-        let err = apply(&r, "faber0", &s, &[]).await.unwrap_err();
+        let err = apply(&r, "faber0", &s, &[], &BTreeSet::new())
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, NetworkError::InvalidInterface(n) if n == "br0\" accept"),
             "{err:?}"
@@ -1263,7 +1536,9 @@ table inet faber {
     #[tokio::test]
     async fn apply_pipes_script_on_stdin() {
         let r = RecordingRunner::new();
-        apply(&r, "faber0", &spec(), &[]).await.unwrap();
+        apply(&r, "faber0", &spec(), &[], &BTreeSet::new())
+            .await
+            .unwrap();
         let calls = r.calls();
         assert_eq!(r.cmdlines(), vec!["nft -f -"]);
         assert_eq!(
@@ -1280,7 +1555,9 @@ table inet faber {
             None,
             CommandOutput::failure(1, "Error: syntax error, unexpected junk"),
         );
-        let err = apply(&r, "faber0", &spec(), &[]).await.unwrap_err();
+        let err = apply(&r, "faber0", &spec(), &[], &BTreeSet::new())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unexpected junk"), "{err}");
     }
 
@@ -1289,7 +1566,7 @@ table inet faber {
         let r = RecordingRunner::new();
         let s = spec();
         assert!(matches!(
-            apply(&r, "faber0\" accept", &s, &[]).await,
+            apply(&r, "faber0\" accept", &s, &[], &BTreeSet::new()).await,
             Err(NetworkError::InvalidInterface(_))
         ));
         assert!(r.calls().is_empty());

@@ -103,8 +103,8 @@ pub struct EnvironmentRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadRecord {
     /// The raft log index of the entry that last changed the pod template:
-    /// everything in the spec except `scale`, `placement` and `expose`, and
-    /// the env. The runner restarts pods only when it moves.
+    /// everything in the spec except `scale`, `placement`, `expose` and
+    /// `egress`, and the env. The runner restarts pods only when it moves.
     pub revision: u64,
     pub spec: WorkloadSpec,
     /// The sealed env of each container, by container name.
@@ -234,14 +234,15 @@ fn count_of_workloads(count: u32) -> String {
     format!("{count} {noun}")
 }
 
-/// The pod template of `spec`: the spec with `scale`, `placement` and
-/// `expose` at their defaults. Two specs with the same template differ
+/// The pod template of `spec`: the spec with `scale`, `placement`, `expose`
+/// and `egress` at their defaults. Two specs with the same template differ
 /// only in how many pods run, where, and who may reach them.
 fn pod_template(spec: &WorkloadSpec) -> WorkloadSpec {
     WorkloadSpec {
         scale: Scale::default(),
         placement: Placement::default(),
         expose: Exposure::default(),
+        egress: false,
         ..spec.clone()
     }
 }
@@ -665,6 +666,7 @@ mod tests {
             scale: Scale::default(),
             restart: RestartPolicy::default(),
             expose: Exposure::default(),
+            egress: false,
             placement: Placement::default(),
             stop_grace_secs: None,
             volumes: BTreeMap::new(),
@@ -1465,8 +1467,8 @@ mod tests {
         assert_invariants(&w);
     }
 
-    /// `scale`, `placement` and `expose` are not part of the pod template:
-    /// changing one is an update that leaves `revision` alone.
+    /// `scale`, `placement`, `expose` and `egress` are not part of the pod
+    /// template: changing one is an update that leaves `revision` alone.
     #[test]
     fn a_change_outside_the_pod_template_keeps_the_revision() {
         let mut scaled = spec("nginx");
@@ -1480,14 +1482,25 @@ mod tests {
         placed.placement.nodes = vec!["node-2".into()];
         let mut exposed = spec("nginx");
         exposed.expose = Exposure::Cluster;
+        let mut egressing = spec("nginx");
+        egressing.egress = true;
         let mut all = scaled.clone();
         all.placement.nodes = vec!["node-3".into()];
         all.expose = Exposure::Cluster;
+        all.egress = true;
 
         let mut w = shop();
         w.apply("shop", "staging", &[("web", spec("nginx"))], false, 2, 1)
             .unwrap();
-        let changes = [scaled, daemon, placed, exposed, all, spec("nginx")];
+        let changes = [
+            scaled,
+            daemon,
+            placed,
+            exposed,
+            egressing,
+            all,
+            spec("nginx"),
+        ];
         for (index, changed) in (3..).zip(changes) {
             let applied = w
                 .apply(

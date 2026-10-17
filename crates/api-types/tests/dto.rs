@@ -335,6 +335,7 @@ fn minimal_spec() -> WorkloadSpec {
         },
         restart: RestartPolicy::Always,
         expose: Exposure::Environment,
+        egress: false,
         placement: Placement { nodes: vec![] },
         stop_grace_secs: None,
         volumes: Default::default(),
@@ -345,7 +346,7 @@ fn minimal_spec() -> WorkloadSpec {
 fn minimal_spec_json() -> Value {
     json!({
         "scale": {"replicas": {"count": 1, "strategy": "spread"}},
-        "restart": "always", "expose": "environment",
+        "restart": "always", "expose": "environment", "egress": false,
         "placement": {"nodes": []}, "volumes": {},
         "containers": [minimal_container_json("a", "b")]
     })
@@ -602,6 +603,7 @@ fn workload_spec_shapes() {
             scale: Scale::Daemon,
             restart: RestartPolicy::Never,
             expose: Exposure::Cluster,
+            egress: true,
             placement: Placement {
                 nodes: vec!["node-1".into()],
             },
@@ -616,7 +618,7 @@ fn workload_spec_shapes() {
             containers: vec![ContainerSpec::new("a", "b"), ContainerSpec::new("c", "d")],
         },
         json!({
-            "scale": "daemon", "restart": "never", "expose": "cluster",
+            "scale": "daemon", "restart": "never", "expose": "cluster", "egress": true,
             "placement": {"nodes": ["node-1"]}, "stop_grace_secs": 30,
             "volumes": {"tmp": {"type": "ramdisk", "size_bytes": 1_048_576}},
             "containers": [minimal_container_json("a", "b"), minimal_container_json("c", "d")]

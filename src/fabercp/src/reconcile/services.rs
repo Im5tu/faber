@@ -1,17 +1,30 @@
 //! Service reconcile step: programs the virtual IPs of the services, and
-//! the containers behind them, into this node's nftables.
+//! the containers behind them, into this node's nftables. It also programs
+//! the pods that may leave the container network.
 //!
-//! The desired value is [`desired_services`]: for every service with a
-//! virtual IP, the IP and the sorted list of `(pod IP, port, protocol)` that
-//! serve it. It holds nothing that changes when a node merely reports again
-//! (no `reported_at`, no `detail`), so a status tick that moves no replica
-//! gives an equal value and the step does not apply.
+//! The desired value is [`ServicesDesired`]: [`desired_services`], which is
+//! for every service with a virtual IP, the IP and the sorted list of
+//! `(pod IP, port, protocol)` that serve it, and [`egress_pod_ips`], the pod
+//! IPs of this node whose workload has `egress` on. It holds nothing that
+//! changes when a node merely reports again (no `reported_at`, no `detail`),
+//! so a status tick that moves no replica gives an equal value and the step
+//! does not apply.
 //!
 //! Every node programs every service, so a container reaches a service from
 //! any node without an extra hop. The rules are part of the one
 //! `inet faber` table that the network step loads;
 //! [`NetworkManager::set_services`] keeps them when that table is loaded
 //! again.
+//!
+//! # Egress
+//!
+//! A pod is listed when its workload has `egress` on, status shows it on
+//! this node, placement still puts the replica on this node, and its IP is
+//! in this node's subnet. Any state counts, and so does any revision up to
+//! the stored one: a pod that is draining keeps its way out. Status can be
+//! stale after a restart, and an IP can be given to another pod once the
+//! first is gone, so with [`ServicesStep::with_live_replicas`] a pod is also
+//! listed only while this node's runner holds that replica with that IP.
 //!
 //! # Which revision serves
 //!
@@ -45,6 +58,7 @@
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use faber_api_types::workload::{Protocol, ReplicaState};
 use faber_network_management::{NatBackend, NatProtocol, NetworkManager, ServiceNat};
@@ -52,40 +66,75 @@ use faber_network_management::{NatBackend, NatProtocol, NetworkManager, ServiceN
 use super::step::{Planned, ReconcileStep, ReplicatedStateView, StepFuture};
 use crate::lease::LeaseTiming;
 use crate::raft::store::PlacementView;
-use crate::status::StatusView;
+use crate::raft::store::status::ReplicaReport;
+use crate::status::{ReplicaSource, StatusView};
+
+/// What the services step wants in the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicesDesired {
+    pub services: Vec<ServiceNat>,
+    /// The pod IPs of this node that may leave the container network.
+    pub egress_pods: BTreeSet<Ipv4Addr>,
+}
 
 /// The services step.
 pub struct ServicesStep {
     network: NetworkManager,
+    node_id: u64,
     lease_timing: LeaseTiming,
+    /// What the local runner holds. `None` skips the check against it.
+    live: Option<Arc<dyn ReplicaSource>>,
 }
 
 impl ServicesStep {
-    pub fn new(network: NetworkManager, lease_timing: LeaseTiming) -> Self {
+    pub fn new(network: NetworkManager, node_id: u64, lease_timing: LeaseTiming) -> Self {
         Self {
             network,
+            node_id,
             lease_timing,
+            live: None,
         }
+    }
+
+    /// Lists an egress pod only while `live` holds that replica with that IP.
+    #[must_use]
+    pub fn with_live_replicas(mut self, live: Arc<dyn ReplicaSource>) -> Self {
+        self.live = Some(live);
+        self
     }
 }
 
 impl ReconcileStep for ServicesStep {
-    type Desired = Vec<ServiceNat>;
+    type Desired = ServicesDesired;
 
     fn name(&self) -> &'static str {
         "services"
     }
 
-    fn plan(&self, view: &ReplicatedStateView) -> Planned<Vec<ServiceNat>> {
+    fn plan(&self, view: &ReplicatedStateView) -> Planned<ServicesDesired> {
         let desired = match &view.placement {
             Some(placement) => {
+                let interval = view.status_interval_secs;
                 let tick = placement
                     .mesh
                     .as_ref()
                     .map_or(0, |m| self.lease_timing.tick_clock_secs(m.lease_secs));
-                desired_services(placement, view.status_interval_secs, tick)
+                let live = self.live.as_ref().map(|live| live.replicas());
+                ServicesDesired {
+                    services: desired_services(placement, interval, tick),
+                    egress_pods: egress_pod_ips(
+                        placement,
+                        self.node_id,
+                        interval,
+                        tick,
+                        live.as_deref(),
+                    ),
+                }
             }
-            None => Vec::new(),
+            None => ServicesDesired {
+                services: Vec::new(),
+                egress_pods: BTreeSet::new(),
+            },
         };
         Planned {
             desired,
@@ -93,9 +142,93 @@ impl ReconcileStep for ServicesStep {
         }
     }
 
-    fn apply<'a>(&'a self, desired: &'a Vec<ServiceNat>) -> StepFuture<'a> {
-        Box::pin(async move { Ok(self.network.set_services(desired).await?) })
+    fn apply<'a>(&'a self, desired: &'a ServicesDesired) -> StepFuture<'a> {
+        Box::pin(async move {
+            Ok(self
+                .network
+                .set_services(&desired.services, &desired.egress_pods)
+                .await?)
+        })
     }
+}
+
+/// The status of every node that is still in the mesh. `None` without a mesh.
+fn status_view(view: &PlacementView, interval_secs: u64, tick_secs: u64) -> Option<StatusView> {
+    let mesh = view.mesh.as_ref()?;
+    let mut statuses = view.statuses.clone();
+    statuses.retain(|id, _| mesh.nodes.contains_key(id));
+    Some(StatusView::new(
+        statuses,
+        interval_secs,
+        mesh.clock,
+        tick_secs,
+    ))
+}
+
+/// The pod IPs on node `node_id` whose workload has `egress` on. See the
+/// module documentation for which pods count.
+///
+/// `live` is what the local runner holds, `None` to skip that check.
+pub fn egress_pod_ips(
+    view: &PlacementView,
+    node_id: u64,
+    interval_secs: u64,
+    tick_secs: u64,
+    live: Option<&[ReplicaReport]>,
+) -> BTreeSet<Ipv4Addr> {
+    let mut pods = BTreeSet::new();
+    let (Some(mesh), Some(status)) = (
+        view.mesh.as_ref(),
+        status_view(view, interval_secs, tick_secs),
+    ) else {
+        return pods;
+    };
+    let Some(subnet) = super::own_subnet(mesh, node_id).ok().flatten() else {
+        return pods;
+    };
+    // The network, broadcast and gateway addresses are never a pod's.
+    let reserved = [
+        Some(subnet.network()),
+        Some(subnet.broadcast()),
+        subnet.hosts().next(),
+    ];
+    for (project, environment, record) in &view.environments {
+        let placement = view.records.get(&(project.clone(), environment.clone()));
+        for (name, workload) in &record.workloads {
+            if !workload.spec.egress {
+                continue;
+            }
+            let placed = placement.map_or(&[][..], |p| p.replicas(name));
+            for revision in status.revisions(project, environment, name) {
+                if revision > workload.revision {
+                    continue;
+                }
+                for replica in status.workload(project, environment, name, revision, placed) {
+                    let Some(ip) = replica.pod_ip else { continue };
+                    if replica.node != Some(node_id)
+                        || !subnet.contains(&ip)
+                        || reserved.contains(&Some(ip))
+                    {
+                        continue;
+                    }
+                    let held = live.is_none_or(|live| {
+                        live.iter().any(|held| {
+                            held.project == *project
+                                && held.environment == *environment
+                                && held.workload == *name
+                                && held.revision == revision
+                                && held.replica_index == replica.replica_index
+                                && held.pod_ip == Some(ip)
+                        })
+                    });
+                    if held {
+                        pods.insert(ip);
+                    }
+                }
+            }
+        }
+    }
+    pods
 }
 
 /// The service rules this node should have, sorted by virtual IP. See the
@@ -108,12 +241,9 @@ pub fn desired_services(
     interval_secs: u64,
     tick_secs: u64,
 ) -> Vec<ServiceNat> {
-    let Some(mesh) = view.mesh.as_ref() else {
+    let Some(status) = status_view(view, interval_secs, tick_secs) else {
         return Vec::new();
     };
-    let mut statuses = view.statuses.clone();
-    statuses.retain(|id, _| mesh.nodes.contains_key(id));
-    let status = StatusView::new(statuses, interval_secs, mesh.clock, tick_secs);
 
     let mut services = Vec::new();
     for (project, environment, record) in &view.environments {
@@ -246,7 +376,7 @@ mod tests {
             endpoint: None,
             invite_id: None,
             instance_id: None,
-            container_subnet: None,
+            container_subnet: Some(format!("10.200.{id}.0/24").parse().unwrap()),
             name: format!("n{id}"),
             lease_renewed_at: 0,
         }
@@ -272,6 +402,7 @@ mod tests {
             let mut mesh = MeshState::init(MeshConfig::default(), node(1)).unwrap();
             mesh.nodes = (1..=3).map(|id| (id, node(id))).collect();
             mesh.clock = 100;
+            mesh.config.container_cidr = Some("10.200.0.0/16".parse().unwrap());
             let environment = EnvironmentRecord {
                 generation: 1,
                 updated_at: 0,
@@ -312,6 +443,21 @@ mod tests {
                     service_ips: ips,
                 },
             }
+        }
+
+        fn egress(mut self, on: bool) -> Self {
+            for (_, _, record) in &mut self.view.environments {
+                record.workloads.get_mut("web").unwrap().spec.egress = on;
+            }
+            self
+        }
+
+        /// The egress pods of `node`, as the step lists them.
+        fn egress_pods(&self, node: u64, live: Option<&[ReplicaReport]>) -> Vec<String> {
+            egress_pod_ips(&self.view, node, INTERVAL, 0, live)
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect()
         }
 
         fn reported(mut self, node: u64, at: u64, replicas: Vec<ReplicaReport>) -> Self {
@@ -621,43 +767,196 @@ mod tests {
         assert!(c.desired().is_empty());
     }
 
-    // ---- the step ----
+    // ---- egress ----
 
     #[test]
-    fn the_step_plans_from_the_view_and_names_itself() {
-        let step = ServicesStep::new(
-            NetworkManager::new(Arc::new(RecordingRunner::new())),
-            LeaseTiming::default(),
+    fn an_egress_workload_lists_its_local_pod_ips() {
+        let c = Cluster::new(1, HTTP, &[1, 2])
+            .egress(true)
+            .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])
+            .reported(2, 100, vec![report(1, 1, Available, "10.200.2.2")]);
+        assert_eq!(c.egress_pods(1, None), ["10.200.1.2"]);
+        assert_eq!(c.egress_pods(2, None), ["10.200.2.2"]);
+        assert!(c.egress_pods(3, None).is_empty());
+    }
+
+    #[test]
+    fn a_workload_without_egress_lists_nothing() {
+        let c = Cluster::new(1, HTTP, &[1]).reported(
+            1,
+            100,
+            vec![report(1, 0, Available, "10.200.1.2")],
         );
-        assert_eq!(step.name(), "services");
-        let view = ReplicatedStateView {
+        assert!(c.egress_pods(1, None).is_empty());
+    }
+
+    #[test]
+    fn a_moved_replica_leaves_the_set() {
+        // Node 1 still reports replica 0, which placement now puts on node 2.
+        let c = Cluster::new(1, HTTP, &[2]).egress(true).reported(
+            1,
+            100,
+            vec![report(1, 0, Available, "10.200.1.2")],
+        );
+        assert!(c.egress_pods(1, None).is_empty());
+    }
+
+    #[test]
+    fn every_revision_of_a_rolling_workload_counts() {
+        let c = Cluster::new(4, HTTP, &[1, 1]).egress(true).reported(
+            1,
+            100,
+            vec![
+                report(3, 0, Available, "10.200.1.2"),
+                report(4, 0, Deploying, "10.200.1.3"),
+                report(3, 1, Unavailable, "10.200.1.4"),
+            ],
+        );
+        assert_eq!(
+            c.egress_pods(1, None),
+            ["10.200.1.2", "10.200.1.3", "10.200.1.4"]
+        );
+    }
+
+    #[test]
+    fn an_ip_the_local_runner_does_not_hold_is_dropped() {
+        let held = report(1, 0, Available, "10.200.1.5");
+        let c = Cluster::new(1, HTTP, &[1])
+            .egress(true)
+            .reported(1, 100, vec![held.clone()]);
+        assert_eq!(
+            c.egress_pods(1, Some(std::slice::from_ref(&held))),
+            ["10.200.1.5"]
+        );
+
+        // Status is old: the runner holds nothing.
+        assert!(c.egress_pods(1, Some(&[])).is_empty());
+        // The IP went to a pod of another workload.
+        let mut other = held.clone();
+        other.workload = "api".into();
+        assert!(c.egress_pods(1, Some(&[other])).is_empty());
+        // The replica runs again, under another IP.
+        let moved = report(1, 0, Available, "10.200.1.6");
+        assert!(c.egress_pods(1, Some(&[moved])).is_empty());
+        // The runner holds the IP for another revision or another replica.
+        let mut revision = held.clone();
+        revision.revision = 2;
+        assert!(c.egress_pods(1, Some(&[revision])).is_empty());
+        let mut index = held;
+        index.replica_index = 1;
+        assert!(c.egress_pods(1, Some(&[index])).is_empty());
+    }
+
+    /// Status is checked too: only addresses a pod can have in this node's
+    /// subnet are listed.
+    #[test]
+    fn addresses_a_pod_cannot_have_are_not_listed() {
+        let c = Cluster::new(1, HTTP, &[1, 1, 1, 1, 1])
+            .egress(true)
+            .reported(
+                1,
+                100,
+                vec![
+                    report(1, 0, Available, "10.200.1.1"),
+                    report(1, 1, Available, "10.200.1.0"),
+                    report(1, 2, Available, "10.200.1.255"),
+                    report(1, 3, Available, "10.200.2.9"),
+                    report(1, 4, Available, "10.200.1.7"),
+                ],
+            );
+        assert_eq!(c.egress_pods(1, None), ["10.200.1.7"]);
+    }
+
+    #[test]
+    fn a_node_without_a_subnet_lists_nothing() {
+        let mut c = Cluster::new(1, HTTP, &[1]).egress(true).reported(
+            1,
+            100,
+            vec![report(1, 0, Available, "10.200.1.2")],
+        );
+        c.view
+            .mesh
+            .as_mut()
+            .unwrap()
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .container_subnet = None;
+        assert!(c.egress_pods(1, None).is_empty());
+    }
+
+    #[test]
+    fn egress_changes_the_desired_value_a_quiet_tick_does_not() {
+        let cluster = |egress| {
+            Cluster::new(1, HTTP, &[1]).egress(egress).reported(
+                1,
+                100,
+                vec![report(1, 0, Available, "10.200.1.2")],
+            )
+        };
+        let first = planned(cluster(true));
+        let mut again = cluster(true);
+        for status in again.view.statuses.values_mut() {
+            status.reported_at += 3;
+            status.replicas[0].detail = Some("probe ok".into());
+        }
+        again.view.mesh.as_mut().unwrap().clock += 3;
+        assert_eq!(first, planned(again));
+        assert_ne!(first, planned(cluster(false)));
+    }
+
+    // ---- the step ----
+
+    fn step() -> ServicesStep {
+        ServicesStep::new(
+            NetworkManager::new(Arc::new(RecordingRunner::new())),
+            1,
+            LeaseTiming::default(),
+        )
+    }
+
+    fn state_of(cluster: Cluster) -> ReplicatedStateView {
+        ReplicatedStateView {
             mesh: None,
-            placement: Some(
-                Cluster::new(1, HTTP, &[1])
-                    .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])
-                    .view,
-            ),
+            placement: Some(cluster.view),
             status_interval_secs: INTERVAL,
             data_keys: Default::default(),
             now: 0,
-        };
+        }
+    }
+
+    /// What the step on node 1 wants for `cluster`.
+    fn planned(cluster: Cluster) -> ServicesDesired {
+        step().plan(&state_of(cluster)).desired
+    }
+
+    #[test]
+    fn the_step_plans_from_the_view_and_names_itself() {
+        let step = step();
+        assert_eq!(step.name(), "services");
+        let view = state_of(Cluster::new(1, HTTP, &[1]).reported(
+            1,
+            100,
+            vec![report(1, 0, Available, "10.200.1.2")],
+        ));
         let planned = step.plan(&view);
-        assert_eq!(planned.desired.len(), 1);
-        assert_eq!(planned.desired[0].backends.len(), 1);
+        assert_eq!(planned.desired.services.len(), 1);
+        assert_eq!(planned.desired.services[0].backends.len(), 1);
         assert!(planned.warnings.is_empty());
 
         let empty = ReplicatedStateView {
             placement: None,
             ..view
         };
-        assert!(step.plan(&empty).desired.is_empty());
+        let nothing = step.plan(&empty).desired;
+        assert!(nothing.services.is_empty() && nothing.egress_pods.is_empty());
     }
 
     #[tokio::test]
     async fn the_step_loads_the_rules_into_the_table_and_a_network_reload_keeps_them() {
         let runner = Arc::new(RecordingRunner::new());
         let network = NetworkManager::new(runner.clone());
-        let step = ServicesStep::new(network.clone(), LeaseTiming::default());
+        let step = ServicesStep::new(network.clone(), 1, LeaseTiming::default());
         let spec = faber_network_management::NetworkSpec {
             interface: "faber0".into(),
             wireguard: faber_network_management::WireGuardSpec {
@@ -674,6 +973,7 @@ mod tests {
                 peer_mesh_ips: Default::default(),
                 containers: Some(ContainerFirewall {
                     cidr: "10.200.0.0/16".parse().unwrap(),
+                    mesh_cidr: "10.99.0.0/16".parse().unwrap(),
                     local_subnet: Some("10.200.1.0/24".parse().unwrap()),
                     node_mesh_ips: Default::default(),
                     bridge: "faberbr0".into(),
@@ -683,9 +983,11 @@ mod tests {
         };
         network.reconcile(&spec).await.unwrap();
 
-        let desired = Cluster::new(1, HTTP, &[1])
-            .reported(1, 100, vec![report(1, 0, Available, "10.200.1.2")])
-            .desired();
+        let desired = planned(Cluster::new(1, HTTP, &[1]).egress(true).reported(
+            1,
+            100,
+            vec![report(1, 0, Available, "10.200.1.2")],
+        ));
         step.apply(&desired).await.unwrap();
         // The network step runs again, as after any peer change.
         network.reconcile(&spec).await.unwrap();
@@ -701,5 +1003,10 @@ mod tests {
         assert!(!scripts[0].contains(rule));
         assert!(scripts[1].contains(rule), "{}", scripts[1]);
         assert!(scripts[2].contains(rule), "{}", scripts[2]);
+        // The egress pod goes the same way.
+        let pod = "\t\telements = { 10.200.1.2 }\n";
+        assert!(!scripts[0].contains(pod));
+        assert!(scripts[1].contains(pod), "{}", scripts[1]);
+        assert!(scripts[2].contains(pod), "{}", scripts[2]);
     }
 }

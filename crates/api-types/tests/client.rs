@@ -810,6 +810,7 @@ async fn deploy_posts_the_workloads_and_returns_the_result() {
                 "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                 "restart": "always",
                 "expose": "environment",
+                "egress": false,
                 "placement": {"nodes": []},
                 "volumes": {},
                 "containers": [{

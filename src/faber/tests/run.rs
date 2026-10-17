@@ -1315,6 +1315,7 @@ fn workload_body() -> Value {
             "scale": "daemon",
             "restart": "on_failure",
             "expose": "cluster",
+            "egress": true,
             "placement": {"nodes": ["node-1", "node-2"]},
             "stop_grace_secs": 30,
             "volumes": {
@@ -1385,6 +1386,7 @@ generation:  9
 scale:       daemon
 restart:     on-failure
 expose:      cluster
+egress:      on
 nodes:       node-1, node-2
 stop_grace:  30s
 replicas:
@@ -1462,6 +1464,25 @@ async fn app_show_json_is_the_dto() {
     let out = run_ok(&server, &args).await;
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v, workload_body());
+}
+
+/// A spec that leaves `egress` out has it off.
+#[tokio::test]
+async fn app_show_prints_egress_off_by_default() {
+    let server = MockServer::start().await;
+    let mut body = workload_body();
+    body["spec"].as_object_mut().unwrap().remove("egress");
+    mount_json(&server, "GET", WORKLOAD_ROUTE, 200, body).await;
+
+    let out = run_ok(&server, &with_target(&["app", "show", "web"], &[])).await;
+    assert!(
+        out.contains(
+            "
+egress:      off
+"
+        ),
+        "{out}"
+    );
 }
 
 #[tokio::test]

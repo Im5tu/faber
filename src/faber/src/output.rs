@@ -650,6 +650,7 @@ pub fn workload(format: OutputFormat, w: &WorkloadResponse) -> Result<String> {
         ("scale", scale(spec.scale)),
         ("restart", restart.to_string()),
         ("expose", exposure(spec.expose).to_string()),
+        ("egress", if spec.egress { "on" } else { "off" }.to_string()),
         ("nodes", names(&spec.placement.nodes)),
         (
             "stop_grace",
