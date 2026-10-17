@@ -11,7 +11,9 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use faber_api_types::workload::{DeployIssueSource, WorkloadSpec, prepare_deploy};
+use faber_api_types::workload::{
+    DeployIssueSource, NOTE_SECRET_NAMES, WorkloadSpec, prepare_deploy,
+};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, Visitor};
 
 /// The largest input file, and the most that is read from stdin: 8 MiB. A
@@ -128,13 +130,29 @@ pub(crate) fn plan(
                     DeployIssueSource::Prune => "--prune",
                     DeployIssueSource::Expose => "--expose",
                 };
-                Diagnostic::new(source, issue.path, issue.message)
+                let message = match issue.source {
+                    DeployIssueSource::Prune => format!(
+                        "{}; drop --prune, or remove them by name with `faber app rm`",
+                        issue.message
+                    ),
+                    _ => issue.message,
+                };
+                Diagnostic::new(source, issue.path, message)
             })
             .collect(),
     })?;
 
     Ok(Plan {
-        notes,
+        notes: notes
+            .into_iter()
+            .map(|note| {
+                if note == NOTE_SECRET_NAMES {
+                    format!("{note}, but the CLI always shows them")
+                } else {
+                    note
+                }
+            })
+            .collect(),
         workloads,
         files: reader.read.into_inner(),
     })

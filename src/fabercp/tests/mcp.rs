@@ -201,6 +201,7 @@ async fn every_tool_runs_against_the_service() {
     );
     let done = ok(&c, "deploy_spec", deploy(json!({}))).await;
     assert_eq!(done["created"], json!(["web"]));
+    assert_eq!(done["notes"].as_array().map(Vec::len), Some(1));
 
     let listed = ok(&c, "app_list", json!({"project": "shop"})).await;
     assert_eq!(

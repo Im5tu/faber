@@ -288,8 +288,9 @@ const SECRET_NAME_PARTS: [&str; 6] = [
 const NOTE_NO_CAPABILITIES: &str = "containers get no Linux capabilities unless the file adds \
      them; images that expect Docker's default set may fail to start";
 
-const NOTE_SECRET_NAMES: &str = "an env variable name looks like a secret; env values are \
-     encrypted at rest, but the CLI always shows them";
+/// Front ends add what they do with the values after this text.
+pub const NOTE_SECRET_NAMES: &str =
+    "an env variable name looks like a secret; env values are encrypted at rest";
 
 /// What a [`DeployIssue`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,8 +345,7 @@ pub fn prepare_deploy(
         issues.push(DeployIssue::new(
             DeployIssueSource::Prune,
             "",
-            "the input has no workloads, so every workload of the environment would be \
-             removed; drop --prune, or remove them by name with `faber app rm`",
+            "the input has no workloads, so every workload of the environment would be removed",
         ));
     }
     for name in expose {

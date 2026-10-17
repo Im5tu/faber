@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use faber_api_types::workload::{
-    CreateProjectRequest, DeployIssue, DeployIssueSource, DeployRequest, WorkloadQuery,
-    WorkloadSpec, fqdn, prepare_deploy,
+    CreateProjectRequest, DeployIssue, DeployIssueSource, DeployRequest, NOTE_SECRET_NAMES,
+    WorkloadQuery, WorkloadSpec, fqdn, prepare_deploy,
 };
 use faber_api_types::{CreateInviteRequest, JoinRequest, error_code};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -191,7 +191,12 @@ fn deploy_refused(issues: &[DeployIssue]) -> CallToolResult {
                 DeployIssueSource::Prune => "prune",
                 DeployIssueSource::Expose => "expose",
             };
-            if place.is_empty() {
+            if issue.source == DeployIssueSource::Prune {
+                format!(
+                    "{}; set prune to false, or remove them by name with app_remove",
+                    issue.message
+                )
+            } else if place.is_empty() {
                 issue.message.clone()
             } else {
                 format!("{place}: {}", issue.message)
@@ -377,7 +382,16 @@ impl FaberMcp {
                 }
             };
         let notes = match prepare_deploy(&mut workloads, &expose.unwrap_or_default(), prune) {
-            Ok(notes) => notes,
+            Ok(notes) => notes
+                .into_iter()
+                .map(|note| {
+                    if note == NOTE_SECRET_NAMES {
+                        format!("{note}; app_show masks them unless reveal is true")
+                    } else {
+                        note
+                    }
+                })
+                .collect::<Vec<_>>(),
             Err(issues) => return deploy_refused(&issues),
         };
         if dry_run.unwrap_or(false) {

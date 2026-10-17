@@ -2597,3 +2597,49 @@ async fn a_joiner_removed_before_it_joined_gives_up_its_identity() {
 
     n1.stop().await;
 }
+
+/// The MCP tools reach the mesh service: an invite maps its arguments, and
+/// the lease reads and sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_tools_invite_and_set_the_lease_in_a_mesh() {
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::StreamableHttpClientTransport;
+
+    let mut n1 = founder().await;
+    let transport =
+        StreamableHttpClientTransport::from_uri(format!("http://{}/mcp", n1.api_addr()));
+    let mcp = ().serve(transport).await.unwrap();
+    let call = |tool: &'static str, args: serde_json::Value| {
+        let mcp = &mcp;
+        async move {
+            let params =
+                CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone());
+            let result = mcp.call_tool(params).await.unwrap();
+            assert_eq!(result.is_error, Some(false), "{tool}: {result:?}");
+            let text = result.content[0].as_text().unwrap().text.clone();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        }
+    };
+
+    let invite = call(
+        "mesh_invite",
+        serde_json::json!({"name": "node-2", "wg_endpoint": NODE2_ENDPOINT, "ttl_secs": 600}),
+    )
+    .await;
+    assert_eq!(invite["name"], "node-2");
+    assert!(invite["mesh_ip"].is_string());
+    let token = InviteToken::decode(invite["token"].as_str().unwrap()).unwrap();
+    assert_eq!(token.endpoint, NODE2_ENDPOINT);
+
+    let lease = call("mesh_lease", serde_json::json!({})).await;
+    assert!(lease["lease_secs"].is_u64());
+    let set = call("mesh_lease", serde_json::json!({"set_secs": 4000})).await;
+    assert_eq!(set["lease_secs"], 4000);
+    let got = call("mesh_lease", serde_json::json!({})).await;
+    assert_eq!(got["lease_secs"], 4000);
+    assert_eq!(n1.client().mesh_lease().await.unwrap().lease_secs, 4000);
+
+    mcp.cancel().await.unwrap();
+    n1.stop().await;
+}
