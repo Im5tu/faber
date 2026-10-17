@@ -161,6 +161,7 @@ fn check_container_rules(container: &ContainerSpec, volumes: &[&str]) -> Result<
         scale: Default::default(),
         restart: Default::default(),
         expose: Default::default(),
+        egress: false,
         placement: Default::default(),
         stop_grace_secs: None,
         // Sizes are unknown here; the ramdisk-versus-memory rule needs
