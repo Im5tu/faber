@@ -630,7 +630,37 @@ Host/Origin guard:
 - Loopback listener: `Host` must be `localhost`, `127.0.0.1` or `[::1]` (any port).
 - Peer listener: the same hosts, plus this node's mesh IP.
 - A request with any `Origin` header, or with `Sec-Fetch-Site` other than `none`, gets 403 `forbidden`.
-- `/mcp` keeps its own `Host` allow-list (loopback, the peer listener address and `--mcp-allowed-host`); the Origin/`Sec-Fetch-Site` rule applies to it too.
+- `/mcp`, served on the loopback listener only, keeps its own `Host` allow-list (loopback names and `--mcp-allowed-host`); the Origin/`Sec-Fetch-Site` rule applies to it too.
+
+## MCP
+
+`/mcp` is the streamable HTTP MCP endpoint. It is served on the loopback listener only: the peer listener answers 404, because it also admits machines that hold just an invite and the tools can deploy and create invites. The `Host` and `Origin` rules are those under "Host/Origin guard". A request body is at most `limits::MAX_HTTP_BODY_BYTES` (1 MiB); a larger one with a `Content-Length` is refused with 413. There is no authentication, as on the loopback REST API.
+
+There are 17 tools, one per CLI action, and each calls the same `FaberService` method as the matching REST handler (setters with `forwarded = false`, so a follower forwards to the leader). Not offered: cluster key export, `app show --watch` and template deploys.
+
+| Tool | Arguments | Result (the JSON text of a successful call) |
+|---|---|---|
+| `health` | none | `HealthResponse`; an error result with the 503 health body when the node is unavailable |
+| `cluster_status` | none | `ClusterStatus` |
+| `cluster_init` | none | `ClusterStatus` |
+| `cluster_join` | `peer` | `ClusterStatus` |
+| `mesh_invite` | `name`, `wg_endpoint`, `ttl_secs?` | `InviteResponse` (it carries a private key). `wg_endpoint` is `CreateInviteRequest.endpoint` |
+| `mesh_lease` | `set_secs?` | `LeaseResponse`; sets the lease first when `set_secs` is given |
+| `mesh_status_interval` | `set_secs?` | `StatusIntervalResponse`; sets the interval first when `set_secs` is given |
+| `project_create` | `name`, `environments?` | `ProjectResponse` |
+| `project_list` | none | `ProjectListResponse` |
+| `project_show` | `name` | `ProjectResponse` |
+| `project_remove` | `name` | `{"removed": name}` |
+| `environment_add` | `project`, `environment` | `ProjectResponse` |
+| `environment_remove` | `project`, `environment` | `{"project": project, "removed": environment}` |
+| `deploy_spec` | `project`, `environment`, `workloads`, `expose?`, `prune?`, `dry_run?` | `DeployResponse` plus `notes` (strings). With `dry_run`: `{project, environment, spec, notes}` and the service is not called |
+| `app_list` | `project?`, `environment?` | `WorkloadListResponse` |
+| `app_show` | `project`, `environment`, `workload`, `reveal?` | `WorkloadResponse`. Env values read `***` unless `reveal` is true (default false, unlike the CLI, which always reveals) |
+| `app_remove` | `project`, `environment`, `workloads` | `{"removed": [fqdn, ...]}`; removes in order and stops at the first failure |
+
+`deploy_spec` takes `workloads` as a JSON object of workload specs by name, the object `faber deploy spec --dry-run` prints. The expose rewrite, the refusal of an empty input and of `prune` with an empty input, validation (`validate_workloads`) and the notes are the same code as the CLI's (`prepare_deploy` in `faber-api-types`). Every issue is one line of the `message` of a single `bad_request`. Duplicate workload names in the JSON object are not detected: the last one wins. The CLI refuses them.
+
+A failed call returns a tool result with `isError` true whose text is the `ErrorBody` JSON the REST route answers with (same `error` code, `message`, `leader_id`, `leader_addr`); the mapping from the service error is shared with REST. The error result of `app_remove` also has `removed`, the fqdns removed before the failure. Arguments that do not match the tool's schema are a JSON-RPC error, not a tool result.
 
 ## Error codes
 
