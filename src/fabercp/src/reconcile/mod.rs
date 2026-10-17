@@ -203,6 +203,7 @@ pub fn desired_network(
             peer_mesh_ips,
             containers: range.map(|cidr| ContainerFirewall {
                 cidr,
+                mesh_cidr: identity.mesh_cidr,
                 local_subnet,
                 node_mesh_ips,
                 bridge: POD_BRIDGE.to_string(),
@@ -1472,6 +1473,7 @@ mod tests {
             spec.containers,
             Some(ContainerFirewall {
                 cidr: net(RANGE),
+                mesh_cidr: net("10.99.0.0/16"),
                 local_subnet: Some(net("10.200.1.0/24")),
                 node_mesh_ips: ips(&["10.99.0.1", "10.99.0.3"]),
                 bridge: "faberbr0".into(),
@@ -1815,6 +1817,7 @@ mod tests {
             plan.desired.network.firewall.containers,
             Some(ContainerFirewall {
                 cidr: net(RANGE),
+                mesh_cidr: net("10.99.0.0/16"),
                 local_subnet: Some(own),
                 node_mesh_ips: BTreeSet::new(),
                 bridge: "faberbr0".into(),

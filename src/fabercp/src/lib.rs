@@ -890,10 +890,14 @@ pub(crate) fn host_steps(host: &HostReconciler) -> StepRunner {
                 host.backends.runtime.clone(),
                 host.identity.node_id,
             ))
-            .with(ServicesStep::new(
-                host.backends.network.clone(),
-                host.lease_timing,
-            ))
+            .with(
+                ServicesStep::new(
+                    host.backends.network.clone(),
+                    host.identity.node_id,
+                    host.lease_timing,
+                )
+                .with_live_replicas(host.containers.state.clone()),
+            )
             .with(
                 ContainersStep::new(
                     runner::SocketNodeClient::new(host.containers.socket.clone()),
