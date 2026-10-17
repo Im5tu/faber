@@ -2202,7 +2202,7 @@ cat > /www/cgi-bin/who <<'CGI'
 #!/bin/sh
 echo "Content-Type: text/plain"
 echo
-echo "$REMOTE_ADDR"
+echo "$REMOTE_ADDR" | sed 's/^\[::ffff://; s/\]$//'
 CGI
 chmod +x /www/cgi-bin/who
 exec httpd -f -p 8080 -h /www
