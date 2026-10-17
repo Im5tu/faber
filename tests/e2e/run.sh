@@ -51,8 +51,9 @@
 #      range, and the probe sees the node address; a default workload does
 #      not reach it; the mesh address stays unreachable for both; turning
 #      egress on or off keeps the revision and the container and takes
-#      effect without a restart. Reaching the real internet is only
-#      reported, not asserted.
+#      effect without a restart. The real internet is a second target: when
+#      the node itself reaches it (a control), the opted-in container must
+#      too; when it does not, the check is skipped.
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -2185,7 +2186,7 @@ n_wait_available() {
 }
 
 phase_n() {
-  local out rc app rev_closed cid_open cid_closed ip_open ip_closed internet
+  local out rc app rev_closed cid_open cid_closed ip_open ip_closed internet reached
   section "N: container egress per workload on $NODE_A"
   out="$(install_crictl "$NODE_A")"
   assert_ok "N $NODE_A: crictl is installed" "$?" "$out"
@@ -2261,11 +2262,22 @@ EOF
   assert_hasnt "N egress_pods does not list the pod of closed" "$out" "\b${ip_closed//./\\.}\b"
   assert_has "N the forward chain accepts egress_pods" "$(dx "$NODE_A" 'nft list chain inet faber forward')" '@egress_pods.* accept$'
 
-  # The internet is informational: CI egress varies.
-  for internet in https://1.1.1.1/ https://9.9.9.9/; do
-    n_wget "$cid_open" "$internet" 5 >/dev/null
-    info "informational: open fetching $internet exits $?"
+  # The real internet. CI egress varies, so the node itself is the control:
+  # if it reaches a target over TCP, the opted-in container must as well.
+  reached=""
+  for internet in 1.1.1.1 9.9.9.9; do
+    if dxq "$NODE_A" "timeout 5 bash -c 'exec 3<>/dev/tcp/$internet/80'"; then
+      reached="$internet"
+      break
+    fi
+    info "control: $NODE_A does not reach $internet:80"
   done
+  if [[ -n "$reached" ]]; then
+    dxq "$NODE_A" "crictl exec $cid_open sh -c 'nc -w 5 $reached 80 </dev/null'"
+    assert_ok "N open reaches $reached:80 on the internet, as $NODE_A does" "$?"
+  else
+    info "skipped: $NODE_A reaches no internet target, so open is not checked against one"
+  fi
 
   # Turning egress on keeps the revision and the container, and takes effect.
   rev_closed="$(m_revision "$NODE_A" closed "$N_PROJECT" "$N_ENV")"

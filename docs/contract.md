@@ -411,7 +411,7 @@ The types are in `faber_api_types::workload`. Every type refuses unknown fields,
 | `scale` | `{"replicas": {"count": 1, "strategy": "spread"}}` | `{"replicas": {"count": N, "strategy": S}}` with N from 0 to 1024 and S `spread` (the default) or `pack`, or `"daemon"` for one copy on every node |
 | `restart` | `always` | `always`, `on_failure` or `never`, see "The runner" |
 | `expose` | `environment` | `environment` or `cluster`, see "Exposure" |
-| `egress` | `false` | `true` lets the pods open connections to addresses outside the container, service and mesh ranges and outside `169.254.0.0/16`, masqueraded to the node's address on its default route. IPv4 only. See "Container network" |
+| `egress` | `false` | `true` lets the pods open connections to addresses outside the container, service and mesh ranges and outside the special ranges listed under "nftables", masqueraded to the node's address on its default route. IPv4 only. See "Container network" |
 | `placement` | `{}` | `{nodes}`. `nodes` is a list of at most 64 unique node names, each a DNS label. Empty means any node. With `"daemon"` the workload runs once on each listed node |
 | `stop_grace_secs?` | none | at most 3600. The runner uses 30 when it is absent |
 | `volumes` | `{}` | at most 32, by name. A workload has no volume unless its spec declares one. Each is one of the two kinds below |
@@ -1060,7 +1060,7 @@ In a mesh with a container range, the forward chain lets container traffic throu
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16 } accept
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
@@ -1081,11 +1081,11 @@ In a mesh with a container range, the forward chain lets container traffic throu
 	}
 ```
 
-The example has a service range (`10.201.0.0/16`) and two opted-in pods, and leaves out the hairpin rules and the other nat chains. Without a service range the list in the first rule is `{ 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16 }`: the container, mesh and service ranges in that order, then the link-local range, which holds the cloud metadata address.
+The example has a service range (`10.201.0.0/16`) and two opted-in pods, and leaves out the hairpin rules and the other nat chains. Without a service range the list in the first rule is `{ 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 }`: the container, mesh and service ranges in that order, then the link-local range, this-network, loopback, and multicast with everything above it. Of the cloud metadata addresses only `169.254.169.254` and the rest of `169.254.0.0/16` are blocked (see the limits of "Container network").
 
 Two rules come before rule 1, and are left out of the numbering below because other text quotes the numbers:
 
-- **E1**: traffic from a pod in `@egress_pods` to any interface other than the tunnel and the bridge, to an address outside the container, mesh and service ranges and outside `169.254.0.0/16`, is accepted. There is no `ct` match: every packet of a flow passes this chain, and rule 1 would drop the second packet of a flow that E1 accepted only as new.
+- **E1**: traffic from a pod in `@egress_pods` to any interface other than the tunnel and the bridge, to an address outside the container, mesh and service ranges and outside `169.254.0.0/16`, `0.0.0.0/8`, `127.0.0.0/8` and `224.0.0.0/3`, is accepted. There is no `ct` match: every packet of a flow passes this chain, and rule 1 would drop the second packet of a flow that E1 accepted only as new.
 - **E2**: traffic from any interface other than the tunnel and the bridge to a pod in `@egress_pods` is accepted for `established,related` only. A flow becomes established only when a pod started it, because a new packet from outside meets rule 2. Nothing outside opens a connection to a pod.
 
 Both are present only with a subnet. A destination in the excluded ranges is not matched by E1 and falls through: rule 1 drops it when it leaves by another interface, rule 6 when it goes into the tunnel. `postrouting` masquerades `@egress_pods` when the output interface is neither the tunnel nor the bridge, so the pod uses the address of the node's default route; the tunnel and bridge traffic keeps the pod address.
@@ -1197,8 +1197,9 @@ faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact te
 | a machine that only holds an invite | any container | dropped: it is not in `node_mesh_ips` and its `AllowedIPs` are its `/32` alone |
 | a container | the mesh IP of another node | dropped by rule 6 of the forward chain on the container's own node |
 | a container | anything outside the container range | dropped on the container's own node unless the workload opted in: by rule 1 when the packet would leave through any interface other than the tunnel, by rule 6 otherwise |
-| a container of a workload with `egress` true | an address outside the container, service and mesh ranges and `169.254.0.0/16` | allowed and masqueraded to the node's address (E1, E2, `postrouting`) |
-| a container of a workload with `egress` true | a mesh IP, the service range or `169.254.0.0/16` (cloud metadata) | dropped by rule 1 or rule 6 |
+| a container of a workload with `egress` true | an address outside the container, service and mesh ranges and the special ranges of E1 | allowed and masqueraded to the node's address (E1, E2, `postrouting`) |
+| a container of a workload with `egress` true | a mesh IP, `169.254.0.0/16` (the usual cloud metadata address), `0.0.0.0/8`, `127.0.0.0/8` or `224.0.0.0/3` | dropped by rule 1 or rule 6 |
+| a container of a workload with `egress` true | a service virtual IP | DNATed in `prerouting` to a backend, or rejected by `service_reject_prerouting`, before the forward chain. E1 never sees it |
 | anything outside | a container of a workload with `egress` true | dropped by rule 2, except the replies of a connection the container opened (E2) |
 | anything behind another interface of the host | a container | dropped by rule 2 |
 | a container, over IPv6 | anything beyond the bridge | dropped. Rule 1 drops what would leave through another interface, and rule 10 what would enter the tunnel. No rule accepts IPv6 |
@@ -1210,9 +1211,10 @@ faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact te
 
 Limits:
 
-- Container egress is off by default. A workload with `egress` true lets its pods reach addresses outside the container, service and mesh ranges and outside `169.254.0.0/16`, masqueraded to the address of the node's default route. The CNI config does no masquerading. The other NAT is the service DNAT, the hairpin and host-to-service masquerade rules of the nat chains (see "Virtual IPs"). IPv4 only. Image pulls are not affected, because containerd pulls on the host.
+- Container egress is off by default. A workload with `egress` true lets its pods reach addresses outside the container, service and mesh ranges and outside `169.254.0.0/16`, `0.0.0.0/8`, `127.0.0.0/8` and `224.0.0.0/3`, masqueraded to the address of the node's default route. The CNI config does no masquerading. The other NAT is the service DNAT, the hairpin and host-to-service masquerade rules of the nat chains (see "Virtual IPs"). IPv4 only. Image pulls are not affected, because containerd pulls on the host.
 - An opted-in pod reaches the node's LAN and any network the host routes to, a VPN included. There is no destination allowlist.
-- A pod that opts in is identified by its IP in the `egress_pods` set. The set is rebuilt when the state of the node changes, not when a sandbox is removed. If host-local gives the IP of a removed opted-in pod to a pod of another workload before the next rebuild (about one status interval), that pod has egress until the rebuild. host-local hands out addresses in order, so this needs the node to cycle through its subnet. fabercp lists a pod only while its own runner holds it, which closes the window for stale status.
+- Of the cloud metadata endpoints, only those in `169.254.0.0/16` are blocked. Some providers use other addresses, for example Azure `168.63.129.16` and Alibaba Cloud `100.100.100.200`, and an opted-in pod reaches them like any other outside address.
+- A pod that opts in is identified by its IP in the `egress_pods` set. The set is rebuilt when the state of the node changes, not when a sandbox is removed. If host-local gives the IP of a removed opted-in pod to a pod of another workload before the next rebuild (about one status interval), that pod has egress until the rebuild. host-local may reuse a released address; whether it does soon depends on the plugin version and has not been checked here. Conntrack entries of the old pod's flows also survive the removal, so within the same window a leftover established flow can deliver replies to the pod that reused the IP (E2 accepts them). fabercp lists a pod only while its own runner holds it, which closes the window for stale status.
 - After a fabercp restart, and for a new replica, egress starts once the runner has seen the pod and a status report has caused a re-plan, up to about one status interval. After a restart, established flows of existing pods are dropped in that gap.
 - A pod that forges the IP of an opted-in pod gets egress. Forging it needs a capability the runner refuses (`NET_RAW`, `NET_ADMIN`).
 - There is no per-container policy. Any registered node can reach every container, and any container can reach every other container.
