@@ -14,9 +14,11 @@
 mod nftables;
 mod wireguard;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 pub use nftables::{
-    ContainerFirewall, DNS_REDIRECT_PORT, FirewallSpec, NatBackend, NatProtocol, ServiceNat,
-    endpoint_ip,
+    ContainerFirewall, DNS_REDIRECT_PORT, FirewallSpec, NatBackend, NatProtocol, SET_EGRESS_PODS,
+    ServiceNat, endpoint_ip,
 };
 pub use wireguard::{WireGuardPeer, WireGuardSpec};
 
@@ -64,6 +66,8 @@ struct TableState {
     base: Option<(String, FirewallSpec)>,
     /// The services of the last [`NetworkManager::set_services`].
     services: Vec<ServiceNat>,
+    /// The egress pods of the last [`NetworkManager::set_services`].
+    egress_pods: BTreeSet<Ipv4Addr>,
 }
 
 impl NetworkManager {
@@ -119,36 +123,62 @@ impl NetworkManager {
     pub async fn reconcile(&self, spec: &NetworkSpec) -> Result<(), NetworkError> {
         let runner = self.runner.as_ref();
         wireguard::ensure_up(runner, &spec.interface, &spec.wireguard).await?;
-        let services = {
+        let (services, egress_pods) = {
             let mut table = self.table();
             table.base = Some((spec.interface.clone(), spec.firewall.clone()));
-            table.services.clone()
+            (table.services.clone(), table.egress_pods.clone())
         };
-        nftables::apply(runner, &spec.interface, &spec.firewall, &services).await
+        nftables::apply(
+            runner,
+            &spec.interface,
+            &spec.firewall,
+            &services,
+            &egress_pods,
+        )
+        .await
     }
 
-    /// Sets the nat rules of the services and loads the table again. The
-    /// table is one script that [`Self::reconcile`] replaces as a whole, so
-    /// the services are kept here and every later `reconcile` includes them.
+    /// Sets the nat rules of the services and the pods that may leave the
+    /// container network ([`SET_EGRESS_PODS`]), and loads the table again.
+    /// The table is one script that [`Self::reconcile`] replaces as a whole,
+    /// so both are kept here and every later `reconcile` includes them.
     ///
     /// Nothing is run when `reconcile` has not loaded the table yet (it will
-    /// include them), or when there are no services now and there were none
-    /// before. The services count as set once the table is loaded with them,
-    /// so after an error the same call tries again.
-    pub async fn set_services(&self, services: &[ServiceNat]) -> Result<(), NetworkError> {
+    /// include them), or when there are neither services nor pods now and
+    /// there were none before. They count as set once the table is loaded
+    /// with them, so after an error the same call tries again.
+    pub async fn set_services(
+        &self,
+        services: &[ServiceNat],
+        egress_pods: &BTreeSet<Ipv4Addr>,
+    ) -> Result<(), NetworkError> {
         let (iface, firewall) = {
             let mut table = self.table();
             let Some(base) = table.base.clone() else {
                 table.services = services.to_vec();
+                table.egress_pods = egress_pods.clone();
                 return Ok(());
             };
-            if services.is_empty() && table.services.is_empty() {
+            if services.is_empty()
+                && egress_pods.is_empty()
+                && table.services.is_empty()
+                && table.egress_pods.is_empty()
+            {
                 return Ok(());
             }
             base
         };
-        nftables::apply(self.runner.as_ref(), &iface, &firewall, services).await?;
-        self.table().services = services.to_vec();
+        nftables::apply(
+            self.runner.as_ref(),
+            &iface,
+            &firewall,
+            services,
+            egress_pods,
+        )
+        .await?;
+        let mut table = self.table();
+        table.services = services.to_vec();
+        table.egress_pods = egress_pods.clone();
         Ok(())
     }
 }
@@ -612,6 +642,7 @@ mod tests {
         spec.wireguard.routes = vec!["10.200.0.0/16".parse().unwrap()];
         spec.firewall.containers = Some(ContainerFirewall {
             cidr: "10.200.0.0/16".parse().unwrap(),
+            mesh_cidr: "10.99.0.0/16".parse().unwrap(),
             local_subnet: Some("10.200.1.0/24".parse().unwrap()),
             node_mesh_ips: ["10.99.0.1".parse().unwrap()].into_iter().collect(),
             bridge: "faberbr0".into(),
@@ -672,6 +703,7 @@ mod tests {
         let mut spec = network_spec("faber0");
         spec.firewall.containers = Some(ContainerFirewall {
             cidr: "10.200.0.0/16".parse().unwrap(),
+            mesh_cidr: "10.99.0.0/16".parse().unwrap(),
             local_subnet: Some("10.200.1.0/24".parse().unwrap()),
             node_mesh_ips: Default::default(),
             bridge: "faberbr0".into(),
@@ -706,7 +738,10 @@ mod tests {
         let manager = NetworkManager::new(r.clone());
         let spec = container_network_spec();
         manager.reconcile(&spec).await.unwrap();
-        manager.set_services(&redis()).await.unwrap();
+        manager
+            .set_services(&redis(), &BTreeSet::new())
+            .await
+            .unwrap();
         // A clone shares the services, as the two steps do.
         manager.clone().reconcile(&spec).await.unwrap();
 
@@ -715,17 +750,59 @@ mod tests {
         assert!(!scripts[0].contains("10.201.0.1"));
         assert_eq!(
             scripts[1],
-            nftables::render_with_services("faber0", &spec.firewall, &redis())
+            nftables::render_with_services("faber0", &spec.firewall, &redis(), &BTreeSet::new())
         );
         assert_eq!(scripts[2], scripts[1]);
         assert!(scripts[2].contains("ip daddr 10.201.0.1 tcp dport 6379 dnat ip to"));
+    }
+
+    fn pods(ips: &[&str]) -> BTreeSet<Ipv4Addr> {
+        ips.iter().map(|ip| ip.parse().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn egress_pods_are_loaded_and_survive_a_reconcile() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        let spec = container_network_spec();
+        manager.reconcile(&spec).await.unwrap();
+        let egress = pods(&["10.200.1.5"]);
+        manager.set_services(&[], &egress).await.unwrap();
+        manager.clone().reconcile(&spec).await.unwrap();
+
+        let scripts = nft_scripts(&r);
+        assert_eq!(scripts.len(), 3, "{scripts:#?}");
+        let want = nftables::render_with_services("faber0", &spec.firewall, &[], &egress);
+        assert!(want.contains("elements = { 10.200.1.5 }"), "{want}");
+        assert_eq!(scripts[1], want);
+        assert_eq!(scripts[2], want);
+    }
+
+    #[tokio::test]
+    async fn a_change_of_egress_pods_alone_reloads_the_table() {
+        let r = Arc::new(RecordingRunner::new());
+        let manager = NetworkManager::new(r.clone());
+        manager.reconcile(&container_network_spec()).await.unwrap();
+        manager
+            .set_services(&redis(), &pods(&["10.200.1.5"]))
+            .await
+            .unwrap();
+        r.clear();
+        manager
+            .set_services(&redis(), &pods(&["10.200.1.6"]))
+            .await
+            .unwrap();
+        assert_eq!(nft_scripts(&r).len(), 1);
     }
 
     #[tokio::test]
     async fn services_set_before_the_table_is_loaded_wait_for_reconcile() {
         let r = Arc::new(RecordingRunner::new());
         let manager = NetworkManager::new(r.clone());
-        manager.set_services(&redis()).await.unwrap();
+        manager
+            .set_services(&redis(), &BTreeSet::new())
+            .await
+            .unwrap();
         assert!(r.calls().is_empty());
 
         manager.reconcile(&container_network_spec()).await.unwrap();
@@ -740,12 +817,15 @@ mod tests {
         let manager = NetworkManager::new(r.clone());
         manager.reconcile(&container_network_spec()).await.unwrap();
         r.clear();
-        manager.set_services(&[]).await.unwrap();
+        manager.set_services(&[], &BTreeSet::new()).await.unwrap();
         assert!(r.calls().is_empty());
 
         // Taking the last service away does load the table.
-        manager.set_services(&redis()).await.unwrap();
-        manager.set_services(&[]).await.unwrap();
+        manager
+            .set_services(&redis(), &BTreeSet::new())
+            .await
+            .unwrap();
+        manager.set_services(&[], &BTreeSet::new()).await.unwrap();
         let scripts = nft_scripts(&r);
         assert_eq!(scripts.len(), 2);
         assert!(!scripts[1].contains("10.201.0.1"));
@@ -757,9 +837,15 @@ mod tests {
         let manager = NetworkManager::new(r.clone());
         manager.reconcile(&container_network_spec()).await.unwrap();
         r.script("nft", None, CommandOutput::failure(1, "boom"));
-        manager.set_services(&redis()).await.unwrap_err();
+        manager
+            .set_services(&redis(), &BTreeSet::new())
+            .await
+            .unwrap_err();
         r.script("nft", None, CommandOutput::success());
-        manager.set_services(&redis()).await.unwrap();
+        manager
+            .set_services(&redis(), &BTreeSet::new())
+            .await
+            .unwrap();
         let scripts = nft_scripts(&r);
         assert_eq!(scripts.len(), 3);
         // The failed call and the retry carry the same services.
