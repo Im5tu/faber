@@ -618,6 +618,7 @@ mod tests {
                         "scale": {"replicas": {"count": 1, "strategy": "spread"}},
                         "restart": "always",
                         "expose": "environment",
+                        "egress": false,
                         "placement": {"nodes": []},
                         "volumes": {},
                         "containers": [{
