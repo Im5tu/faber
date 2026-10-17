@@ -34,67 +34,71 @@ use crate::service::ServiceError;
 
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
-        let (status, body) = match self {
-            ServiceError::NotFound => {
-                (StatusCode::NOT_FOUND, ErrorBody::new(error_code::NOT_FOUND))
-            }
-            ServiceError::BadRequest(m) => (
-                StatusCode::BAD_REQUEST,
-                ErrorBody::new(error_code::BAD_REQUEST).with_message(m),
-            ),
-            ServiceError::AlreadyInitialized => (
-                StatusCode::CONFLICT,
-                ErrorBody::new(error_code::ALREADY_INITIALIZED)
-                    .with_message("cluster is already initialized"),
-            ),
-            ServiceError::AlreadyJoined => (
-                StatusCode::CONFLICT,
-                ErrorBody::new(error_code::ALREADY_JOINED)
-                    .with_message("this node has already joined a cluster"),
-            ),
-            ServiceError::NotLeader {
-                leader_id,
-                leader_addr,
-            } => {
-                let mut body = ErrorBody::new(error_code::NOT_LEADER)
-                    .with_message(format!("node {leader_id} at {leader_addr} is the leader"));
-                body.leader_id = Some(leader_id);
-                body.leader_addr = Some(leader_addr);
-                (StatusCode::SERVICE_UNAVAILABLE, body)
-            }
-            ServiceError::NoLeader => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorBody::new(error_code::NO_LEADER).with_message("no leader is known"),
-            ),
-            ServiceError::NotReady(m) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorBody::new(error_code::NOT_READY).with_message(m),
-            ),
-            ServiceError::PeerUnreachable(m) => (
-                StatusCode::BAD_GATEWAY,
-                ErrorBody::new(error_code::PEER_UNREACHABLE).with_message(m),
-            ),
-            ServiceError::Rejected { code, message } => (
-                rejection_status(&code),
-                ErrorBody::new(code).with_message(message),
-            ),
-            ServiceError::Forbidden(m) => (
-                StatusCode::FORBIDDEN,
-                ErrorBody::new(error_code::FORBIDDEN).with_message(m),
-            ),
-            ServiceError::Upstream { status, body } => (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                body,
-            ),
-            ServiceError::Internal(m) => {
-                tracing::error!(error = %m, "internal error");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorBody::new(error_code::INTERNAL).with_message(m),
-                )
-            }
-        };
+        let (status, body) = error_parts(self);
         (status, Json(body)).into_response()
+    }
+}
+
+/// The HTTP status and [`ErrorBody`] of `err`. REST answers with both; MCP
+/// tools return the body.
+pub fn error_parts(err: ServiceError) -> (StatusCode, ErrorBody) {
+    match err {
+        ServiceError::NotFound => (StatusCode::NOT_FOUND, ErrorBody::new(error_code::NOT_FOUND)),
+        ServiceError::BadRequest(m) => (
+            StatusCode::BAD_REQUEST,
+            ErrorBody::new(error_code::BAD_REQUEST).with_message(m),
+        ),
+        ServiceError::AlreadyInitialized => (
+            StatusCode::CONFLICT,
+            ErrorBody::new(error_code::ALREADY_INITIALIZED)
+                .with_message("cluster is already initialized"),
+        ),
+        ServiceError::AlreadyJoined => (
+            StatusCode::CONFLICT,
+            ErrorBody::new(error_code::ALREADY_JOINED)
+                .with_message("this node has already joined a cluster"),
+        ),
+        ServiceError::NotLeader {
+            leader_id,
+            leader_addr,
+        } => {
+            let mut body = ErrorBody::new(error_code::NOT_LEADER)
+                .with_message(format!("node {leader_id} at {leader_addr} is the leader"));
+            body.leader_id = Some(leader_id);
+            body.leader_addr = Some(leader_addr);
+            (StatusCode::SERVICE_UNAVAILABLE, body)
+        }
+        ServiceError::NoLeader => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorBody::new(error_code::NO_LEADER).with_message("no leader is known"),
+        ),
+        ServiceError::NotReady(m) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorBody::new(error_code::NOT_READY).with_message(m),
+        ),
+        ServiceError::PeerUnreachable(m) => (
+            StatusCode::BAD_GATEWAY,
+            ErrorBody::new(error_code::PEER_UNREACHABLE).with_message(m),
+        ),
+        ServiceError::Rejected { code, message } => (
+            rejection_status(&code),
+            ErrorBody::new(code).with_message(message),
+        ),
+        ServiceError::Forbidden(m) => (
+            StatusCode::FORBIDDEN,
+            ErrorBody::new(error_code::FORBIDDEN).with_message(m),
+        ),
+        ServiceError::Upstream { status, body } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        ),
+        ServiceError::Internal(m) => {
+            tracing::error!(error = %m, "internal error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody::new(error_code::INTERNAL).with_message(m),
+            )
+        }
     }
 }
 

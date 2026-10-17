@@ -7,7 +7,7 @@
 //! HTTP (WireGuard provides transport encryption between nodes).
 
 mod apps;
-mod cluster;
+pub(crate) mod cluster;
 mod mesh;
 
 use axum::Router;
