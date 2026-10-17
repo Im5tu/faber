@@ -1,0 +1,13 @@
+# Regeneration helper for crates/cri/src/generated. Not part of the workspace
+# and not part of normal builds. Run: crates/cri/regen.sh
+[package]
+name = "faber-cri-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"

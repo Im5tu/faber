@@ -1,0 +1,20 @@
+[package]
+name = "faber-network-management"
+description = "Host network reconciliation for faber: the WireGuard interface and the inet faber nftables table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "faber_network_management"
+path = "src/lib.rs"
+
+[dependencies]
+ipnet = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

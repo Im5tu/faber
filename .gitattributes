@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+*.bats text eol=lf
+tests/install/fixtures/** text eol=lf
+tests/e2e/Dockerfile text eol=lf
