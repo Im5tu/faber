@@ -43,7 +43,8 @@ Every asset has a signed build provenance attestation, and each tarball has a si
 gh release verify v0.1.0 --repo Im5tu/faber
 gh release verify-asset v0.1.0 faber-0.1.0-linux-x86_64.tar.gz --repo Im5tu/faber
 gh attestation verify faber-0.1.0-linux-x86_64.tar.gz --repo Im5tu/faber \
-  --signer-workflow Im5tu/faber/.github/workflows/_build.yml
+  --signer-workflow Im5tu/faber/.github/workflows/_build.yml \
+  --source-ref refs/tags/v0.1.0
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 

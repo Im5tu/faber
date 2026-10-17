@@ -53,7 +53,7 @@ jobs:
       - name: Install the toolchain
         run: |
           set -euo pipefail
-          rustup show
+          rustup toolchain install
           {
             echo '### Toolchain'
             echo '```'
@@ -137,6 +137,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
           dependency-snapshot: false
+          syft-version: v1.54.1
 
       - name: Check the SBOM lists crates
         run: |
@@ -148,6 +149,13 @@ jobs:
             echo "The SBOM has no cargo components; the auditable data was not read." >&2
             exit 1
           fi
+          for crate in fabercp faber faber-node; do
+            found="$(jq --arg n "$crate" '[.components[]? | select(.name == $n and ((.purl // "") | startswith("pkg:cargo/")))] | length' "$sbom")"
+            if [ "$found" -eq 0 ]; then
+              echo "The SBOM does not list the workspace crate ${crate}." >&2
+              exit 1
+            fi
+          done
 
       - name: Scan SBOM
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
@@ -158,6 +166,7 @@ jobs:
           output-format: table
           output-file: grype-${{ matrix.arch }}.txt
           cache-db: false
+          grype-version: v0.120.1
 
       - name: Add findings to the summary
         if: always()
@@ -214,6 +223,7 @@ jobs:
           subject-path: |
             release/*.tar.gz
             release/SHA256SUMS
+            release/*.cdx.json
 
       - name: Attest SBOM (x86_64)
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
