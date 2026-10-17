@@ -11,28 +11,12 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use faber_api_types::workload::{Exposure, WorkloadSpec, validate_workloads};
+use faber_api_types::workload::{DeployIssueSource, WorkloadSpec, prepare_deploy};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, Visitor};
 
 /// The largest input file, and the most that is read from stdin: 8 MiB. A
 /// deploy request holds far less.
 const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Parts of an env variable name that suggest its value is a secret.
-const SECRET_NAME_PARTS: [&str; 6] = [
-    "PASSWORD",
-    "PASSWD",
-    "SECRET",
-    "TOKEN",
-    "API_KEY",
-    "PRIVATE_KEY",
-];
-
-const NOTE_NO_CAPABILITIES: &str = "containers get no Linux capabilities unless the file adds \
-     them; images that expect Docker's default set may fail to start";
-
-const NOTE_SECRET_NAMES: &str = "an env variable name looks like a secret; env values are \
-     encrypted at rest, but the CLI always shows them";
 
 /// What a deploy reads from the machine it runs on.
 pub struct Inputs {
@@ -135,50 +119,22 @@ pub(crate) fn plan(
         })?
         .0;
 
-    let mut errors = Vec::new();
-    if workloads.is_empty() && !prune {
-        errors.push(Diagnostic::new(
-            &result_source,
-            "",
-            "nothing to deploy: the input has no workloads",
-        ));
-    } else if workloads.is_empty() {
-        errors.push(Diagnostic::new(
-            "--prune",
-            "",
-            "the input has no workloads, so every workload of the environment would be \
-             removed; drop --prune, or remove them by name with `faber app rm`",
-        ));
-    }
-    for name in expose {
-        match workloads.get_mut(name) {
-            Some(spec) => spec.expose = Exposure::Cluster,
-            None => {
-                let known: Vec<&str> = workloads.keys().map(String::as_str).collect();
-                errors.push(Diagnostic::new(
-                    "--expose",
-                    "",
-                    format!(
-                        "no workload named {name:?}; the input has: {}",
-                        known.join(", ")
-                    ),
-                ));
-            }
-        }
-    }
-    if let Err(violations) = validate_workloads(&workloads) {
-        errors.extend(
-            violations
-                .into_iter()
-                .map(|v| Diagnostic::new(&result_source, v.path, v.message)),
-        );
-    }
-    if !errors.is_empty() {
-        return Err(Failure { errors });
-    }
+    let notes = prepare_deploy(&mut workloads, expose, prune).map_err(|issues| Failure {
+        errors: issues
+            .into_iter()
+            .map(|issue| {
+                let source = match issue.source {
+                    DeployIssueSource::Input => result_source.as_str(),
+                    DeployIssueSource::Prune => "--prune",
+                    DeployIssueSource::Expose => "--expose",
+                };
+                Diagnostic::new(source, issue.path, issue.message)
+            })
+            .collect(),
+    })?;
 
     Ok(Plan {
-        notes: notes(&workloads),
+        notes,
         workloads,
         files: reader.read.into_inner(),
     })
@@ -326,23 +282,6 @@ fn read_input(
     read.map_err(|e| Diagnostic::new(source, "", format!("cannot read: {e}")))
 }
 
-fn notes(workloads: &BTreeMap<String, WorkloadSpec>) -> Vec<String> {
-    let mut containers = workloads.values().flat_map(|spec| &spec.containers);
-    let mut notes = Vec::new();
-    if containers.clone().all(|c| c.capabilities.is_empty()) {
-        notes.push(NOTE_NO_CAPABILITIES.to_string());
-    }
-    if containers.any(|c| c.env.keys().any(|name| looks_like_a_secret(name))) {
-        notes.push(NOTE_SECRET_NAMES.to_string());
-    }
-    notes
-}
-
-fn looks_like_a_secret(env_name: &str) -> bool {
-    let upper = env_name.to_ascii_uppercase();
-    SECRET_NAME_PARTS.iter().any(|part| upper.contains(part))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,22 +414,5 @@ mod tests {
             r"\\?\UNC\server\share\a.yaml"
         );
         assert_eq!(plain(Path::new("/work/a.yaml")), "/work/a.yaml");
-    }
-
-    #[test]
-    fn secret_names_are_matched_in_any_case() {
-        for name in [
-            "DB_PASSWORD",
-            "db_passwd",
-            "ClientSecret",
-            "GITHUB_TOKEN",
-            "stripe_api_key",
-            "SSH_PRIVATE_KEY",
-        ] {
-            assert!(looks_like_a_secret(name), "{name}");
-        }
-        for name in ["MODE", "PORT", "KEYBOARD", "API_URL", "PASS"] {
-            assert!(!looks_like_a_secret(name), "{name}");
-        }
     }
 }
