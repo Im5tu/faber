@@ -106,12 +106,13 @@ Other containers reach it at `redis.staging.shop.faber.local:6379`.
 
 Every command takes `--output json`. The CLI talks to the fabercp API on the same node, at `127.0.0.1` unless `--endpoint` says otherwise.
 
+The same actions are MCP tools at `http://127.0.0.1:7400/mcp`, apart from `cluster key export` and `--watch`. The endpoint answers on loopback only. `docs/contract.md` lists the tools and their arguments.
+
 ## Not there yet
 
-- **No auth on the local API:** any user on a node can use it and read env values through it.
+- **No auth on the local API or MCP:** any user on a node can use them and read env values through them.
 - **No ingress yet:** services can't be reached from outside the cluster (#3).
 - **No container egress yet:** containers can't reach the internet (#2).
-- **MCP:** the endpoint exists but has no tools (#4).
 - **Image pulls are anonymous only.**
 - **No logs, exec, metrics or web UI.**
 - **Block volumes:** they live on one node, with no backup or move.
