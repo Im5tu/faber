@@ -112,7 +112,7 @@ The same actions are MCP tools at `http://127.0.0.1:7400/mcp`, apart from `clust
 
 - **No auth on the local API or MCP:** any user on a node can use them and read env values through them.
 - **No ingress yet:** services can't be reached from outside the cluster (#3).
-- **Container egress is opt-in per workload:** `egress: true` in the spec. An opted-in container also reaches the node's LAN, and there is no destination allowlist.
+- **Container egress is opt-in and unfiltered:** only workloads with `egress: true` reach outside the cluster, and they also reach the node's LAN. There is no destination allowlist.
 - **Image pulls are anonymous only.**
 - **No logs, exec, metrics or web UI.**
 - **Block volumes:** they live on one node, with no backup or move.

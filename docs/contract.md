@@ -901,9 +901,10 @@ nftables chains (see "nftables") do the work:
 - `prerouting` (hook prerouting, priority dstnat), `output` (hook output, priority -100) and `postrouting` (priority srcnat) are nat chains in `inet faber`, present when container networking is on.
 - Per service and per (protocol, port): `ip daddr <vip> <proto> dport <port> dnat ip to numgen random mod N map { 0 : <ip>, ... }`. In `prerouting` it applies only to packets from the bridge, and in `output` to the host's own. A port with no backend gets no rule.
 - Hairpin: in `postrouting`, `oifname <bridge> ip saddr <b> ip daddr <b> ct status dnat masquerade` for each backend `b` in the local subnet, so a container that reaches its own service sees a source that is not itself.
+- A pod in `egress_pods` is masqueraded when it leaves by an interface other than the tunnel and the bridge: `ip saddr @egress_pods oifname != { <iface>, <bridge> } masquerade`, last in the chain.
 - A host connection to a service that reaches a pod on another node is masqueraded to the tunnel address: `oifname <iface> ip saddr != <container cidr> ip daddr <container cidr> ct status dnat masquerade`.
 - Two filter chains, `service_reject_prerouting` (from the bridge) and `service_reject_output`, reject any packet still addressed to the service range after the nat chains: an address with no backend, or one no service holds.
-- The forward chain needs no new rule: container-to-container traffic across nodes is already allowed, and `br_netfilter`, which install.sh loads, makes bridged traffic pass these chains.
+- For the services, the forward chain needs no new rule: container-to-container traffic across nodes is already allowed, and `br_netfilter`, which install.sh loads, makes bridged traffic pass these chains.
 - `NetworkManager::set_services` keeps the service rules and the egress pod set, so a network reload keeps them.
 
 ## DNS
