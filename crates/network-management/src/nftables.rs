@@ -20,8 +20,8 @@
 //! for the pods in `@egress_pods` (see [`SET_EGRESS_PODS`]), which are the
 //! pods of workloads that opted in to egress:
 //! - E1: `iifname <bridge> oifname != { <iface>, <bridge> } ip saddr
-//!   @egress_pods ip daddr != { <cidr>, <mesh>, <service>, 169.254.0.0/16 }
-//!   accept`. The service range is left out of the list when there is none.
+//!   @egress_pods ip daddr != { <cidr>, <mesh>, <service>, 169.254.0.0/16,
+//!   0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept`. The service range is left out of the list when there is none.
 //!   There is no `ct` match: every packet of a flow passes this chain, and a
 //!   later packet would meet rule 1.
 //! - E2: `oifname <bridge> iifname != { <iface>, <bridge> } ip daddr
@@ -134,8 +134,11 @@ pub const SET_NODE_MESH_IPS: &str = "node_mesh_ips";
 /// Set of the local pod IPs whose workload has `egress` on (`type
 /// ipv4_addr`). Only in the table when [`FirewallSpec::containers`] is set.
 pub const SET_EGRESS_PODS: &str = "egress_pods";
-/// The link-local range, which holds the cloud metadata address.
-const LINK_LOCAL: &str = "169.254.0.0/16";
+/// Destinations an opted-in pod never reaches, besides the container, mesh
+/// and service ranges: this-network, loopback, link-local (which holds the
+/// metadata address of most clouds) and multicast with everything above it.
+const NOT_UNICAST_OUTSIDE: [&str; 4] =
+    ["169.254.0.0/16", "0.0.0.0/8", "127.0.0.0/8", "224.0.0.0/3"];
 
 /// Everything the table is rendered from, apart from the WireGuard interface
 /// name (`NetworkSpec::interface`).
@@ -445,7 +448,7 @@ fn forward_rules(iface: &str, containers: Option<&ContainerFirewall>) -> Vec<Str
         let excluded = excluded
             .iter()
             .map(Ipv4Net::to_string)
-            .chain([LINK_LOCAL.to_string()])
+            .chain(NOT_UNICAST_OUTSIDE.map(String::from))
             .collect::<Vec<_>>()
             .join(", ");
         rules.extend([
@@ -765,7 +768,7 @@ table inet faber {
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16 } accept
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
@@ -803,7 +806,7 @@ table inet faber {
         let head = container_head("\tset node_mesh_ips {\n\t\ttype ipv4_addr\n\t}\n");
         let forward = r#"	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16 } accept
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
@@ -1379,7 +1382,7 @@ table inet faber {
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16 } accept
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16, 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/3 } accept
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
@@ -1461,6 +1464,10 @@ table inet faber {
             ("faber0", "10.99.0.1"),
             ("eth0", "10.201.0.5"),
             ("eth0", "10.200.2.7"),
+            ("eth0", "127.0.0.1"),
+            ("eth0", "0.1.2.3"),
+            ("eth0", "224.0.0.251"),
+            ("eth0", "255.255.255.255"),
         ] {
             assert_eq!(
                 verdict(new_v4("faberbr0", oif, "10.200.1.5", dst)),
