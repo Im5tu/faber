@@ -72,7 +72,7 @@ pub struct Config {
     #[arg(long, env = "FABER_PEER_PORT", default_value_t = DEFAULT_PEER_PORT)]
     pub peer_port: u16,
 
-    /// Explicit peer listener address (/raft, /api/v1, /mcp). Must be loopback
+    /// Explicit peer listener address (/raft, /api/v1). Must be loopback
     /// or an address on a WireGuard interface. Without this or
     /// --wg-interface, the peer listener binds 127.0.0.1:<peer-port>.
     #[arg(long, env = "FABER_PEER_LISTEN")]
@@ -104,7 +104,7 @@ pub struct Config {
     pub keep_logs: u64,
 
     /// Extra `Host` header value accepted by /mcp (repeatable). Loopback
-    /// names and the peer listener address are always accepted.
+    /// names are always accepted.
     #[arg(
         long = "mcp-allowed-host",
         env = "FABER_MCP_ALLOWED_HOSTS",
@@ -409,15 +409,12 @@ impl Config {
         })
     }
 
-    /// Loopback names, the peer listener's IP and `ip:port`, then any
-    /// configured extras, without duplicates.
-    pub fn allowed_mcp_hosts(&self, peer_addr: SocketAddr) -> Vec<String> {
+    /// Loopback names, then any configured extras, without duplicates.
+    pub fn allowed_mcp_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = DEFAULT_MCP_ALLOWED_HOSTS
             .iter()
             .map(|h| h.to_string())
             .collect();
-        hosts.push(peer_addr.ip().to_string());
-        hosts.push(peer_addr.to_string());
         hosts.extend(self.mcp_allowed_hosts.iter().cloned());
         let mut seen = BTreeSet::new();
         hosts.retain(|h| seen.insert(h.clone()));
@@ -1083,35 +1080,19 @@ mod tests {
     }
 
     #[test]
-    fn mcp_hosts_include_loopback_peer_and_extras_once() {
+    fn mcp_hosts_include_loopback_and_extras_once() {
         let mut c = Config::new(1, "d");
         c.mcp_allowed_hosts = vec!["node1.wg".into()];
         assert_eq!(
-            c.allowed_mcp_hosts("10.8.0.1:7401".parse().unwrap()),
-            vec![
-                "localhost",
-                "127.0.0.1",
-                "::1",
-                "10.8.0.1",
-                "10.8.0.1:7401",
-                "node1.wg"
-            ]
+            c.allowed_mcp_hosts(),
+            vec!["localhost", "127.0.0.1", "::1", "node1.wg"]
         );
-        let v6 = c.allowed_mcp_hosts("[fd00::1]:7401".parse().unwrap());
-        assert!(v6.contains(&"fd00::1".to_string()));
-        assert!(v6.contains(&"[fd00::1]:7401".to_string()));
 
         // Repeats and the built-in hosts are listed once.
         c.mcp_allowed_hosts = vec!["localhost".into(), "a.example".into(), "a.example".into()];
         assert_eq!(
-            c.allowed_mcp_hosts("127.0.0.1:7401".parse().unwrap()),
-            vec![
-                "localhost",
-                "127.0.0.1",
-                "::1",
-                "127.0.0.1:7401",
-                "a.example"
-            ]
+            c.allowed_mcp_hosts(),
+            vec!["localhost", "127.0.0.1", "::1", "a.example"]
         );
     }
 

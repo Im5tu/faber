@@ -4,7 +4,7 @@
 //! Two listeners, never bound anywhere but loopback or WireGuard:
 //! - local (loopback): `/api/v1` (including the loopback-only
 //!   `/api/v1/mesh/*`) and `/mcp`
-//! - peer (WireGuard or loopback): `/api/v1`, `/mcp` and `/raft`
+//! - peer (WireGuard or loopback): `/api/v1` and `/raft`
 //!
 //! In mesh mode ([`Config::mesh_mode`]) the node also owns the host's
 //! WireGuard interface, the `inet faber` nftables table, the containerd
@@ -54,6 +54,7 @@ use openraft::RaftMetrics;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 pub use config::Config;
@@ -523,10 +524,21 @@ pub async fn start_with(
     service.check_cluster_key().await;
     let cancel = CancellationToken::new();
 
-    let mcp = mcp::service(config.allowed_mcp_hosts(peer_addr), cancel.child_token());
+    // Loopback only: the peer listener also admits machines that hold just an
+    // invite, and the tools can deploy and create invites.
+    let mcp = mcp::service(
+        service.clone(),
+        config.allowed_mcp_hosts(),
+        cancel.child_token(),
+    );
+    let mcp_app = Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(RequestBodyLimitLayer::new(
+            faber_api_types::workload::limits::MAX_HTTP_BODY_BYTES,
+        ));
     let local_app = api::local_router(service.clone())
         .layer(from_fn_with_state(HostGuard::local(), guard::host_guard))
-        .nest_service("/mcp", mcp.clone())
+        .merge(mcp_app)
         .layer(from_fn(guard::origin_guard))
         .layer(TraceLayer::new_for_http());
     let raft_sources = {
@@ -540,7 +552,6 @@ pub async fn start_with(
             HostGuard::peer(peer_addr.ip()),
             guard::host_guard,
         ))
-        .nest_service("/mcp", mcp)
         .layer(from_fn(guard::origin_guard))
         .layer(TraceLayer::new_for_http());
 
