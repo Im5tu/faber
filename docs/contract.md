@@ -321,7 +321,7 @@ Each cell of "Rejected with" lists its checks in the order apply makes them.
 | `ApplyWorkloads{project, environment, workloads, prune, at}` | `workloads` maps each name to a `StoredWorkload{spec, env}`: the spec with every container's `env` empty, and the sealed env of each container (see "Encryption"). With `prune`, removes every stored workload the command does not name. Then, for each workload of the command: a new name is created with `revision = index`; a workload equal to the stored one is unchanged, the env compared by digest and not by ciphertext; any other one replaces the stored one, and `revision` becomes `index` if the pod template or an env digest differs. If nothing was created, updated or removed, apply writes nothing and answers with the generation the environment has. Otherwise the record gets `generation = index` and `updated_at = at`. Answers `Applied` | `not_found`: unknown project or environment. `bad_request`: a workload name is not a DNS label; a workload carries env values that are not sealed; `workloads` is over 128 KiB as JSON. `workloads_exhausted`: the environment would hold more than 64 workloads; its record would be over 512 KiB; all records together would be over 16 MiB. The three `workloads_exhausted` checks run only for a command that changes something |
 | `RemoveWorkloads{project, environment, names, at}` | Removes the named workloads and sets `generation = index` and `updated_at = at`. A name given twice is removed once. With no name at all the record stays as it is | `not_found`: unknown project or environment; a name the environment does not hold. Nothing is removed then, also not the names it does hold |
 
-The pod template of a spec is the spec with `scale`, `placement` and `expose` set to their defaults. `revision` moves only when the template or an env value changes, so a deploy that changes the replica count, the nodes or the exposure leaves it alone.
+The pod template of a spec is the spec with `scale`, `placement`, `expose` and `egress` set to their defaults. `revision` moves only when the template or an env value changes, so a deploy that changes the replica count, the nodes, the exposure or egress leaves it alone.
 
 Apply checks a fixed set of things about a workload: its name and the size of the command. It does not run the model's validation (`WorkloadSpec::validate`, `validate_workloads`). The service runs that before it proposes or forwards a command. The reason is replay. Every replica must compute the same answer for a logged command, today and after an upgrade. A validation rule that changes between versions would make an old entry apply on one build and fail on another. The fixed set in apply does not change. The price is that a spec which only apply has seen is not known to be valid, and a reader of `env/...` must not assume it is.
 
@@ -396,7 +396,7 @@ A DNS label is 1 to 63 characters of `a-z`, `0-9` and `-`, with no hyphen at eit
 
 - An environment's `generation` is the raft log index of the entry that last changed it, starting with the entry that created it. It only grows, and it does not repeat when an environment is removed and created again under the same name.
 - A deploy that changes nothing keeps the generation and writes nothing. "Changes nothing" means every spec of the request equals the stored one, every env value is unchanged, and `prune` removes nothing.
-- A workload's `revision` is the log index of the entry that last changed its pod template. The pod template is the spec with `scale`, `placement` and `expose` left out, together with the env values. A deploy that changes only `scale`, `placement` or `expose` updates the workload, moves the generation and keeps the revision. The runner starts the containers of a new revision when the revision moves and at no other time.
+- A workload's `revision` is the log index of the entry that last changed its pod template. The pod template is the spec with `scale`, `placement`, `expose` and `egress` left out, together with the env values. A deploy that changes only one of those updates the workload, moves the generation and keeps the revision. The runner starts the containers of a new revision when the revision moves and at no other time. A change of `egress` restarts nothing: the nftables set follows on the next reconcile (see "nftables").
 - Removing a workload moves the generation.
 - A deploy with workloads needs the cluster key on the leader, even when no workload has env, because the leader seals the env with the data key of the environment, and makes that key on the first deploy (see "Encryption").
 
@@ -411,6 +411,7 @@ The types are in `faber_api_types::workload`. Every type refuses unknown fields,
 | `scale` | `{"replicas": {"count": 1, "strategy": "spread"}}` | `{"replicas": {"count": N, "strategy": S}}` with N from 0 to 1024 and S `spread` (the default) or `pack`, or `"daemon"` for one copy on every node |
 | `restart` | `always` | `always`, `on_failure` or `never`, see "The runner" |
 | `expose` | `environment` | `environment` or `cluster`, see "Exposure" |
+| `egress` | `false` | `true` lets the pods open connections to addresses outside the container, service and mesh ranges and outside `169.254.0.0/16`, masqueraded to the node's address on its default route. IPv4 only. See "Container network" |
 | `placement` | `{}` | `{nodes}`. `nodes` is a list of at most 64 unique node names, each a DNS label. Empty means any node. With `"daemon"` the workload runs once on each listed node |
 | `stop_grace_secs?` | none | at most 3600. The runner uses 30 when it is absent |
 | `volumes` | `{}` | at most 32, by name. A workload has no volume unless its spec declares one. Each is one of the two kinds below |
@@ -509,7 +510,7 @@ A limit that apply checks answers 409 `workloads_exhausted`, except the 128 KiB 
 - Env values are encrypted at rest and masked on read, but a node that runs a replica holds the cluster key and the replica's plaintext env. Root on that node can read both, and so can any local user through the unauthenticated loopback API with `?reveal=true`. Do not put in `env` a secret that such a user may not see (see "Encryption").
 - The API has no authentication. Whoever can reach a node's loopback listener can deploy, and a deploy runs containers on every node it is placed on. The right to deploy is the right to run any public image on the cluster, inside a user namespace and with the limits in "faber-node". A registered node can also write through `/raft/cluster/workloads`.
 - `expose` is not enforced.
-- Container egress is off. A container reaches the other containers and the services of the cluster and nothing else. Images are pulled by containerd on the host, so pulls are not affected.
+- Container egress is off by default. A container reaches the other containers and the services of the cluster and nothing else, unless its workload sets `egress` to true. An opted-in pod also reaches the node's LAN and anything the host routes to, and there is no destination allowlist (see "Container network"). Images are pulled by containerd on the host, so pulls are not affected.
 - Images are pulled anonymously from public registries. There is no registry authentication.
 - There is no log collection.
 - A block volume cannot be resized: faber-node refuses a changed `size_bytes` on an existing volume. The runner never removes a block volume (see "Volumes").
@@ -892,7 +893,7 @@ Each service (a workload) gets a virtual IP from the **service CIDR**, default `
 - A **backend** is a replica that is placed, reported `available`, has a pod IP and is on a node whose report is not stale. The service serves the ports its containers declare, on the same port numbers.
 - **Active revision.** The newest revision (not newer than the stored one) whose placed replicas are all available. Otherwise the newest revision with at least one available replica. A new revision takes over only when it is complete, so the backends switch from the old revision to the new in one step (blue/green). Open connections keep their conntrack entry to the old replicas, which stop after the drain period.
 - A replica that fails a probe leaves the backends at once.
-- The services step runs after the network and runtime steps. Its desired value is, per service with an address, the address and the sorted `(pod_ip, port, protocol)` list, with no timestamps, so a status tick that changes nothing causes no update.
+- The services step runs after the network and runtime steps. Its desired value is, per service with an address, the address and the sorted `(pod_ip, port, protocol)` list, and the set of this node's pod IPs that may leave the container network (see "nftables"), with no timestamps, so a status tick that changes nothing causes no update. The step reads the local runner's replicas for that set.
 - A node without nftables nat support fails to start.
 
 nftables chains (see "nftables") do the work:
@@ -903,7 +904,7 @@ nftables chains (see "nftables") do the work:
 - A host connection to a service that reaches a pod on another node is masqueraded to the tunnel address: `oifname <iface> ip saddr != <container cidr> ip daddr <container cidr> ct status dnat masquerade`.
 - Two filter chains, `service_reject_prerouting` (from the bridge) and `service_reject_output`, reject any packet still addressed to the service range after the nat chains: an address with no backend, or one no service holds.
 - The forward chain needs no new rule: container-to-container traffic across nodes is already allowed, and `br_netfilter`, which install.sh loads, makes bridged traffic pass these chains.
-- `NetworkManager::set_services` keeps the service rules, so a network reload keeps them.
+- `NetworkManager::set_services` keeps the service rules and the egress pod set, so a network reload keeps them.
 
 ## DNS
 
@@ -1022,7 +1023,7 @@ A record that names a different interface does not count. install.sh skips its o
 
 ## nftables
 
-Table `inet faber`, replaced atomically on each load. With a container range it also has the nat chains `prerouting`, `output` and `postrouting`, which redirect DNS and send virtual IP traffic to backends, and the filter chains `service_reject_prerouting` and `service_reject_output` (see "Virtual IPs" and "DNS"). The table is one script, so a network reload keeps the service rules. fabercp owns only this table and adds no default drop for the rest of the host.
+Table `inet faber`, replaced atomically on each load. With a container range it also has the nat chains `prerouting`, `output` and `postrouting`, which redirect DNS, send virtual IP traffic to backends and masquerade the pods that opted in to egress, and the filter chains `service_reject_prerouting` and `service_reject_output` (see "Virtual IPs" and "DNS"). The table is one script, so a network reload keeps the service rules and the egress set. fabercp owns only this table and adds no default drop for the rest of the host.
 
 | Set | Type | Members |
 |---|---|---|
@@ -1030,6 +1031,7 @@ Table `inet faber`, replaced atomically on each load. With a container range it 
 | `peer_endpoints6` | `ipv6_addr` | IPv6 endpoint IPs, same rule (usually empty) |
 | `peer_mesh_ips` | `ipv4_addr` | mesh IPs of the other nodes and live invites |
 | `node_mesh_ips` | `ipv4_addr` | mesh IPs of the other registered nodes. Invites are not in it, so a machine that only holds an invite has no way to the containers. The set is in the table only when the mesh has a container range |
+| `egress_pods` | `ipv4_addr` | pod IPs of this node's pods whose workload has `egress` true, only addresses in the node's own subnet. In the table only when the mesh has a container range. Empty until a pod opts in |
 
 Rules, chain `input` (`type filter hook input priority filter - 10; policy accept;`):
 - `iifname != "faber0" udp dport <wg_port>`: accept from `@peer_endpoints`/`@peer_endpoints6`, drop the rest.
@@ -1051,8 +1053,14 @@ In a mesh with a container range, the forward chain lets container traffic throu
 		type ipv4_addr
 		elements = { 10.99.0.1, 10.99.0.4 }
 	}
+	set egress_pods {
+		type ipv4_addr
+		elements = { 10.200.1.5, 10.200.1.9 }
+	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
+		iifname "faberbr0" oifname != { "faber0", "faberbr0" } ip saddr @egress_pods ip daddr != { 10.200.0.0/16, 10.99.0.0/16, 10.201.0.0/16, 169.254.0.0/16 } accept
+		oifname "faberbr0" iifname != { "faber0", "faberbr0" } ip daddr @egress_pods ct state established,related accept
 		iifname "faberbr0" oifname != { "faber0", "faberbr0" } drop
 		oifname "faberbr0" iifname != { "faber0", "faberbr0" } drop
 		iifname "faber0" oifname "faber0" drop
@@ -1065,7 +1073,21 @@ In a mesh with a container range, the forward chain lets container traffic throu
 		oifname "faber0" drop
 		iifname "faber0" drop
 	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "faber0" ip saddr != 10.200.0.0/16 ip daddr 10.200.0.0/16 ct status dnat masquerade
+		ip saddr @egress_pods oifname != { "faber0", "faberbr0" } masquerade
+	}
 ```
+
+The example has a service range (`10.201.0.0/16`) and two opted-in pods, and leaves out the hairpin rules and the other nat chains. Without a service range the list in the first rule is `{ 10.200.0.0/16, 10.99.0.0/16, 169.254.0.0/16 }`: the container, mesh and service ranges in that order, then the link-local range, which holds the cloud metadata address.
+
+Two rules come before rule 1, and are left out of the numbering below because other text quotes the numbers:
+
+- **E1**: traffic from a pod in `@egress_pods` to any interface other than the tunnel and the bridge, to an address outside the container, mesh and service ranges and outside `169.254.0.0/16`, is accepted. There is no `ct` match: every packet of a flow passes this chain, and rule 1 would drop the second packet of a flow that E1 accepted only as new.
+- **E2**: traffic from any interface other than the tunnel and the bridge to a pod in `@egress_pods` is accepted for `established,related` only. A flow becomes established only when a pod started it, because a new packet from outside meets rule 2. Nothing outside opens a connection to a pod.
+
+Both are present only with a subnet. A destination in the excluded ranges is not matched by E1 and falls through: rule 1 drops it when it leaves by another interface, rule 6 when it goes into the tunnel. `postrouting` masquerades `@egress_pods` when the output interface is neither the tunnel nor the bridge, so the pod uses the address of the node's default route; the tunnel and bridge traffic keeps the pod address.
 
 One line per rule, in order:
 
@@ -1074,7 +1096,7 @@ One line per rule, in order:
 3. `iifname "faber0" oifname "faber0" drop`: no node relays traffic from one peer to another. The route for the range points at `faber0`, so without this rule a packet for the local subnet would go back out of the tunnel while the bridge does not exist yet.
 4. `iifname "faber0" ct state established,related accept`: replies coming in from the tunnel.
 5. `oifname "faber0" ct state established,related accept`: replies going out into the tunnel.
-6. `ip saddr <local> ip daddr != <cidr> drop`: a local container opens no connection to anything outside the container range, on any interface. Container egress is off. The rule sits after rules 4 and 5, or it would drop a container's replies to a node. For packets from the bridge, rules 1 and 10 already do this. The rule stays for a container attached to some other interface.
+6. `ip saddr <local> ip daddr != <cidr> drop`: a local container opens no connection to anything outside the container range, on any interface, unless it is in `@egress_pods` and E1 accepted the packet first. Container egress is off for every pod that has not opted in. The rule sits after rules 4 and 5, or it would drop a container's replies to a node. For packets from the bridge, rules 1 and 10 already do this. The rule stays for a container attached to some other interface. For an opted-in pod, a destination in the excluded ranges is dropped by rule 1 (other interface) or rule 6 (tunnel).
 7. `iifname "faber0" oifname "faberbr0" ip saddr @node_mesh_ips ip daddr <local> accept`: new traffic from a registered node to a local container.
 8. `iifname "faber0" oifname "faberbr0" ip saddr <cidr> ip daddr <local> accept`: new traffic from a container on another node to a local container. Rules 7 and 8 are separate because a named set cannot be an element of an anonymous one. Both name the bridge as the output: the local subnet is only behind the bridge, and this keeps a peer from reaching another interface through a more specific route.
 9. `iifname "faberbr0" oifname "faber0" ip saddr <local> ip daddr <cidr> accept`: new traffic from a local container to a container on another node. It names the bridge as the input because the `AllowedIPs` on the other nodes trust any packet with a `<local>` source that comes out of this node's tunnel. A host on another interface that forges such a source must not get in.
@@ -1083,11 +1105,11 @@ One line per rule, in order:
 
 Rules 1 and 2 match interfaces by name and no address. Three things follow:
 
-- They cover IPv6 and a container that forges its source address. Rules 6 to 9 match IPv4 addresses only.
+- They cover IPv6 and a container that forges its source address, except that E1 and E2 match addresses: a source equal to the IP of an opted-in pod gets egress. Forging it needs `NET_RAW` or `NET_ADMIN`, which the runner refuses. Rules 6 to 9 match IPv4 addresses only.
 - They hold once `faber0` is deleted, as after a teardown that keeps the table. Container traffic then follows the default route and is dropped, not sent in clear text.
 - They drop replies too. No connection they cut off was allowed to start.
 
-Rules 6 to 9 name the node's own subnet. fabercp leaves them out until raft has given the node a subnet, and the chain is then rules 1 to 5, 10 and 11.
+E1, E2 and rules 6 to 9 name the node's own subnet. fabercp leaves them out until raft has given the node a subnet, and the chain is then rules 1 to 5, 10 and 11. The `egress_pods` set is there either way.
 
 Traffic between two containers on the same bridge has the bridge as both interfaces and matches no rule. It passes this chain at all only with `br_netfilter` loaded.
 
@@ -1160,7 +1182,7 @@ faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact te
 ```
 
 - `cniVersion` is `1.0.0` because containerd 1.6 rejects `1.1.0`.
-- `ipMasq` is false: there is no NAT.
+- `ipMasq` is false: the CNI plugin does no NAT. Masquerade for opted-in pods is a rule of `inet faber`.
 - `dataDir` is under `/run`, so `host-local` address leases do not survive a reboot.
 - containerd watches the directory, so a new or removed file needs no restart. The reload path unit does not watch it.
 - faber-node removes the file while the node has no subnet. A node must not keep a config for a subnet that may now belong to another node.
@@ -1173,7 +1195,10 @@ faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact te
 | a registered node | a container on any node | allowed |
 | a machine that only holds an invite | any container | dropped: it is not in `node_mesh_ips` and its `AllowedIPs` are its `/32` alone |
 | a container | the mesh IP of another node | dropped by rule 6 of the forward chain on the container's own node |
-| a container | anything outside the container range | dropped on the container's own node: by rule 1 when the packet would leave through any interface other than the tunnel, by rule 6 otherwise |
+| a container | anything outside the container range | dropped on the container's own node unless the workload opted in: by rule 1 when the packet would leave through any interface other than the tunnel, by rule 6 otherwise |
+| a container of a workload with `egress` true | an address outside the container, service and mesh ranges and `169.254.0.0/16` | allowed and masqueraded to the node's address (E1, E2, `postrouting`) |
+| a container of a workload with `egress` true | a mesh IP, the service range or `169.254.0.0/16` (cloud metadata) | dropped by rule 1 or rule 6 |
+| anything outside | a container of a workload with `egress` true | dropped by rule 2, except the replies of a connection the container opened (E2) |
 | anything behind another interface of the host | a container | dropped by rule 2 |
 | a container, over IPv6 | anything beyond the bridge | dropped. Rule 1 drops what would leave through another interface, and rule 10 what would enter the tunnel. No rule accepts IPv6 |
 | a container with a forged source address | anything beyond the bridge and the tunnel | dropped by rule 1, which matches no address |
@@ -1184,9 +1209,13 @@ faber-node writes this file for a node whose subnet is `10.200.3.0/24`. Exact te
 
 Limits:
 
-- Container egress is off. The CNI config does no masquerading, and no rule lets a container reach an address outside the container range. The only NAT is the service DNAT, the hairpin and host-to-service masquerade rules of the nat chains (see "Virtual IPs"). Image pulls are not affected, because containerd pulls on the host.
+- Container egress is off by default. A workload with `egress` true lets its pods reach addresses outside the container, service and mesh ranges and outside `169.254.0.0/16`, masqueraded to the address of the node's default route. The CNI config does no masquerading. The other NAT is the service DNAT, the hairpin and host-to-service masquerade rules of the nat chains (see "Virtual IPs"). IPv4 only. Image pulls are not affected, because containerd pulls on the host.
+- An opted-in pod reaches the node's LAN and any network the host routes to, a VPN included. There is no destination allowlist.
+- A pod that opts in is identified by its IP in the `egress_pods` set. The set is rebuilt when the state of the node changes, not when a sandbox is removed. If host-local gives the IP of a removed opted-in pod to a pod of another workload before the next rebuild (about one status interval), that pod has egress until the rebuild. host-local hands out addresses in order, so this needs the node to cycle through its subnet. fabercp lists a pod only while its own runner holds it, which closes the window for stale status.
+- After a fabercp restart, and for a new replica, egress starts once the runner has seen the pod and a status report has caused a re-plan, up to about one status interval. After a restart, established flows of existing pods are dropped in that gap.
+- A pod that forges the IP of an opted-in pod gets egress. Forging it needs a capability the runner refuses (`NET_RAW`, `NET_ADMIN`).
 - There is no per-container policy. Any registered node can reach every container, and any container can reach every other container.
-- A host firewall whose forward chain has policy drop (ufw, Docker and firewalld commonly set one) blocks container traffic between nodes, because that traffic is forwarded between `faber0` and `faberbr0` and a drop in any chain on the hook is final. install.sh warns and names the chains. faber never edits that firewall: the admin has to allow forwarding between `faber0` and `faberbr0` in both directions.
+- A host firewall whose forward chain has policy drop (ufw, Docker and firewalld commonly set one) blocks container traffic between nodes, because that traffic is forwarded between `faber0` and `faberbr0` and a drop in any chain on the hook is final. install.sh warns and names the chains. faber never edits that firewall: the admin has to allow forwarding between `faber0` and `faberbr0` in both directions. Egress needs the same for the bridge and the interface of the default route.
 
 ## Node lease
 
