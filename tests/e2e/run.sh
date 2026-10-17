@@ -9,9 +9,9 @@
 # Environment:
 #   E2E_SKIP_BUILD=1   reuse tmp/e2e-bin/{fabercp,faber,faber-node} instead of building
 #   E2E_KEEP=1         leave the containers and the network up afterwards
-#   E2E_PHASES="..."   phases to run, default "A B H J K M C D E F I G", always
-#                      in that order (B needs A; K needs A; H, J, M, C, D, E, F and I need B;
-#                      M runs before F and I, which add nodes it would place on)
+#   E2E_PHASES="..."   phases to run, default "A B H J K M N C D E F I G", always
+#                      in that order (B needs A; K needs A; H, J, M, N, C, D, E, F and I need B;
+#                      M and N run before F and I, which add nodes they would place on)
 #
 # Phases:
 #   A  new mesh on node A; containerd config and the reload path unit
@@ -46,6 +46,13 @@
 #      its data, and a redeploy with a changed env keeps the virtual IP and
 #      rolls one replica at a time: the name keeps answering PING and the
 #      replicas are never both down on the old revision.
+#   N  container egress on A (needs A and B): a workload with `egress` true
+#      reaches a probe container on the Docker network, outside every faber
+#      range, and the probe sees the node address; a default workload does
+#      not reach it; the mesh address stays unreachable for both; turning
+#      egress on or off keeps the revision and the container and takes
+#      effect without a restart. Reaching the real internet is only
+#      reported, not asserted.
 #   G  phase A again on a node with Docker's containerd.io 2.x preinstalled,
 #      and a pod sandbox on that node
 #
@@ -88,7 +95,7 @@ NODE_E="faber-e2e-e"
 NODE_F="faber-e2e-f"
 ALL_NODES=("$NODE_A" "$NODE_B" "$NODE_C" "$NODE_D" "$NODE_E" "$NODE_F")
 SRC="/root/faber-src"
-PHASES="${E2E_PHASES:-A B H J K M C D E F I G}"
+PHASES="${E2E_PHASES:-A B H J K M N C D E F I G}"
 
 WG_PORT=51820
 PEER_PORT=7401
@@ -288,6 +295,7 @@ cleanup() {
     return 0
   fi
   local node
+  docker rm -f "$N_PROBE" >/dev/null 2>&1
   for node in "${ALL_NODES[@]}"; do
     docker rm -fv "$node" >/dev/null 2>&1
   done
@@ -1842,14 +1850,16 @@ m_deploy() {
 }
 
 # m_show NODE: faber app show of the service.
-m_show() { dx "$1" "faber app show $M_APP --project $M_PROJECT --env $M_ENV"; }
+# Another workload: m_show NODE APP PROJECT ENV.
+m_show() { dx "$1" "faber app show ${2:-$M_APP} --project ${3:-$M_PROJECT} --env ${4:-$M_ENV}"; }
 
-# m_revision NODE
-m_revision() { m_show "$1" | awk '$1 == "revision:" { print $2 }'; }
+# m_revision NODE [APP PROJECT ENV]
+m_revision() { m_show "$@" | awk '$1 == "revision:" { print $2 }'; }
 
-# m_replicas NODE: one line per replica: index node revision state pod-ip.
+# m_replicas NODE [APP PROJECT ENV]: one line per replica: index node
+# revision state pod-ip.
 m_replicas() {
-  m_show "$1" | awk '/^  REPLICA/ { f = 1; next } /^[a-z]/ { f = 0 } f && /^  [0-9]+ / { print $1, $2, $3, $4, $5 }'
+  m_show "$@" | awk '/^  REPLICA/ { f = 1; next } /^[a-z]/ { f = 0 } f && /^  [0-9]+ / { print $1, $2, $3, $4, $5 }'
 }
 
 # m_available NODE REV: how many replicas are available on revision REV.
@@ -2126,6 +2136,167 @@ phase_m() {
   done
 }
 
+# --- phase N: container egress per workload ---------------------------------
+
+N_PROJECT="egress"
+N_ENV="staging"
+N_PROBE="faber-e2e-probe"
+N_PROBE_IP=""
+
+# n_spec OPEN CLOSED COUNT: two workloads on NODE_A, each with COUNT replicas
+# of one sleeping container. OPEN and CLOSED are the text put after "scale" in
+# the workload: ',"egress":true' or nothing. command replaces the entrypoint,
+# so the container only sleeps; the redis image has busybox wget.
+n_spec() {
+  local w
+  printf '{'
+  for w in open closed; do
+    [[ "$w" == closed ]] && printf ','
+    printf '"%s":{"scale":{"replicas":{"count":%s}},"placement":{"nodes":["%s"]},"stop_grace_secs":1%s,' \
+      "$w" "$3" "$NAME_A" "$([[ "$w" == open ]] && printf '%s' "$1" || printf '%s' "$2")"
+    printf '"containers":[{"name":"app","image":"redis:7-alpine","command":["sleep","3600"]}]}'
+  done
+  printf '}\n'
+}
+
+# n_deploy OPEN CLOSED COUNT TAG: deploy n_spec on NODE_A. Sets N_OUT and N_RC.
+n_deploy() {
+  n_spec "$1" "$2" "$3" | docker exec -i "$NODE_A" faber deploy spec - --project "$N_PROJECT" --env "$N_ENV" >"$LOG_DIR/n-deploy-$4.log" 2>&1
+  N_RC=${PIPESTATUS[1]}
+  N_OUT="$(tr -d '\r' <"$LOG_DIR/n-deploy-$4.log")"
+}
+
+# n_show APP: faber app show of one workload of this phase.
+n_show() { m_show "$NODE_A" "$1" "$N_PROJECT" "$N_ENV"; }
+
+# n_pod_ip APP: the pod IP of the first replica of APP.
+n_pod_ip() { m_replicas "$NODE_A" "$1" "$N_PROJECT" "$N_ENV" | awk 'NR == 1 { print $5 }'; }
+
+# n_cid APP: the id of the running container of APP. faber-node names a
+# container <workload>-<revision>-<container>.
+n_cid() { dx "$NODE_A" "crictl ps -q --name '^$1-' | head -n 1"; }
+
+# n_wget CID URL [SECONDS]: GET URL from inside the container CID on NODE_A.
+n_wget() { dx "$NODE_A" "crictl exec $1 wget -q -T ${3:-5} -O - $2"; }
+
+# n_wait_available APP: poll until the replica of APP is available.
+n_wait_available() {
+  wait_for 300 "$NODE_A" "faber app show $1 --project $N_PROJECT --env $N_ENV | grep -qE '^  0 +[0-9]+ +[0-9]+ +available '"
+}
+
+phase_n() {
+  local out rc app rev_closed cid_open cid_closed ip_open ip_closed internet
+  section "N: container egress per workload on $NODE_A"
+  out="$(install_crictl "$NODE_A")"
+  assert_ok "N $NODE_A: crictl is installed" "$?" "$out"
+
+  # The target is a container on the Docker network: outside every faber
+  # range, and reached by the node over its default route like the internet.
+  docker rm -f "$N_PROBE" >/dev/null 2>&1
+  out="$(docker run -d --name "$N_PROBE" --network "$NET" busybox:1.36 sh -c "$(
+    cat <<'EOF'
+mkdir -p /www/cgi-bin
+echo faber-egress-ok > /www/index.html
+cat > /www/cgi-bin/who <<'CGI'
+#!/bin/sh
+echo "Content-Type: text/plain"
+echo
+echo "$REMOTE_ADDR"
+CGI
+chmod +x /www/cgi-bin/who
+exec httpd -f -p 8080 -h /www
+EOF
+  )" 2>&1)"
+  rc=$?
+  if ((rc != 0)); then
+    fail "N the probe container starts on the Docker network" "$out"
+    return
+  fi
+  N_PROBE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$N_PROBE" | tr -d '\r')"
+  info "probe $N_PROBE at $N_PROBE_IP:8080"
+
+  # Without these the denials below would pass for the wrong reason.
+  wait_for 30 "$NODE_A" "curl -fsS --max-time 3 http://$N_PROBE_IP:8080/"
+  out="$(dx "$NODE_A" "curl -sS --max-time 5 http://$N_PROBE_IP:8080/")"
+  assert_eq "N control: $NODE_A itself reaches the probe" "$out" "faber-egress-ok"
+  out="$(dx "$NODE_A" "curl -sS --max-time 5 -o /dev/null -w 'http=%{http_code}' http://$MESH_B:$PEER_PORT/api/v1/health")"
+  assert_eq "N control: $NODE_A itself reaches $MESH_B:$PEER_PORT" "$out" "http=200"
+
+  out="$(dx "$NODE_A" "faber project create $N_PROJECT")"
+  assert_ok "N $NODE_A: faber project create $N_PROJECT" "$?" "$out"
+  n_deploy ',"egress":true' '' 1 one
+  evidence "$N_OUT"
+  assert_ok "N $NODE_A: faber deploy spec (open with egress, closed without) exits 0" "$N_RC" "$N_OUT"
+  for app in open closed; do
+    if n_wait_available "$app"; then
+      pass "N the replica of $app becomes available"
+    else
+      fail "N the replica of $app becomes available (300 s)" "$(n_show "$app")"$'\n'"$(dx "$NODE_A" 'journalctl -u fabercp --no-pager -o cat | grep -v INFO | tail -n 3 | cut -c1-600')"
+      return
+    fi
+  done
+  assert_has "N app show open prints egress on" "$(n_show open)" '^egress: +on$'
+  assert_has "N app show closed prints egress off" "$(n_show closed)" '^egress: +off$'
+  ip_open="$(n_pod_ip open)"
+  ip_closed="$(n_pod_ip closed)"
+  cid_open="$(n_cid open)"
+  cid_closed="$(n_cid closed)"
+  info "open: pod $ip_open, container ${cid_open:0:13}; closed: pod $ip_closed, container ${cid_closed:0:13}"
+
+  # The opted-in pod gets out, as the node's own address.
+  out="$(n_wget "$cid_open" "http://$N_PROBE_IP:8080/")"
+  assert_eq "N open reaches the probe" "$out" "faber-egress-ok"
+  out="$(n_wget "$cid_open" "http://$N_PROBE_IP:8080/cgi-bin/who")"
+  assert_eq "N the probe sees open as the node address $IP_A (masquerade)" "$out" "$IP_A"
+  # The default pod does not, and neither does anything reach the mesh.
+  n_wget "$cid_closed" "http://$N_PROBE_IP:8080/" 5 >/dev/null
+  assert_fails "N closed cannot reach the probe (wget fails: packets are dropped)" "$?"
+  n_wget "$cid_open" "http://$MESH_B:$PEER_PORT/api/v1/health" 3 >/dev/null
+  assert_fails "N open cannot reach $MESH_B:$PEER_PORT (the mesh stays dropped)" "$?"
+
+  # The table follows.
+  out="$(dx "$NODE_A" 'nft list set inet faber egress_pods')"
+  evidence "$out"
+  assert_has "N egress_pods lists the pod of open" "$out" "\b${ip_open//./\\.}\b"
+  assert_hasnt "N egress_pods does not list the pod of closed" "$out" "\b${ip_closed//./\\.}\b"
+  assert_has "N the forward chain accepts egress_pods" "$(dx "$NODE_A" 'nft list chain inet faber forward')" '@egress_pods.* accept$'
+
+  # The internet is informational: CI egress varies.
+  for internet in https://1.1.1.1/ https://9.9.9.9/; do
+    n_wget "$cid_open" "$internet" 5 >/dev/null
+    info "informational: open fetching $internet exits $?"
+  done
+
+  # Turning egress on keeps the revision and the container, and takes effect.
+  rev_closed="$(m_revision "$NODE_A" closed "$N_PROJECT" "$N_ENV")"
+  n_deploy ',"egress":true' ',"egress":true' 1 on
+  assert_ok "N redeploy with egress on for closed exits 0" "$N_RC" "$N_OUT"
+  assert_eq "N turning egress on keeps the revision of closed" "$(m_revision "$NODE_A" closed "$N_PROJECT" "$N_ENV")" "$rev_closed"
+  assert_eq "N turning egress on keeps the container of closed" "$(n_cid closed)" "$cid_closed"
+  if wait_for 60 "$NODE_A" "crictl exec $cid_closed wget -q -T 3 -O /dev/null http://$N_PROBE_IP:8080/"; then
+    pass "N closed reaches the probe once egress is on"
+  else
+    fail "N closed reaches the probe once egress is on (60 s)" "$(dx "$NODE_A" 'nft list set inet faber egress_pods')"
+  fi
+
+  # And off again, without a restart.
+  n_deploy ',"egress":true' '' 1 off
+  assert_ok "N redeploy with egress off for closed exits 0" "$N_RC" "$N_OUT"
+  if wait_for 60 "$NODE_A" "! nft list set inet faber egress_pods | grep -qE '\b${ip_closed//./\\.}\b'"; then
+    pass "N egress_pods drops the pod of closed"
+  else
+    fail "N egress_pods drops the pod of closed (60 s)" "$(dx "$NODE_A" 'nft list set inet faber egress_pods')"
+  fi
+  n_wget "$cid_closed" "http://$N_PROBE_IP:8080/" 5 >/dev/null
+  assert_fails "N closed cannot reach the probe once egress is off" "$?"
+  assert_eq "N turning egress off keeps the container of closed" "$(n_cid closed)" "$cid_closed"
+
+  # Leave node A clean for the phases that follow.
+  docker rm -f "$N_PROBE" >/dev/null 2>&1
+  n_deploy ',"egress":true' '' 0 zero
+  assert_ok "N scale both workloads to zero" "$N_RC" "$N_OUT"
+}
+
 # refusal_warnings: a node whose raft RPCs a peer answers with 403 logs a
 # warning, at most once a minute per peer. Nothing in this suite makes that
 # happen on purpose, so this only reports what the journals hold.
@@ -2178,6 +2349,7 @@ main() {
   has_phase J && phase_j
   has_phase K && phase_k
   has_phase M && phase_m
+  has_phase N && phase_n
   has_phase C && phase_c
   has_phase D && phase_d
   has_phase E && phase_e
