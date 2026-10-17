@@ -1,0 +1,246 @@
+# Reusable build for releases. Called by release.yml.
+#
+# This workflow is the signer identity in the attestations, so consumers verify
+# with --signer-workflow <owner>/<repo>/.github/workflows/_build.yml.
+# Only the attest job holds a signing token.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Workspace version, without the leading v
+        type: string
+        required: true
+      epoch:
+        description: Commit time in seconds, used as SOURCE_DATE_EPOCH
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ inputs.version }}
+      ARCH: ${{ matrix.arch }}
+      SOURCE_DATE_EPOCH: ${{ inputs.epoch }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake
+
+      - name: Install the toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          {
+            echo '### Toolchain'
+            echo '```'
+            rustc -Vv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install cargo-auditable
+        run: cargo install --locked cargo-auditable --version 0.7.7
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/build --remap-path-prefix=${cargo_home}=/cargo"
+          cargo auditable build --release --locked -p fabercp -p faber -p faber-node
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          dir="faber-${VERSION}-linux-${ARCH}"
+          stage="${RUNNER_TEMP}/stage"
+          mkdir -p "${stage}/${dir}" dist
+          for bin in fabercp faber faber-node; do
+            install -m 0755 "target/release/${bin}" "${stage}/${dir}/${bin}"
+          done
+          install -m 0755 src/install.sh "${stage}/${dir}/install.sh"
+          chmod 0755 "${stage}/${dir}"
+          tar --sort=name --format=posix \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --owner=0 --group=0 --numeric-owner \
+            --pax-option='exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime' \
+            -C "${stage}" -cf - "${dir}" | gzip -n > "dist/${dir}.tar.gz"
+          sha256sum "dist/${dir}.tar.gz"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist/faber-${{ inputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  sbom-scan:
+    name: sbom-scan (${{ matrix.arch }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x86_64, aarch64]
+    env:
+      VERSION: ${{ inputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: in
+
+      - name: Extract binaries
+        run: |
+          set -euo pipefail
+          mkdir scan
+          tar -xzf "in/faber-${VERSION}-linux-${ARCH}.tar.gz" -C scan
+
+      # Syft reads the dependency list that cargo-auditable embeds in each
+      # binary (the cargo-auditable-binary-cataloger, on by default for
+      # directory scans). The directory holds no Cargo.lock, so dev-only
+      # crates do not show up.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: scan/faber-${{ inputs.version }}-linux-${{ matrix.arch }}
+          format: cyclonedx-json
+          output-file: faber-${{ inputs.version }}-linux-${{ matrix.arch }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+          syft-version: v1.54.1
+
+      - name: Check the SBOM lists crates
+        run: |
+          set -euo pipefail
+          sbom="faber-${VERSION}-linux-${ARCH}.cdx.json"
+          count="$(jq '[.components[]? | select(.purl? // "" | startswith("pkg:cargo/"))] | length' "$sbom")"
+          echo "Cargo components: ${count}"
+          if [ "$count" -eq 0 ]; then
+            echo "The SBOM has no cargo components; the auditable data was not read." >&2
+            exit 1
+          fi
+          for crate in fabercp faber faber-node; do
+            found="$(jq --arg n "$crate" '[.components[]? | select(.name == $n and ((.purl // "") | startswith("pkg:cargo/")))] | length' "$sbom")"
+            if [ "$found" -eq 0 ]; then
+              echo "The SBOM does not list the workspace crate ${crate}." >&2
+              exit 1
+            fi
+          done
+
+      - name: Scan SBOM
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: faber-${{ inputs.version }}-linux-${{ matrix.arch }}.cdx.json
+          severity-cutoff: high
+          fail-build: true
+          output-format: table
+          output-file: grype-${{ matrix.arch }}.txt
+          cache-db: false
+          grype-version: v0.120.1
+
+      - name: Add findings to the summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f "grype-${ARCH}.txt" ]; then
+            {
+              echo "### Grype findings (${ARCH})"
+              echo '```'
+              cat "grype-${ARCH}.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: faber-${{ inputs.version }}-linux-${{ matrix.arch }}.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: attest
+    needs: sbom-scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # sign the attestations with the workflow identity
+      attestations: write # store the attestations
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download tarballs and SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{tarball,sbom}-*"
+          path: release
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          set -euo pipefail
+          cd release
+          LC_ALL=C sha256sum "faber-${VERSION}-linux-aarch64.cdx.json" "faber-${VERSION}-linux-aarch64.tar.gz" \
+            "faber-${VERSION}-linux-x86_64.cdx.json" "faber-${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/SHA256SUMS
+            release/*.cdx.json
+
+      - name: Attest SBOM (x86_64)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: release/faber-${{ inputs.version }}-linux-x86_64.tar.gz
+          sbom-path: release/faber-${{ inputs.version }}-linux-x86_64.cdx.json
+
+      - name: Attest SBOM (aarch64)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: release/faber-${{ inputs.version }}-linux-aarch64.tar.gz
+          sbom-path: release/faber-${{ inputs.version }}-linux-aarch64.cdx.json
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7

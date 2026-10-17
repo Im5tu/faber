@@ -23,11 +23,42 @@ It is early software. Clusters made with one version may not work with the next,
 
 ## Install
 
+### Download a release
+
+Each release has a tarball for Linux `x86_64` and `aarch64`. It holds `fabercp`, `faber`, `faber-node` and `install.sh`. Download one from the [releases page](https://github.com/Im5tu/faber/releases), or with the GitHub CLI:
+
+```sh
+gh release download v0.1.0 --repo Im5tu/faber --pattern '*linux-x86_64*'
+tar -xzf faber-0.1.0-linux-x86_64.tar.gz
+cd faber-0.1.0-linux-x86_64
+```
+
+The binaries are already next to `install.sh`, so skip to the installer step below.
+
+### Verify a release
+
+Every asset has a signed build provenance attestation, and each tarball has a signed SBOM (CycloneDX). Check them with the GitHub CLI:
+
+```sh
+gh release verify v0.1.0 --repo Im5tu/faber
+gh release verify-asset v0.1.0 faber-0.1.0-linux-x86_64.tar.gz --repo Im5tu/faber
+gh attestation verify faber-0.1.0-linux-x86_64.tar.gz --repo Im5tu/faber \
+  --signer-workflow Im5tu/faber/.github/workflows/_build.yml \
+  --source-ref refs/tags/v0.1.0
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Add `--predicate-type https://cyclonedx.org/bom` to the attestation check to verify the SBOM instead. The binaries also carry their dependency list, so `cargo audit bin fabercp` works on them.
+
+### Build from source
+
 Build the three binaries on Linux:
 
 ```sh
 cargo build --release -p fabercp -p faber -p faber-node
 ```
+
+### Install on the first server
 
 Put `fabercp`, `faber` and `faber-node` next to `src/install.sh` on the first server, then create the mesh:
 
