@@ -838,6 +838,33 @@ mod tests {
         // The replica runs again, under another IP.
         let moved = report(1, 0, Available, "10.200.1.6");
         assert!(c.egress_pods(1, Some(&[moved])).is_empty());
+        // The runner holds the IP for another revision or another replica.
+        let mut revision = held.clone();
+        revision.revision = 2;
+        assert!(c.egress_pods(1, Some(&[revision])).is_empty());
+        let mut index = held;
+        index.replica_index = 1;
+        assert!(c.egress_pods(1, Some(&[index])).is_empty());
+    }
+
+    /// Status is checked too: only addresses a pod can have in this node's
+    /// subnet are listed.
+    #[test]
+    fn addresses_a_pod_cannot_have_are_not_listed() {
+        let c = Cluster::new(1, HTTP, &[1, 1, 1, 1, 1])
+            .egress(true)
+            .reported(
+                1,
+                100,
+                vec![
+                    report(1, 0, Available, "10.200.1.1"),
+                    report(1, 1, Available, "10.200.1.0"),
+                    report(1, 2, Available, "10.200.1.255"),
+                    report(1, 3, Available, "10.200.2.9"),
+                    report(1, 4, Available, "10.200.1.7"),
+                ],
+            );
+        assert_eq!(c.egress_pods(1, None), ["10.200.1.7"]);
     }
 
     #[test]
