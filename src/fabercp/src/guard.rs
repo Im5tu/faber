@@ -10,8 +10,9 @@
 //!
 //! Both answer 403 `forbidden`.
 //!
-//! `/mcp` keeps its own `Host` allow-list (it accepts configured extra hosts),
-//! so it gets only [`origin_guard`].
+//! `/mcp`, served on the loopback listener only, keeps its own `Host`
+//! allow-list (it accepts configured extra hosts), so it gets only
+//! [`origin_guard`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

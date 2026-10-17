@@ -275,6 +275,126 @@ pub fn validate_workloads(
     if out.is_empty() { Ok(()) } else { Err(out) }
 }
 
+/// Parts of an env variable name that suggest its value is a secret.
+const SECRET_NAME_PARTS: [&str; 6] = [
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "TOKEN",
+    "API_KEY",
+    "PRIVATE_KEY",
+];
+
+const NOTE_NO_CAPABILITIES: &str = "containers get no Linux capabilities unless the file adds \
+     them; images that expect Docker's default set may fail to start";
+
+/// Front ends add what they do with the values after this text.
+pub const NOTE_SECRET_NAMES: &str =
+    "an env variable name looks like a secret; env values are encrypted at rest";
+
+/// What a [`DeployIssue`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployIssueSource {
+    /// The workloads themselves.
+    Input,
+    /// The prune option.
+    Prune,
+    /// The expose option.
+    Expose,
+}
+
+/// One finding of [`prepare_deploy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployIssue {
+    pub source: DeployIssueSource,
+    /// Where in the workloads, as in [`Violation::path`]. Empty for the whole
+    /// input or for an option.
+    pub path: String,
+    pub message: String,
+}
+
+impl DeployIssue {
+    fn new(source: DeployIssueSource, path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            source,
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// The checks every deploy front end makes before it sends the workloads.
+///
+/// Sets `expose = cluster` on the workloads named in `expose`, refuses an
+/// empty input (and `prune` with an empty input, which would remove every
+/// workload of the environment) and runs [`validate_workloads`]. Returns the
+/// notes for the user, or every issue found, at least one.
+pub fn prepare_deploy(
+    workloads: &mut BTreeMap<String, WorkloadSpec>,
+    expose: &[String],
+    prune: bool,
+) -> Result<Vec<String>, Vec<DeployIssue>> {
+    let mut issues = Vec::new();
+    if workloads.is_empty() && !prune {
+        issues.push(DeployIssue::new(
+            DeployIssueSource::Input,
+            "",
+            "nothing to deploy: the input has no workloads",
+        ));
+    } else if workloads.is_empty() {
+        issues.push(DeployIssue::new(
+            DeployIssueSource::Prune,
+            "",
+            "the input has no workloads, so every workload of the environment would be removed",
+        ));
+    }
+    for name in expose {
+        match workloads.get_mut(name) {
+            Some(spec) => spec.expose = Exposure::Cluster,
+            None => {
+                let known: Vec<&str> = workloads.keys().map(String::as_str).collect();
+                issues.push(DeployIssue::new(
+                    DeployIssueSource::Expose,
+                    "",
+                    format!(
+                        "no workload named {name:?}; the input has: {}",
+                        known.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    if let Err(violations) = validate_workloads(workloads) {
+        issues.extend(
+            violations
+                .into_iter()
+                .map(|v| DeployIssue::new(DeployIssueSource::Input, v.path, v.message)),
+        );
+    }
+    if issues.is_empty() {
+        Ok(deploy_notes(workloads))
+    } else {
+        Err(issues)
+    }
+}
+
+fn deploy_notes(workloads: &BTreeMap<String, WorkloadSpec>) -> Vec<String> {
+    let mut containers = workloads.values().flat_map(|spec| &spec.containers);
+    let mut notes = Vec::new();
+    if containers.clone().all(|c| c.capabilities.is_empty()) {
+        notes.push(NOTE_NO_CAPABILITIES.to_string());
+    }
+    if containers.any(|c| c.env.keys().any(|name| looks_like_a_secret(name))) {
+        notes.push(NOTE_SECRET_NAMES.to_string());
+    }
+    notes
+}
+
+fn looks_like_a_secret(env_name: &str) -> bool {
+    let upper = env_name.to_ascii_uppercase();
+    SECRET_NAME_PARTS.iter().any(|part| upper.contains(part))
+}
+
 /// A writer that keeps only the number of bytes written to it.
 struct ByteCount(usize);
 
@@ -3434,6 +3554,85 @@ mod tests {
                 "is 131073 bytes as JSON, at most 131072 are allowed"
             )])
         );
+    }
+
+    #[test]
+    fn prepare_deploy_exposes_named_workloads_and_adds_notes() {
+        let mut workloads =
+            BTreeMap::from([("api".to_string(), base()), ("web".to_string(), base())]);
+        let notes = prepare_deploy(&mut workloads, &["web".to_string()], false).unwrap();
+        assert_eq!(workloads["web"].expose, Exposure::Cluster);
+        assert_eq!(workloads["api"].expose, Exposure::default());
+        assert_eq!(notes, [NOTE_NO_CAPABILITIES]);
+
+        workloads.get_mut("api").unwrap().containers[0]
+            .env
+            .insert("DB_PASSWORD".into(), "x".into());
+        workloads.get_mut("api").unwrap().containers[0]
+            .capabilities
+            .push("NET_BIND_SERVICE".into());
+        let notes = prepare_deploy(&mut workloads, &[], false).unwrap();
+        assert_eq!(notes, [NOTE_SECRET_NAMES]);
+    }
+
+    #[test]
+    fn prepare_deploy_refuses_empty_input_and_prune_of_nothing() {
+        let issue = |source, message: &str| DeployIssue::new(source, "", message);
+        assert_eq!(
+            prepare_deploy(&mut BTreeMap::new(), &[], false),
+            Err(vec![issue(
+                DeployIssueSource::Input,
+                "nothing to deploy: the input has no workloads"
+            )])
+        );
+        let refused = prepare_deploy(&mut BTreeMap::new(), &[], true).unwrap_err();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].source, DeployIssueSource::Prune);
+        assert!(
+            refused[0]
+                .message
+                .starts_with("the input has no workloads, so every")
+        );
+    }
+
+    #[test]
+    fn prepare_deploy_reports_unknown_expose_and_violations_together() {
+        let mut bad = base();
+        bad.containers[0].image = String::new();
+        let mut workloads = BTreeMap::from([("web".to_string(), bad)]);
+        let issues = prepare_deploy(&mut workloads, &["nope".to_string()], false).unwrap_err();
+        assert_eq!(
+            issues,
+            vec![
+                DeployIssue::new(
+                    DeployIssueSource::Expose,
+                    "",
+                    "no workload named \"nope\"; the input has: web"
+                ),
+                DeployIssue::new(
+                    DeployIssueSource::Input,
+                    "web.containers[0].image",
+                    "must not be empty"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_names_are_matched_in_any_case() {
+        for name in [
+            "DB_PASSWORD",
+            "db_passwd",
+            "ClientSecret",
+            "GITHUB_TOKEN",
+            "stripe_api_key",
+            "SSH_PRIVATE_KEY",
+        ] {
+            assert!(looks_like_a_secret(name), "{name}");
+        }
+        for name in ["MODE", "PORT", "KEYBOARD", "API_URL", "PASS"] {
+            assert!(!looks_like_a_secret(name), "{name}");
+        }
     }
 
     #[test]

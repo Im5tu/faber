@@ -46,7 +46,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
 if-addrs = "0.15"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"

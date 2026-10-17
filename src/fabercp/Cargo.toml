@@ -15,6 +15,7 @@ faber-node-protocol = { workspace = true }
 openraft = { workspace = true }
 rocksdb = { workspace = true }
 rmcp = { workspace = true }
+schemars = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

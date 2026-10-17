@@ -9,8 +9,8 @@
 # Environment:
 #   E2E_SKIP_BUILD=1   reuse tmp/e2e-bin/{fabercp,faber,faber-node} instead of building
 #   E2E_KEEP=1         leave the containers and the network up afterwards
-#   E2E_PHASES="..."   phases to run, default "A B H J M C D E F I G", always
-#                      in that order (B needs A; H, J, M, C, D, E, F and I need B;
+#   E2E_PHASES="..."   phases to run, default "A B H J K M C D E F I G", always
+#                      in that order (B needs A; K needs A; H, J, M, C, D, E, F and I need B;
 #                      M runs before F and I, which add nodes it would place on)
 #
 # Phases:
@@ -26,6 +26,9 @@
 #      and environments, spec deploys of workloads with zero replicas (so
 #      the phase checks records and nothing runs), refused removals while a
 #      workload is left, and the records after a restart of fabercp
+#   K  the MCP endpoint on A's loopback listener: initialize, the tool list
+#      (17 tools) and a project_list call over the streamable HTTP transport,
+#      and the peer listener answering 404 on /mcp
 #   C  install.sh re-run changes nothing
 #   D  restart and stop of fabercp
 #   E  hardening of the service and the files
@@ -85,7 +88,7 @@ NODE_E="faber-e2e-e"
 NODE_F="faber-e2e-f"
 ALL_NODES=("$NODE_A" "$NODE_B" "$NODE_C" "$NODE_D" "$NODE_E" "$NODE_F")
 SRC="/root/faber-src"
-PHASES="${E2E_PHASES:-A B H J M C D E F I G}"
+PHASES="${E2E_PHASES:-A B H J K M C D E F I G}"
 
 WG_PORT=51820
 PEER_PORT=7401
@@ -1163,6 +1166,51 @@ EOF
   assert_eq "J still 2 voters at the end" "$(voters "$NODE_A")" "2"
 }
 
+# --- phase K: the MCP endpoint on the loopback listener ----------------------
+
+# k_post NODE SESSION BODY: POST BODY to /mcp on NODE's loopback listener with
+# the headers of the streamable HTTP transport (SESSION may be empty), and
+# print the status line, the headers and the body.
+k_post() {
+  local sid_header=""
+  [[ -n "$2" ]] && sid_header="-H 'Mcp-Session-Id: $2'"
+  dx "$1" "curl -sS -i --max-time 10 -X POST $sid_header -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '$3' http://127.0.0.1:7400/mcp"
+}
+
+# k_data TEXT: the JSON of the data: lines of an event stream.
+k_data() { sed -n 's/^data: *//p' <<<"$1"; }
+
+phase_k() {
+  local out sid data names want
+  section "K: MCP tools on the loopback listener"
+
+  out="$(k_post "$NODE_A" "" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}')"
+  evidence "$out"
+  assert_has "K initialize answers 200" "$out" '^HTTP/[0-9.]+ 200'
+  sid="$(grep -i '^mcp-session-id:' <<<"$out" | head -n 1 | awk '{print $2}')"
+  assert_ne "K initialize returns a session id" "$sid" ""
+  assert_has "K initialize reports the tools capability" "$(k_data "$out")" '"tools"'
+
+  out="$(k_post "$NODE_A" "$sid" '{"jsonrpc":"2.0","method":"notifications/initialized"}')"
+  assert_has "K notifications/initialized answers 202" "$out" '^HTTP/[0-9.]+ 202'
+
+  out="$(k_post "$NODE_A" "$sid" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')"
+  data="$(k_data "$out")"
+  names="$(grep -o '"name":"[a-z_]*"' <<<"$data" | sed 's/"name":"\(.*\)"/\1/' | sort -u | tr '\n' ' ')"
+  want="app_list app_remove app_show cluster_init cluster_join cluster_status deploy_spec environment_add environment_remove health mesh_invite mesh_lease mesh_status_interval project_create project_list project_remove project_show "
+  assert_eq "K tools/list names the 17 tools" "$names" "$want"
+
+  out="$(k_post "$NODE_A" "$sid" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_list","arguments":{}}}')"
+  data="$(k_data "$out")"
+  evidence "$data"
+  assert_has "K tools/call project_list is not an error" "$data" '"isError":false'
+  assert_has "K tools/call project_list returns the projects" "$data" 'projects'
+
+  # The peer listener does not serve /mcp.
+  out="$(dx "$NODE_A" "curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{}' http://$MESH_A:$PEER_PORT/mcp")"
+  assert_eq "K the peer listener answers 404 on /mcp" "$out" "404"
+}
+
 # --- phase C: idempotency ---------------------------------------------------
 
 phase_c() {
@@ -2128,6 +2176,7 @@ main() {
   has_phase B && phase_b
   has_phase H && phase_h
   has_phase J && phase_j
+  has_phase K && phase_k
   has_phase M && phase_m
   has_phase C && phase_c
   has_phase D && phase_d

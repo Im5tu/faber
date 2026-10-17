@@ -14,18 +14,28 @@ use crate::service::{FaberService, ServiceResult};
 /// is `unavailable`) plus the `error` and `message` of an error body, so a
 /// client that reads either shape understands it.
 pub async fn health(State(svc): State<FaberService>) -> Response {
+    let (status, body) = health_report(&svc);
+    (status, Json(body)).into_response()
+}
+
+/// The status and JSON body `/api/v1/health` answers with, as described on
+/// [`health`].
+pub(crate) fn health_report(svc: &FaberService) -> (StatusCode, serde_json::Value) {
     let health = svc.health();
     match svc.health_problem() {
-        None => Json(health).into_response(),
-        Some(problem) => {
-            let body = serde_json::json!({
+        None => (
+            StatusCode::OK,
+            serde_json::to_value(health).unwrap_or_default(),
+        ),
+        Some(problem) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
                 "status": health.status,
                 "node_id": health.node_id,
                 "error": error_code::UNAVAILABLE,
                 "message": problem,
-            });
-            (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
-        }
+            }),
+        ),
     }
 }
 
